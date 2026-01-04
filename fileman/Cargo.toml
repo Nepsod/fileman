@@ -1,0 +1,11 @@
+[package]
+name = "fileman"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "GPL-3.0"
+
+[dependencies]
+npio = { workspace = true }
+nptk = { workspace = true }

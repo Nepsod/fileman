@@ -1,0 +1,26 @@
+[workspace]
+members = [
+    "fileman",
+    "nptk-fileman-widgets",
+    "nptk-fileman-widgets/examples/file_list"
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+authors = ["Dominik Adrian Grzywak <starterx4@gmail.com>"]
+repository = "https://github.com/Nepsod/fileman"
+
+[workspace.dependencies]
+npio = { path = "../npio" }
+nptk = { path = "../nptk" }
+
+# For rust-analyzer visibility
+nptk-fileman-widgets = { path = "nptk-fileman-widgets" }
+fileman = { path = "fileman" }
+
+# 3rd-party
+nalgebra = { version = "0.34", default-features = false, features = ["std"] }
+tokio = { version = "1.48", features = ["parking_lot", "sync", "fs", "rt", "rt-multi-thread"] }
+log = "0.4.29"
+smol = "2.0"

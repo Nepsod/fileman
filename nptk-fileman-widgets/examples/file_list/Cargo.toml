@@ -1,0 +1,10 @@
+[package]
+name = "file_list"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+nptk = { workspace = true }
+nptk-fileman-widgets = { path = "../../../nptk-fileman-widgets" }
+tokio = { workspace = true }

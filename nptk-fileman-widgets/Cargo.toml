@@ -1,0 +1,18 @@
+[package]
+name = "nptk-fileman-widgets"
+version = "0.0.1"
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "LGPL-3.0"
+
+[dependencies]
+npio = { workspace = true }
+nptk = { workspace = true }
+nalgebra = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+smol = { workspace = true }
+
+chrono = { version = "0.4", default-features = true }
+humansize = "2.1"
