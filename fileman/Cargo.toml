@@ -9,3 +9,8 @@ license = "GPL-3.0"
 [dependencies]
 npio = { workspace = true }
 nptk = { workspace = true }
+nptk-fileman-widgets = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+smol = { workspace = true }
+env_logger = "0.11"
