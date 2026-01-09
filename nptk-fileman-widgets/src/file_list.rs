@@ -150,6 +150,11 @@ impl FileList {
         let _ = self.fs_model.refresh(&path);
     }
 
+    /// Get the current path.
+    pub fn get_current_path(&self) -> PathBuf {
+        (*self.current_path.get()).clone()
+    }
+
     /// Get the currently selected paths.
     pub fn selected_paths(&self) -> Vec<PathBuf> {
         self.selected_paths.get().clone()

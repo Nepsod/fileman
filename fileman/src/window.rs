@@ -60,18 +60,30 @@ impl Widget for FileListWrapper {
             }
         }
 
-        // Check if navigation path has changed and update FileList if needed
-        if let Ok(nav) = self.navigation.lock() {
-            let current_nav_path = nav.get_current_path();
-            if current_nav_path != self.last_path {
-                self.file_list.set_path(current_nav_path.clone());
-                self.last_path = current_nav_path;
+        // Update the wrapped FileList first to let it handle internal navigation
+        update |= self.file_list.update(layout, context.clone(), info);
+
+        // Check if FileList's path has changed internally (e.g., from double-click navigation)
+        let file_list_path = self.file_list.get_current_path();
+        if file_list_path != self.last_path {
+            // Sync FileList's path change to NavigationState
+            if let Ok(mut nav) = self.navigation.lock() {
+                nav.navigate_to(file_list_path.clone());
+                self.last_path = file_list_path;
                 update.insert(Update::LAYOUT | Update::DRAW);
+            }
+        } else {
+            // Check if navigation path has changed externally and update FileList if needed
+            if let Ok(nav) = self.navigation.lock() {
+                let current_nav_path = nav.get_current_path();
+                if current_nav_path != self.last_path {
+                    self.file_list.set_path(current_nav_path.clone());
+                    self.last_path = current_nav_path;
+                    update.insert(Update::LAYOUT | Update::DRAW);
+                }
             }
         }
         
-        // Update the wrapped FileList
-        update |= self.file_list.update(layout, context, info);
         update
     }
 
