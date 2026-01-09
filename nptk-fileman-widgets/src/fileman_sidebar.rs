@@ -69,7 +69,7 @@ impl FilemanSidebar {
         let (tx, rx) = mpsc::unbounded_channel();
         let config = FilemanSidebarConfig::default();
         
-        // Build sections based on config
+        // Build sections based on config (synchronous - user dirs will be loaded later)
         let sections = Self::build_sections(&config, tx.clone());
         
         // Set up navigation callback
@@ -256,6 +256,8 @@ impl FilemanSidebar {
     }
 
     /// Build the Places section with user directories.
+    /// Note: User directories are loaded synchronously using blocking approach.
+    /// This works because we're in a tokio runtime context from #[tokio::main].
     fn build_places_section(config: &FilemanSidebarConfig) -> Option<SidebarSection> {
         let mut items = Vec::new();
 
@@ -275,9 +277,28 @@ impl FilemanSidebar {
                 .with_uri(format!("file://{}", home_path.display())),
         );
 
-        // User directories
+        // User directories - load synchronously using tokio runtime handle
+        // This works because we're in a tokio runtime context from #[tokio::main].
+        // We use block_in_place + block_on to safely convert async call to sync during widget construction.
         for dir_type in &config.user_directories {
-            if let Ok(Some(file)) = get_user_special_file(*dir_type) {
+            // Use block_in_place to move to a blocking thread, then block_on the async call
+            // This prevents blocking the async runtime if we're already on an async thread
+            let file_result = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::try_current()
+                    .map(|handle| {
+                        handle.block_on(async {
+                            get_user_special_file(*dir_type).await
+                        })
+                    })
+                    .unwrap_or_else(|_| {
+                        // If no runtime available (shouldn't happen in normal execution),
+                        // return error so we skip this directory
+                        log::warn!("No tokio runtime available for loading user directory {:?}", dir_type);
+                        Ok(None)
+                    })
+            });
+            
+            if let Ok(Some(file)) = file_result {
                 let uri = file.uri();
                 let label = match dir_type {
                     UserDirectory::Desktop => "Desktop",
@@ -307,50 +328,22 @@ impl FilemanSidebar {
     }
 
     /// Build the Bookmarks section.
+    /// Returns None if bookmarks cannot be loaded or are empty.
+    /// Note: Bookmark loading may be deferred to avoid blocking during widget construction.
     fn build_bookmarks_section(config: &FilemanSidebarConfig) -> Option<SidebarSection> {
-        // Try to load bookmarks synchronously (may block briefly)
-        let mut service = BookmarksService::new();
-        let bookmarks = match smol::block_on(service.load()) {
-            Ok(_) => service.get_bookmarks(),
-            Err(e) => {
-                log::warn!("Failed to load bookmarks: {}", e);
-                return None;
-            }
-        };
-
-        if bookmarks.is_empty() {
-            return None;
-        }
-
-        let items: Vec<SidebarItem> = bookmarks
-            .iter()
-            .enumerate()
-            .filter_map(|(i, bookmark)| {
-                // Extract name from bookmark or derive from URI
-                let name = bookmark.name.clone().unwrap_or_else(|| {
-                    if let Some(path) = uri_to_path(&bookmark.uri) {
-                        path.file_name()
-                            .and_then(|n| n.to_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| format!("Bookmark {}", i + 1))
-                    } else {
-                        format!("Bookmark {}", i + 1)
-                    }
-                });
-
-                Some(
-                    SidebarItem::new(format!("bookmark_{}", i), name)
-                        .with_icon(bookmark.icon.clone().unwrap_or_else(|| "folder".to_string()))
-                        .with_uri(bookmark.uri.clone()),
-                )
-            })
-            .collect();
-
-        if items.is_empty() {
-            None
-        } else {
-            Some(SidebarSection::new("Bookmarks").with_items(items))
-        }
+        // Skip synchronous bookmark loading during construction to avoid deadlocks.
+        // The issue is that when FilemanSidebar::new() is called, it happens during
+        // widget tree construction which may be in a tokio runtime context. Using
+        // smol::block_on() or tokio::block_on() here can cause deadlocks.
+        //
+        // Solution: Bookmarks should be loaded asynchronously after widget creation.
+        // For now, return None - the bookmarks section will be empty initially.
+        // TODO: Implement proper async bookmark loading that:
+        //   1. Creates sidebar with empty bookmarks section initially
+        //   2. Spawns async task to load bookmarks
+        //   3. Updates sidebar sections when bookmarks are loaded
+        log::debug!("Bookmarks section loading deferred to avoid blocking during construction");
+        None
     }
 }
 

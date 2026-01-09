@@ -18,7 +18,7 @@ pub fn create_file(path: PathBuf) -> Result<(), String> {
 pub fn delete_path(path: PathBuf) -> Result<(), String> {
     let metadata = fs::metadata(&path)
         .map_err(|e| format!("Failed to get metadata: {}", e))?;
-
+    
     if metadata.is_dir() {
         fs::remove_dir_all(&path)
             .map_err(|e| format!("Failed to remove directory: {}", e))

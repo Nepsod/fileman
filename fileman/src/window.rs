@@ -13,6 +13,8 @@ struct FileListWrapper {
     navigation: Arc<Mutex<crate::navigation::NavigationState>>,
     last_path: PathBuf,
     navigation_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
+    // Track if we need to check path sync (only after navigation-related events)
+    should_check_path_sync: bool,
 }
 
 impl FileListWrapper {
@@ -26,6 +28,7 @@ impl FileListWrapper {
             navigation,
             last_path: initial_path,
             navigation_rx: Some(navigation_rx),
+            should_check_path_sync: false,
         }
     }
 }
@@ -47,7 +50,7 @@ impl Widget for FileListWrapper {
     ) -> nptk::core::app::update::Update {
         let mut update = Update::empty();
 
-        // Poll navigation events from sidebar
+        // Poll navigation events from sidebar (only check when we have events)
         if let Some(ref mut rx) = self.navigation_rx {
             // Use try_recv to poll non-blockingly
             while let Ok(path) = rx.try_recv() {
@@ -55,31 +58,41 @@ impl Widget for FileListWrapper {
                     nav.navigate_to(path.clone());
                     self.file_list.set_path(path.clone());
                     self.last_path = path;
+                    self.should_check_path_sync = true;
                     update.insert(Update::LAYOUT | Update::DRAW);
                 }
             }
         }
 
         // Update the wrapped FileList first to let it handle internal navigation
-        update |= self.file_list.update(layout, context.clone(), info);
+        let file_list_update = self.file_list.update(layout, context.clone(), info);
+        update |= file_list_update;
 
-        // Check if FileList's path has changed internally (e.g., from double-click navigation)
-        let file_list_path = self.file_list.get_current_path();
-        if file_list_path != self.last_path {
-            // Sync FileList's path change to NavigationState
-            if let Ok(mut nav) = self.navigation.lock() {
-                nav.navigate_to(file_list_path.clone());
-                self.last_path = file_list_path;
-                update.insert(Update::LAYOUT | Update::DRAW);
-            }
-        } else {
-            // Check if navigation path has changed externally and update FileList if needed
-            if let Ok(nav) = self.navigation.lock() {
-                let current_nav_path = nav.get_current_path();
-                if current_nav_path != self.last_path {
-                    self.file_list.set_path(current_nav_path.clone());
-                    self.last_path = current_nav_path;
+        // Only check path sync when:
+        // 1. We received navigation from sidebar (should_check_path_sync is set), OR
+        // 2. FileList requested LAYOUT update (structural change, might be navigation)
+        // This avoids checking on every hover/redraw cycle which causes infinite loops
+        if self.should_check_path_sync || file_list_update.contains(Update::LAYOUT) {
+            self.should_check_path_sync = false;
+            
+            // Check if FileList's path has changed internally (e.g., from double-click navigation)
+            let file_list_path = self.file_list.get_current_path();
+            if file_list_path != self.last_path {
+                // Sync FileList's path change to NavigationState
+                if let Ok(mut nav) = self.navigation.lock() {
+                    nav.navigate_to(file_list_path.clone());
+                    self.last_path = file_list_path;
                     update.insert(Update::LAYOUT | Update::DRAW);
+                }
+            } else {
+                // Check if navigation path has changed externally (e.g., from toolbar buttons)
+                if let Ok(nav) = self.navigation.lock() {
+                    let current_nav_path = nav.get_current_path();
+                    if current_nav_path != self.last_path {
+                        self.file_list.set_path(current_nav_path.clone());
+                        self.last_path = current_nav_path;
+                        update.insert(Update::LAYOUT | Update::DRAW);
+                    }
                 }
             }
         }
