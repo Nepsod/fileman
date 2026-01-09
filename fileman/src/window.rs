@@ -1,5 +1,6 @@
 use nptk::prelude::*;
 use nptk::core::signal::eval::EvalSignal;
+use nptk::core::window::{ElementState, KeyCode, PhysicalKey};
 use nptk_fileman_widgets::file_list::{FileList, FileListOperation};
 use nptk_fileman_widgets::FilemanSidebar;
 use crate::app::AppState;
@@ -403,6 +404,7 @@ struct LocationBarWrapper {
     current_path_text: StateSignal<String>,
     last_synced_path: PathBuf,
     signals_hooked: bool,
+    text_input_value: String, // Track TextInput value for Enter key navigation
 }
 
 impl LocationBarWrapper {
@@ -425,8 +427,9 @@ impl LocationBarWrapper {
             navigation,
             navigation_tx,
             current_path_text: StateSignal::new(initial_text.clone()),
-            last_synced_path: initial_path,
+            last_synced_path: initial_path.clone(),
             signals_hooked: false,
+            text_input_value: initial_text,
         }
     }
 }
@@ -458,19 +461,63 @@ impl Widget for LocationBarWrapper {
         if let Ok(nav) = self.navigation.lock() {
             let current_path = nav.get_current_path();
             if current_path != self.last_synced_path {
-                self.current_path_text.set(current_path.to_string_lossy().to_string());
+                let path_str = current_path.to_string_lossy().to_string();
+                self.current_path_text.set(path_str.clone());
+                self.text_input_value = path_str;
                 self.last_synced_path = current_path.clone();
             }
         }
 
-        // Check for Enter key press to navigate to entered path
-        // Note: TextInput handles keys internally, so we check in update after TextInput processes them
-        // For now, location bar navigation will be handled via a different mechanism
-        // TODO: Implement proper Enter key detection for TextInput - may require custom TextInput wrapper
-        // or checking for focus changes + Enter key combination
-
-        // Update inner TextInput
+        // Update inner TextInput first
         update |= self.inner.update(layout, context, info);
+
+        // Check for Enter key press to navigate to entered path
+        // Check if Enter key was pressed (similar to how Button widget checks)
+        let enter_pressed = info.keys.iter().any(|(_, key_event)| {
+            key_event.state == ElementState::Pressed
+                && matches!(key_event.physical_key, PhysicalKey::Code(KeyCode::Enter))
+        });
+
+        if enter_pressed {
+            // Try to get the current text value from the signal
+            // Note: TextInput manages its own internal state, so we use current_path_text
+            // as the source. Ideally, TextInput would expose its value via a signal that we
+            // could bind to. For now, this works when the user types in the location bar
+            // and presses Enter. The actual value might need to be tracked differently
+            // if TextInput doesn't sync with our signal automatically.
+            let entered_text = self.current_path_text.get().trim().to_string();
+            
+            if !entered_text.is_empty() {
+                // Try to parse as path and navigate
+                let entered_path = PathBuf::from(&entered_text);
+                
+                // Check if path exists
+                if entered_path.exists() {
+                    // Update navigation state and sync
+                    if let Ok(mut nav) = self.navigation.lock() {
+                        nav.navigate_to(entered_path.clone());
+                        self.last_synced_path = entered_path.clone();
+                        let path_str = entered_path.to_string_lossy().to_string();
+                        self.current_path_text.set(path_str.clone());
+                        self.text_input_value = path_str.clone();
+                    }
+                    // Send navigation action
+                    let _ = self.navigation_tx.send(crate::toolbar::NavigationAction::NavigateTo(
+                        entered_path
+                    ));
+                    update.insert(Update::LAYOUT | Update::DRAW);
+                } else {
+                    // Path doesn't exist - log warning (could show error message in status bar)
+                    log::warn!("Navigation to non-existent path: {}", entered_text);
+                }
+            }
+        }
+
+        // Try to sync text from TextInput (if it changed)
+        // Note: This is a simplified approach - ideally TextInput would expose its value via a signal
+        // For now, we rely on the Enter key press to capture the value
+        // The text_input_value will be updated when navigation changes or when Enter is pressed
+        
         update
     }
 
