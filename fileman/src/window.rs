@@ -1,4 +1,5 @@
 use nptk::prelude::*;
+use nptk::core::signal::eval::EvalSignal;
 use nptk_fileman_widgets::file_list::{FileList, FileListOperation};
 use nptk_fileman_widgets::FilemanSidebar;
 use crate::app::AppState;
@@ -26,15 +27,17 @@ struct FileListWrapper {
     navigation_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
     // Track if we need to check path sync (only after navigation-related events)
     should_check_path_sync: bool,
-    // File operation processing - receives from FileList widget
+    // File operation processing - receives from FileList widget (already confirmed)
     file_list_operation_rx: Option<mpsc::UnboundedReceiver<FileListOperation>>,
-    // File operation processing - receives from toolbar/other UI
+    // File operation processing - receives from toolbar/other UI (needs confirmation)
     operation_rx: Option<mpsc::UnboundedReceiver<FileOperationRequest>>,
     // Status message sender (for displaying operation results)
     status_tx: Option<mpsc::UnboundedSender<String>>,
     // Selected paths request/response channels for toolbar delete button
     selected_paths_request_rx: Option<mpsc::UnboundedReceiver<()>>,
     selected_paths_response_tx: Option<mpsc::UnboundedSender<Vec<PathBuf>>>,
+    // Pending delete operations waiting for confirmation (from toolbar)
+    pending_delete_confirmation: Arc<Mutex<Option<Vec<PathBuf>>>>,
 }
 
 impl FileListWrapper {
@@ -61,7 +64,82 @@ impl FileListWrapper {
             status_tx: Some(status_tx),
             selected_paths_request_rx: Some(selected_paths_request_rx),
             selected_paths_response_tx: Some(selected_paths_response_tx),
+            pending_delete_confirmation: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Show delete confirmation dialog
+    fn show_delete_confirmation_dialog(&self, paths: &[PathBuf], context: AppContext) {
+        if paths.is_empty() {
+            return;
+        }
+
+        // Build message text
+        let message = if paths.len() == 1 {
+            let path = &paths[0];
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unnamed>");
+            format!("Are you sure you want to delete \"{}\"?", name)
+        } else {
+            format!("Are you sure you want to delete {} selected item(s)?", paths.len())
+        };
+
+        let pending_delete = self.pending_delete_confirmation.clone();
+        let paths_to_delete = paths.to_vec();
+
+        // Message text widget
+        let message_text = Text::new(message);
+        
+        // Cancel button - closes dialog (popup closes automatically on click outside or ESC)
+        let cancel_btn = Button::new(Text::new("Cancel".to_string()))
+            .with_on_pressed(MaybeSignal::value(Update::DRAW));
+        
+        // Delete button - confirms deletion
+        let delete_btn = Button::new(Text::new("Delete".to_string()))
+            .with_on_pressed({
+                let pending_delete_btn = pending_delete.clone();
+                let paths_btn = paths_to_delete.clone();
+                MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                    // Set pending delete confirmation - will be processed in update()
+                    if let Ok(mut pending) = pending_delete_btn.lock() {
+                        *pending = Some(paths_btn.clone());
+                    }
+                    Update::DRAW
+                })))
+            });
+
+        // Build dialog content
+        let dialog_content = Container::new(vec![
+            Box::new(message_text),
+            Box::new(Container::new(vec![
+                Box::new(cancel_btn),
+                Box::new(delete_btn),
+            ]).with_layout_style(LayoutStyle {
+                flex_direction: FlexDirection::Row,
+                gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
+                justify_content: Some(JustifyContent::FlexEnd),
+                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+                ..Default::default()
+            })),
+        ]).with_layout_style(LayoutStyle {
+            size: Vector2::new(Dimension::length(400.0), Dimension::auto()),
+            flex_direction: FlexDirection::Column,
+            padding: Rect {
+                left: LengthPercentage::length(16.0),
+                right: LengthPercentage::length(16.0),
+                top: LengthPercentage::length(16.0),
+                bottom: LengthPercentage::length(16.0),
+            },
+            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(16.0)),
+            ..Default::default()
+        });
+
+        // Show popup at center of screen
+        context
+            .popup_manager
+            .create_popup_at(Box::new(dialog_content), "Confirm Delete", (400, 150), (300, 200));
     }
 }
 
@@ -197,40 +275,15 @@ impl Widget for FileListWrapper {
         }
 
         // Process file operations from toolbar/other UI
+        // Note: Delete operations need confirmation, so show dialog first
+        // Collect operations first to avoid borrow conflicts
+        let mut pending_deletes = Vec::new();
         if let Some(ref mut rx) = self.operation_rx {
             while let Ok(op) = rx.try_recv() {
                 match op {
                     FileOperationRequest::Delete(paths) => {
-                        let mut all_success = true;
-                        let mut error_msg = String::new();
-                        
-                        for path in &paths {
-                            match operations::delete_path(path.clone()) {
-                                Ok(_) => {
-                                    log::info!("Deleted: {:?}", path);
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to delete {:?}: {}", path, e);
-                                    all_success = false;
-                                    error_msg = e;
-                                    break; // Stop on first error
-                                }
-                            }
-                        }
-                        
-                        // Update status message
-                        if let Some(ref tx) = self.status_tx {
-                            if all_success {
-                                let _ = tx.send(format!("Deleted {} item(s)", paths.len()));
-                            } else {
-                                let _ = tx.send(format!("Error: {}", error_msg));
-                            }
-                        }
-                        
-                        // Refresh file list
-                        let current_path = self.file_list.get_current_path();
-                        self.file_list.set_path(current_path.clone());
-                        update.insert(Update::LAYOUT | Update::DRAW);
+                        // Collect delete requests to show confirmation dialog
+                        pending_deletes.push(paths);
                     }
                     FileOperationRequest::CreateDirectory { parent, name } => {
                         let new_dir = parent.join(&name);
@@ -275,6 +328,12 @@ impl Widget for FileListWrapper {
                     }
                 }
             }
+        }
+        
+        // Show confirmation dialogs for pending delete operations (after releasing borrow)
+        for paths in pending_deletes {
+            self.show_delete_confirmation_dialog(&paths, context.clone());
+            update.insert(Update::DRAW);
         }
         
         update

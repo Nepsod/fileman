@@ -4,7 +4,7 @@ use nalgebra::Vector2;
 use nptk::core::app::context::AppContext;
 use nptk::core::app::info::AppInfo;
 use nptk::core::app::update::Update;
-use nptk::core::layout::{Dimension, LayoutNode, LayoutStyle, StyleNode};
+use nptk::core::layout::{Dimension, LayoutNode, LayoutStyle, StyleNode, LengthPercentage};
 use nptk::core::menu::{MenuTemplate, MenuItem, MenuCommand};
 use nptk::core::signal::{state::StateSignal, MaybeSignal, Signal};
 use nptk::core::text_render::TextRenderContext;
@@ -30,6 +30,7 @@ mod view_compact;
 mod view_icon;
 mod view_list;
 
+
 /// Simple operation request type for use within FileList widget
 /// This is converted to the full FileOperationRequest in FileListWrapper
 pub enum FileListOperation {
@@ -37,8 +38,13 @@ pub enum FileListOperation {
 }
 
 use nptk::widgets::scroll_container::{ScrollContainer, ScrollDirection};
+use nptk::core::signal::eval::EvalSignal;
 use npio::service::filesystem::mime_registry::MimeRegistry;
 use std::path::PathBuf;
+// Import widgets needed for confirmation dialog
+use nptk::widgets::container::Container;
+use nptk::widgets::button::Button;
+use nptk::widgets::text::Text;
 
 /// View mode for the file list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -358,6 +364,7 @@ struct FileListContent {
     operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
     last_cursor: Option<Point>,
     menu_was_open: bool, // Track if menu was open in previous update to detect when it closes
+    pending_delete_confirmation: Arc<Mutex<Option<Vec<PathBuf>>>>, // Paths waiting for delete confirmation
 }
 
 #[derive(Clone)]
@@ -418,6 +425,7 @@ impl FileListContent {
             operation_tx,
             last_cursor: None,
             menu_was_open: false,
+            pending_delete_confirmation: Arc::new(Mutex::new(None)),
         }
         .with_thumbnail_size(128)
     }
@@ -514,6 +522,85 @@ impl FileListContent {
         }
 
         self.selected_paths.set(new_selection);
+    }
+
+    /// Show a confirmation dialog asking if the user is sure they want to delete the selected files
+    pub(super) fn show_delete_confirmation_dialog(&self, paths: &[PathBuf], context: AppContext) {
+        if paths.is_empty() {
+            return;
+        }
+
+        // Build message text
+        let message = if paths.len() == 1 {
+            let path = &paths[0];
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unnamed>");
+            format!("Are you sure you want to delete \"{}\"?", name)
+        } else {
+            format!("Are you sure you want to delete {} selected item(s)?", paths.len())
+        };
+
+        // Create the dialog widget with message and buttons
+        let pending_delete = self.pending_delete_confirmation.clone();
+        let paths_to_delete = paths.to_vec();
+
+        // Message text widget
+        let message_text = Text::new(message);
+        
+        // Cancel button - just closes dialog (popup closes automatically on click outside)
+        let cancel_btn = Button::new(Text::new("Cancel".to_string()))
+            .with_on_pressed(MaybeSignal::value(Update::DRAW));
+        
+        // Delete button - confirms deletion
+        let delete_btn = Button::new(Text::new("Delete".to_string()))
+            .with_on_pressed({
+                let pending_delete_btn = pending_delete.clone();
+                let paths_btn = paths_to_delete.clone();
+                MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                    // Set pending delete confirmation - will be processed in update()
+                    if let Ok(mut pending) = pending_delete_btn.lock() {
+                        *pending = Some(paths_btn.clone());
+                    }
+                    Update::DRAW
+                })))
+            });
+
+        // Build dialog content with message and buttons
+        let dialog_content = Container::new(vec![
+            Box::new(message_text),
+            Box::new(Container::new(vec![
+                Box::new(cancel_btn),
+                Box::new(delete_btn),
+            ]).with_layout_style(LayoutStyle {
+                flex_direction: nptk::core::layout::FlexDirection::Row,
+                gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
+                justify_content: Some(nptk::core::layout::JustifyContent::FlexEnd),
+                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+                ..Default::default()
+            })),
+        ]).with_layout_style(LayoutStyle {
+            size: Vector2::new(Dimension::length(400.0), Dimension::auto()),
+            flex_direction: nptk::core::layout::FlexDirection::Column,
+            padding: nptk::core::layout::Rect {
+                left: LengthPercentage::length(16.0),
+                right: LengthPercentage::length(16.0),
+                top: LengthPercentage::length(16.0),
+                bottom: LengthPercentage::length(16.0),
+            },
+            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(16.0)),
+            ..Default::default()
+        });
+
+        // Show popup at cursor position or center of screen
+        let pos = self
+            .last_cursor
+            .map(|p| (p.x as i32, p.y as i32))
+            .unwrap_or((300, 200));
+        context
+            .popup_manager
+            .create_popup_at(Box::new(dialog_content), "Confirm Delete", (400, 150), pos);
     }
 }
 
@@ -1051,17 +1138,9 @@ impl Widget for FileListContent {
                 if let Some(action) = pending.take() {
                     // Action was set - process it immediately
                     if action.delete {
-                        // Delete action - send via operation channel if available
-                        if let Some(ref op_tx) = self.operation_tx {
-                            if let Err(e) = op_tx.send(FileListOperation::Delete(action.paths.clone())) {
-                                log::error!("Failed to send delete operation: {}", e);
-                            } else {
-                                log::info!("Delete operation sent for paths: {:?}", action.paths);
-                                update.insert(Update::DRAW);
-                            }
-                        } else {
-                            log::warn!("Delete requested but no operation channel available");
-                        }
+                        // Delete action - show confirmation dialog first
+                        self.show_delete_confirmation_dialog(&action.paths, context);
+                        update.insert(Update::DRAW);
                     } else if let Some(app_id) = action.app_id {
                         for path in action.paths.iter() {
                             if let Err(err) = self.mime_registry.launch(&app_id, path) {
@@ -1113,6 +1192,23 @@ impl Widget for FileListContent {
         }
         
         self.menu_was_open = menu_is_open;
+
+        // Process confirmed delete operations (user clicked "Delete" in confirmation dialog)
+        if let Ok(mut pending_delete) = self.pending_delete_confirmation.lock() {
+            if let Some(paths) = pending_delete.take() {
+                // User confirmed - proceed with deletion
+                if let Some(ref op_tx) = self.operation_tx {
+                    if let Err(e) = op_tx.send(FileListOperation::Delete(paths.clone())) {
+                        log::error!("Failed to send delete operation: {}", e);
+                    } else {
+                        log::info!("Delete operation confirmed and sent for paths: {:?}", paths);
+                        update.insert(Update::DRAW);
+                    }
+                } else {
+                    log::warn!("Delete confirmed but no operation channel available");
+                }
+            }
+        }
 
         update
     }
