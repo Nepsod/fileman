@@ -30,6 +30,12 @@ mod view_compact;
 mod view_icon;
 mod view_list;
 
+/// Simple operation request type for use within FileList widget
+/// This is converted to the full FileOperationRequest in FileListWrapper
+pub enum FileListOperation {
+    Delete(Vec<PathBuf>),
+}
+
 use nptk::widgets::scroll_container::{ScrollContainer, ScrollDirection};
 use npio::service::filesystem::mime_registry::MimeRegistry;
 use std::path::PathBuf;
@@ -76,6 +82,16 @@ impl FileList {
 
     /// Create a new file list widget.
     pub fn new(initial_path: PathBuf) -> Self {
+        Self::new_with_operations(initial_path, None)
+    }
+
+    /// Create a new file list widget with optional operation channel for file operations.
+    /// 
+    /// `operation_tx` - if provided, file operations (like delete) will be sent via this channel.
+    pub fn new_with_operations(
+        initial_path: PathBuf,
+        operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
+    ) -> Self {
         let fs_model = Arc::new(FileSystemModel::new(initial_path.clone()).unwrap());
         let event_rx = Arc::new(Mutex::new(fs_model.subscribe_events()));
 
@@ -117,6 +133,7 @@ impl FileList {
             thumbnail_event_rx,
             cache_update_tx,
             cache_update_rx,
+            operation_tx,
         );
 
         // Create scroll container (Both directions to support icon view)
@@ -338,6 +355,7 @@ struct FileListContent {
     svg_scene_cache: std::collections::HashMap<String, (nptk::core::vg::Scene, f64, f64)>,
     mime_registry: MimeRegistry,
     pending_action: Arc<Mutex<Option<PendingAction>>>,
+    operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
     last_cursor: Option<Point>,
 }
 
@@ -346,6 +364,7 @@ struct PendingAction {
     paths: Vec<PathBuf>,
     app_id: Option<String>,
     properties: bool,
+    delete: bool, // If true, this is a delete action
 }
 
 impl FileListContent {
@@ -361,6 +380,7 @@ impl FileListContent {
         thumbnail_event_rx: tokio::sync::broadcast::Receiver<ThumbnailEvent>,
         cache_update_tx: tokio::sync::mpsc::UnboundedSender<()>,
         cache_update_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+        operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
     ) -> Self {
         Self {
             entries,
@@ -394,6 +414,7 @@ impl FileListContent {
             svg_scene_cache: std::collections::HashMap::new(),
             mime_registry: MimeRegistry::load_default(),
             pending_action: Arc::new(Mutex::new(None)),
+            operation_tx,
             last_cursor: None,
         }
         .with_thumbnail_size(128)
@@ -810,6 +831,7 @@ impl Widget for FileListContent {
                                                     paths: paths_for_open.clone(),
                                                     app_id: None,
                                                     properties: false,
+                                                    delete: false,
                                                 });
                                             }
                                             Update::DRAW
@@ -831,11 +853,20 @@ impl Widget for FileListContent {
                             }
 
                             // Add Delete item
+                            let pending_delete = self.pending_action.clone();
+                            let delete_paths = paths_for_action.clone();
                             core_items.push(
                                 MenuItem::new(MenuCommand::FileDelete, "Delete")
-                                    .with_action(|| {
-                                        println!("Delete");
-                                        Update::empty()
+                                    .with_action(move || {
+                                        if let Ok(mut pending_lock) = pending_delete.lock() {
+                                            *pending_lock = Some(PendingAction {
+                                                paths: delete_paths.clone(),
+                                                app_id: None,
+                                                properties: false,
+                                                delete: true,
+                                            });
+                                        }
+                                        Update::DRAW
                                     }),
                             );
 
@@ -850,6 +881,7 @@ impl Widget for FileListContent {
                                                 paths: props_paths.clone(),
                                                 app_id: None,
                                                 properties: true,
+                                                delete: false,
                                             });
                                         }
                                         Update::DRAW
@@ -1002,7 +1034,19 @@ impl Widget for FileListContent {
         // Process any pending action set by context menu callbacks.
         if let Ok(mut pending) = self.pending_action.lock() {
             if let Some(action) = pending.take() {
-                if let Some(app_id) = action.app_id {
+                if action.delete {
+                    // Delete action - send via operation channel if available
+                    if let Some(ref op_tx) = self.operation_tx {
+                        if let Err(e) = op_tx.send(FileListOperation::Delete(action.paths.clone())) {
+                            log::error!("Failed to send delete operation: {}", e);
+                        } else {
+                            log::info!("Delete operation sent for paths: {:?}", action.paths);
+                            update.insert(Update::DRAW);
+                        }
+                    } else {
+                        log::warn!("Delete requested but no operation channel available");
+                    }
+                } else if let Some(app_id) = action.app_id {
                     for path in action.paths.iter() {
                         if let Err(err) = self.mime_registry.launch(&app_id, path) {
                             log::warn!(

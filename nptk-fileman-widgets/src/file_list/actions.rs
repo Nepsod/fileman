@@ -121,6 +121,7 @@ impl FileListContent {
                                 paths: paths_for_action.clone(),
                                 app_id: Some(app_id_cloned.clone()),
                                 properties: false,
+                                delete: false,
                             });
                         }
                         Update::DRAW
