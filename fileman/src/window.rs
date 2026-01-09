@@ -336,6 +336,44 @@ impl Widget for FileListWrapper {
             update.insert(Update::DRAW);
         }
         
+        // Process confirmed delete operations from toolbar (user clicked "Delete" in confirmation dialog)
+        if let Ok(mut pending_delete) = self.pending_delete_confirmation.lock() {
+            if let Some(paths) = pending_delete.take() {
+                // User confirmed - proceed with deletion
+                let paths_clone = paths.clone();
+                let mut all_success = true;
+                let mut error_msg = String::new();
+                
+                for path in &paths {
+                    match operations::delete_path(path.clone()) {
+                        Ok(_) => {
+                            log::info!("Deleted: {:?}", path);
+                        }
+                        Err(e) => {
+                            log::error!("Failed to delete {:?}: {}", path, e);
+                            all_success = false;
+                            error_msg = e;
+                            break;
+                        }
+                    }
+                }
+                
+                // Update status message
+                if let Some(ref tx) = self.status_tx {
+                    if all_success {
+                        let _ = tx.send(format!("Deleted {} item(s)", paths_clone.len()));
+                    } else {
+                        let _ = tx.send(format!("Error: {}", error_msg));
+                    }
+                }
+                
+                // Refresh file list
+                let current_path = self.file_list.get_current_path();
+                self.file_list.set_path(current_path.clone());
+                update.insert(Update::LAYOUT | Update::DRAW);
+            }
+        }
+        
         update
     }
 
