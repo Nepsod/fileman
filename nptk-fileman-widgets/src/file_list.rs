@@ -256,6 +256,13 @@ impl Widget for FileList {
                             update.insert(Update::LAYOUT | Update::DRAW);
                         }
                     },
+                    FileSystemEvent::EntryAdded { path, .. } | FileSystemEvent::EntryRemoved { path } | FileSystemEvent::EntryModified { path, .. } => {
+                        if let Some(parent) = path.parent() {
+                            if parent == *self.current_path.get() {
+                                let _ = self.fs_model.refresh(parent);
+                            }
+                        }
+                    },
                     _ => {
                         // For other events, we might want to refresh if they affect current path
                         // But for now, let's just rely on DirectoryLoaded

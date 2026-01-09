@@ -35,6 +35,9 @@ pub struct ToolbarWrapper {
     can_go_forward: nptk::core::signal::state::StateSignal<bool>,
     has_selection: nptk::core::signal::state::StateSignal<bool>,
     signals_hooked: bool,
+    new_folder_requested: Arc<Mutex<bool>>,
+    properties_requested: Arc<Mutex<bool>>,
+    pending_properties_request: Arc<Mutex<bool>>,
 }
 
 impl ToolbarWrapper {
@@ -100,19 +103,30 @@ impl ToolbarWrapper {
                 Update::empty()
             }))));
 
+        let new_folder_requested = Arc::new(Mutex::new(false));
         let new_folder_btn = ToolbarButton::new(Text::new("New Folder".to_string()))
-            .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
-                if let Ok(nav) = nav_clone5.lock() {
-                    let current = nav.get_current_path();
-                    let name = format!("New Folder {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-                    let _ = op_tx_clone.send(FileOperationRequest::CreateDirectory {
-                        parent: current,
-                        name,
-                    });
-                    return Update::LAYOUT | Update::DRAW;
-                }
-                Update::empty()
-            }))));
+            .with_on_pressed({
+                let new_folder_flag = new_folder_requested.clone();
+                nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                    if let Ok(mut flag) = new_folder_flag.lock() {
+                        *flag = true;
+                    }
+                    Update::DRAW
+                })))
+            });
+
+        let properties_requested = Arc::new(Mutex::new(false));
+        let pending_properties_request = Arc::new(Mutex::new(false));
+        let properties_btn = ToolbarButton::new(Text::new("Properties".to_string()))
+            .with_on_pressed({
+                let properties_flag = properties_requested.clone();
+                nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                    if let Ok(mut flag) = properties_flag.lock() {
+                        *flag = true;
+                    }
+                    Update::DRAW
+                })))
+            });
 
         // Delete button - request selected paths and delete them
         let delete_op_tx = operation_tx.clone();
@@ -133,7 +147,9 @@ impl ToolbarWrapper {
             .with_child(home_btn)
             .with_separator()
             .with_child(new_folder_btn)
-            .with_child(delete_btn);
+            .with_child(delete_btn)
+            .with_separator()
+            .with_child(properties_btn);
 
         let wrapper = Self {
             inner: toolbar,
@@ -147,6 +163,9 @@ impl ToolbarWrapper {
             can_go_forward: nptk::core::signal::state::StateSignal::new(false),
             has_selection: nptk::core::signal::state::StateSignal::new(false),
             signals_hooked: false,
+            new_folder_requested,
+            properties_requested,
+            pending_properties_request,
         };
 
         (wrapper, nav_tx)
@@ -237,11 +256,50 @@ impl Widget for ToolbarWrapper {
             }
         }
         
+        // Handle new folder button press
+        if let Ok(mut flag) = self.new_folder_requested.lock() {
+            if *flag {
+                *flag = false;
+                if let Ok(nav) = self.navigation.lock() {
+                    let current = nav.get_current_path();
+                    let name = format!("New Folder {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+                    let _ = self.operation_tx.send(FileOperationRequest::CreateDirectory {
+                        parent: current,
+                        name,
+                    });
+                    update.insert(Update::LAYOUT | Update::DRAW);
+                }
+            }
+        }
+
+        // Handle properties button press
+        if let Ok(mut flag) = self.properties_requested.lock() {
+            if *flag {
+                *flag = false;
+                // Set pending flag and request selected paths
+                if let Ok(mut pending) = self.pending_properties_request.lock() {
+                    *pending = true;
+                }
+                let _ = self.selected_paths_request_tx.send(());
+                update.insert(Update::DRAW);
+            }
+        }
+
         // Handle delete button - process selected paths response and delete
         if let Some(ref mut rx) = self.selected_paths_response_rx {
             while let Ok(paths) = rx.try_recv() {
                 if !paths.is_empty() {
-                    // Send delete operation request
+                    // Check if this was for properties
+                    if let Ok(mut pending_props) = self.pending_properties_request.lock() {
+                        if *pending_props {
+                            *pending_props = false;
+                            // This was a properties request
+                            let _ = self.operation_tx.send(FileOperationRequest::Properties(paths));
+                            update.insert(Update::LAYOUT | Update::DRAW);
+                            continue;
+                        }
+                    }
+                    // This was a delete request
                     let _ = self.operation_tx.send(FileOperationRequest::Delete(paths));
                     update.insert(Update::LAYOUT | Update::DRAW);
                 }

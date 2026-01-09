@@ -17,6 +17,7 @@ pub enum FileOperationRequest {
     Delete(Vec<PathBuf>),
     CreateDirectory { parent: PathBuf, name: String },
     Rename { from: PathBuf, to: PathBuf },
+    Properties(Vec<PathBuf>),
     // Future: Copy, Move, etc.
 }
 
@@ -67,6 +68,13 @@ impl FileListWrapper {
             selected_paths_response_tx: Some(selected_paths_response_tx),
             pending_delete_confirmation: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Show properties popup for the given paths
+    pub fn show_properties_for_paths(&mut self, paths: &[PathBuf], context: nptk::core::app::context::AppContext) {
+        // Properties functionality is handled internally by FileListContent
+        // This is a placeholder for the public API
+        log::info!("Properties requested for: {:?}", paths);
     }
 
     /// Show delete confirmation dialog
@@ -326,6 +334,17 @@ impl Widget for FileListWrapper {
                                 }
                             }
                         }
+                    }
+                    FileOperationRequest::Properties(paths) => {
+                        // Show properties using the same mechanism as context menu
+                        // We need to trigger the properties action through the FileList's operation channel
+                        // For now, log the request - the actual implementation would need to be done
+                        // through the FileList's internal operation system
+                        log::info!("Properties requested for paths: {:?}", paths);
+                        if let Some(ref tx) = self.status_tx {
+                            let _ = tx.send("Properties functionality available via right-click".to_string());
+                        }
+                        update.insert(Update::DRAW);
                     }
                 }
             }
@@ -609,8 +628,12 @@ impl StatusBarWrapper {
                 let current_path = nav.get_current_path();
                 let path_str = current_path.to_string_lossy().to_string();
                 // Only update if path actually changed to avoid unnecessary updates
-                let current_status = self.status_text.get();
-                if *current_status != path_str && !current_status.starts_with("Error:") && !current_status.contains("Created") && !current_status.contains("Deleted") {
+                // Get current status first, then compare and set if different
+                let should_update = {
+                    let current_status = self.status_text.get();
+                    *current_status != path_str && !current_status.starts_with("Error:") && !current_status.contains("Created") && !current_status.contains("Deleted")
+                };
+                if should_update {
                     self.status_text.set(path_str);
                 }
             }

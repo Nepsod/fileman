@@ -30,7 +30,13 @@ impl NavigationState {
     /// Navigate to a new path
     pub fn navigate_to(&mut self, path: PathBuf) {
         // Only add to history if it's different from current
-        let current = (*self.current_path.get()).clone();
+        let current = if self.history_position < self.path_history.len() {
+            self.path_history[self.history_position].clone()
+        } else {
+            // Fallback to getting from signal if history is inconsistent
+            (*self.current_path.get()).clone()
+        };
+        
         if current != path {
             // Remove any history after current position
             self.path_history.truncate(self.history_position + 1);
@@ -77,11 +83,21 @@ impl NavigationState {
 
     /// Get the current path
     pub fn get_current_path(&self) -> PathBuf {
-        (*self.current_path.get()).clone()
+        if self.history_position < self.path_history.len() {
+            self.path_history[self.history_position].clone()
+        } else {
+            // Fallback to signal if history is inconsistent
+            (*self.current_path.get()).clone()
+        }
     }
 
     /// Get parent directory
     pub fn parent_path(&self) -> Option<PathBuf> {
-        (*self.current_path.get()).parent().map(PathBuf::from)
+        let current = if self.history_position < self.path_history.len() {
+            self.path_history[self.history_position].clone()
+        } else {
+            (*self.current_path.get()).clone()
+        };
+        current.parent().map(PathBuf::from)
     }
 }

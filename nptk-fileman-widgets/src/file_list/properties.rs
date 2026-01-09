@@ -75,7 +75,9 @@ impl FileListContent {
                 .map(|s| s.to_uppercase())
                 .unwrap_or_else(|| "FILE".to_string());
 
-            let mime_type = smol::block_on(MimeDetector::detect_mime_type(path))
+            let mime_type = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(MimeDetector::detect_mime_type(path))
+            })
                 .or_else(|| Self::xdg_mime_filetype(path))
                 .unwrap_or_else(|| "unknown".to_string());
 
@@ -548,7 +550,9 @@ impl Widget for PropertiesContent {
                     .to_string();
 
                 let mime_type = if file_type == FileType::File {
-                    smol::block_on(MimeDetector::detect_mime_type(path))
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(MimeDetector::detect_mime_type(path))
+                    })
                 } else {
                     None
                 };
@@ -579,11 +583,13 @@ impl Widget for PropertiesContent {
 
             if let Some(entry) = entry {
                 if let Ok(file) = get_file_for_uri(&file_entry_to_uri(&entry)) {
-                    if let Ok(thumbnail_image) = smol::block_on(async {
-                        // Try to get existing thumbnail image (checks cache first)
-                        self.thumbnail_service
-                            .get_thumbnail_image(&*file, u32_to_thumbnail_size(self.thumbnail_size), None)
-                            .await
+                    if let Ok(thumbnail_image) = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            // Try to get existing thumbnail image (checks cache first)
+                            self.thumbnail_service
+                                .get_thumbnail_image(&*file, u32_to_thumbnail_size(self.thumbnail_size), None)
+                                .await
+                        })
                     }) {
                         let image_data = ImageData {
                             data: Blob::from(thumbnail_image.data),
@@ -611,8 +617,9 @@ impl Widget for PropertiesContent {
                 if !icon_rendered {
                     let uri = file_entry_to_uri(&entry);
                     if let Ok(file) = get_file_for_uri(&uri) {
-                        if let Some(icon) =
-                            smol::block_on(self.icon_registry.get_file_icon(&*file, icon_size as u32))
+                        if let Some(icon) = tokio::task::block_in_place(|| {
+                            tokio::runtime::Handle::current().block_on(self.icon_registry.get_file_icon(&*file, icon_size as u32))
+                        })
                         {
                         match icon {
                             npio::service::icon::CachedIcon::Image {
