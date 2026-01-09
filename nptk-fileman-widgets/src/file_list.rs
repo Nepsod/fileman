@@ -357,6 +357,7 @@ struct FileListContent {
     pending_action: Arc<Mutex<Option<PendingAction>>>,
     operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
     last_cursor: Option<Point>,
+    menu_was_open: bool, // Track if menu was open in previous update to detect when it closes
 }
 
 #[derive(Clone)]
@@ -416,6 +417,7 @@ impl FileListContent {
             pending_action: Arc::new(Mutex::new(None)),
             operation_tx,
             last_cursor: None,
+            menu_was_open: false,
         }
         .with_thumbnail_size(128)
     }
@@ -1031,57 +1033,86 @@ impl Widget for FileListContent {
             }
         }
 
+        // Check menu state to detect when menu closes
+        let menu_is_open = context.menu_manager.is_open();
+        
         // Process any pending action set by context menu callbacks.
-        if let Ok(mut pending) = self.pending_action.lock() {
-            if let Some(action) = pending.take() {
-                if action.delete {
-                    // Delete action - send via operation channel if available
-                    if let Some(ref op_tx) = self.operation_tx {
-                        if let Err(e) = op_tx.send(FileListOperation::Delete(action.paths.clone())) {
-                            log::error!("Failed to send delete operation: {}", e);
-                        } else {
-                            log::info!("Delete operation sent for paths: {:?}", action.paths);
-                            update.insert(Update::DRAW);
-                        }
-                    } else {
-                        log::warn!("Delete requested but no operation channel available");
-                    }
-                } else if let Some(app_id) = action.app_id {
-                    for path in action.paths.iter() {
-                        if let Err(err) = self.mime_registry.launch(&app_id, path) {
-                            log::warn!(
-                                "Failed to launch {} with {}: {}",
-                                path.display(),
-                                app_id,
-                                err
-                            );
-                        }
-                    }
-                } else if action.properties {
-                    self.show_properties_popup(&action.paths, context);
-                } else {
-                    if action.paths.len() == 1 {
-                        let path = &action.paths[0];
-                        if path.is_dir() {
-                            self.current_path.set(path.clone());
-                            let _ = self.fs_model.refresh(path);
-                            self.selected_paths.set(Vec::new());
-                            update.insert(Update::LAYOUT | Update::DRAW);
-                        } else {
-                            FileListContent::launch_path(self.mime_registry.clone(), path.clone());
-                        }
-                    } else {
-                        // Multi-selection: launch all files, skip directories.
-                        for path in action.paths.iter() {
-                            if path.is_dir() {
-                                continue;
+        // Menu item actions set pending_action when clicked, and we should process it
+        // immediately (menu item actions return Update::DRAW which triggers this update cycle).
+        // However, we need to prevent stale actions from being processed when clicking elsewhere.
+        // Strategy: Only process pending_action if:
+        // 1. Menu is currently open (action was just triggered by menu item click), OR
+        // 2. Menu just closed AND we had a pending action (menu item was clicked before menu closed)
+        // Clear pending_action if menu closes without an action being processed
+        let should_process = menu_is_open || (self.menu_was_open && !menu_is_open);
+        
+        if should_process {
+            if let Ok(mut pending) = self.pending_action.lock() {
+                if let Some(action) = pending.take() {
+                    // Action was set - process it immediately
+                    if action.delete {
+                        // Delete action - send via operation channel if available
+                        if let Some(ref op_tx) = self.operation_tx {
+                            if let Err(e) = op_tx.send(FileListOperation::Delete(action.paths.clone())) {
+                                log::error!("Failed to send delete operation: {}", e);
+                            } else {
+                                log::info!("Delete operation sent for paths: {:?}", action.paths);
+                                update.insert(Update::DRAW);
                             }
-                            FileListContent::launch_path(self.mime_registry.clone(), path.clone());
+                        } else {
+                            log::warn!("Delete requested but no operation channel available");
+                        }
+                    } else if let Some(app_id) = action.app_id {
+                        for path in action.paths.iter() {
+                            if let Err(err) = self.mime_registry.launch(&app_id, path) {
+                                log::warn!(
+                                    "Failed to launch {} with {}: {}",
+                                    path.display(),
+                                    app_id,
+                                    err
+                                );
+                            }
+                        }
+                    } else if action.properties {
+                        self.show_properties_popup(&action.paths, context);
+                    } else {
+                        if action.paths.len() == 1 {
+                            let path = &action.paths[0];
+                            if path.is_dir() {
+                                self.current_path.set(path.clone());
+                                let _ = self.fs_model.refresh(path);
+                                self.selected_paths.set(Vec::new());
+                                update.insert(Update::LAYOUT | Update::DRAW);
+                            } else {
+                                FileListContent::launch_path(self.mime_registry.clone(), path.clone());
+                            }
+                        } else {
+                            // Multi-selection: launch all files, skip directories.
+                            for path in action.paths.iter() {
+                                if path.is_dir() {
+                                    continue;
+                                }
+                                FileListContent::launch_path(self.mime_registry.clone(), path.clone());
+                            }
                         }
                     }
+                } else if !menu_is_open && self.menu_was_open {
+                    // Menu closed without pending action - this is normal (menu closed without item click)
+                    // No action to process or clear
+                }
+            }
+        } else if !menu_is_open {
+            // Menu is not open and wasn't open before - clear any stale pending_action
+            // This prevents actions from being processed when clicking elsewhere after menu was closed
+            if let Ok(mut pending) = self.pending_action.lock() {
+                if pending.is_some() {
+                    log::debug!("Clearing stale pending_action - no menu context");
+                    *pending = None;
                 }
             }
         }
+        
+        self.menu_was_open = menu_is_open;
 
         update
     }
