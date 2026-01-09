@@ -7,3 +7,9 @@ pub use nptk::{core as nptk_core,
 
 /// Contains the [file_list::FileList] widget.
 pub mod file_list;
+
+/// Contains the [fileman_sidebar::FilemanSidebar] widget.
+pub mod fileman_sidebar;
+
+// Re-export for convenience
+pub use fileman_sidebar::FilemanSidebar;

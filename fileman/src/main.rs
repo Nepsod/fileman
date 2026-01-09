@@ -2,7 +2,6 @@ mod app;
 mod navigation;
 mod window;
 mod toolbar;
-mod sidebar;
 mod menus;
 mod operations;
 
