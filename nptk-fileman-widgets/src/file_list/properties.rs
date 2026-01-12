@@ -1,4 +1,5 @@
 use super::FileListContent;
+use nptk::prelude::LengthPercentage;
 use nptk::widgets::file_icon::renderer::{render_image_icon, render_svg_icon_with_arc_cache};
 use nptk::widgets::tabs_container::{TabItem, TabsContainer};
 use chrono::{DateTime, Local};
@@ -133,6 +134,8 @@ impl FileListContent {
             (format!("{} items", count), "MULTI".to_string())
         };
 
+        let title_clone = title.clone();
+        let rows_clone = rows.clone();
         let data = PropertiesData {
             title,
             icon_label,
@@ -405,7 +408,7 @@ impl PropertiesContent {
 
 impl Widget for PropertiesContent {
     fn widget_id(&self) -> WidgetId {
-        WidgetId::new("nptk-widgets", "FileListProperties")
+        WidgetId::new("nptk-fileman-widgets", "FileListProperties")
     }
 
     fn layout_style(&self) -> StyleNode {

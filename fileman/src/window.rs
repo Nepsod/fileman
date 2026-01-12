@@ -40,6 +40,10 @@ struct FileListWrapper {
     selected_paths_response_tx: Option<mpsc::UnboundedSender<Vec<PathBuf>>>,
     // Pending delete operations waiting for confirmation (from toolbar)
     pending_delete_confirmation: Arc<Mutex<Option<Vec<PathBuf>>>>,
+    // Selection change notification channels
+    selection_change_rx: Option<mpsc::UnboundedReceiver<Vec<PathBuf>>>,
+    selection_change_toolbar_tx: Option<mpsc::UnboundedSender<Vec<PathBuf>>>,
+    selection_change_status_tx: Option<mpsc::UnboundedSender<Vec<PathBuf>>>,
 }
 
 impl FileListWrapper {
@@ -51,12 +55,17 @@ impl FileListWrapper {
         status_tx: mpsc::UnboundedSender<String>,
         selected_paths_request_rx: mpsc::UnboundedReceiver<()>,
         selected_paths_response_tx: mpsc::UnboundedSender<Vec<PathBuf>>,
+        selection_change_toolbar_tx: mpsc::UnboundedSender<Vec<PathBuf>>,
+        selection_change_status_tx: mpsc::UnboundedSender<Vec<PathBuf>>,
     ) -> Self {
         // Create channel for FileList operations
         let (file_list_op_tx, file_list_op_rx) = mpsc::unbounded_channel::<FileListOperation>();
         
+        // Create channel to receive selection changes from FileList
+        let (selection_change_file_list_tx, selection_change_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
+        
         Self {
-            file_list: FileList::new_with_operations(initial_path.clone(), Some(file_list_op_tx)),
+            file_list: FileList::new_with_operations(initial_path.clone(), Some(file_list_op_tx), Some(selection_change_file_list_tx)),
             navigation,
             last_path: initial_path,
             navigation_rx: Some(navigation_rx),
@@ -67,6 +76,9 @@ impl FileListWrapper {
             selected_paths_request_rx: Some(selected_paths_request_rx),
             selected_paths_response_tx: Some(selected_paths_response_tx),
             pending_delete_confirmation: Arc::new(Mutex::new(None)),
+            selection_change_rx: Some(selection_change_rx),
+            selection_change_toolbar_tx: Some(selection_change_toolbar_tx),
+            selection_change_status_tx: Some(selection_change_status_tx),
         }
     }
 
@@ -230,12 +242,33 @@ impl Widget for FileListWrapper {
         }
 
         // Handle selected paths requests (for toolbar delete button)
+        // IMPORTANT: Only respond if there was an actual request - this prevents
+        // selection changes from accidentally triggering delete operations
         if let Some(ref mut rx) = self.selected_paths_request_rx {
             while rx.try_recv().is_ok() {
-                // Respond with current selection
+                // Only respond if there's actually a selection - this prevents empty responses
+                // that might be misinterpreted
                 let selected = self.file_list.selected_paths();
-                if let Some(ref tx) = self.selected_paths_response_tx {
-                    let _ = tx.send(selected);
+                if !selected.is_empty() {
+                    if let Some(ref tx) = self.selected_paths_response_tx {
+                        let _ = tx.send(selected);
+                    }
+                }
+            }
+        }
+
+        // Forward selection changes to toolbar and statusbar
+        // IMPORTANT: These go through selection_change_toolbar_tx, NOT selected_paths_response_tx
+        if let Some(ref mut rx) = self.selection_change_rx {
+            while let Ok(selected_paths) = rx.try_recv() {
+                log::debug!("Forwarding selection change ({} path(s)) to toolbar and statusbar", selected_paths.len());
+                // Forward to toolbar
+                if let Some(ref tx) = self.selection_change_toolbar_tx {
+                    let _ = tx.send(selected_paths.clone());
+                }
+                // Forward to statusbar
+                if let Some(ref tx) = self.selection_change_status_tx {
+                    let _ = tx.send(selected_paths);
                 }
             }
         }
@@ -292,6 +325,7 @@ impl Widget for FileListWrapper {
                 match op {
                     FileOperationRequest::Delete(paths) => {
                         // Collect delete requests to show confirmation dialog
+                        log::warn!("RECEIVED DELETE REQUEST for {} path(s)", paths.len());
                         pending_deletes.push(paths);
                     }
                     FileOperationRequest::CreateDirectory { parent, name } => {
@@ -351,6 +385,9 @@ impl Widget for FileListWrapper {
         }
         
         // Show confirmation dialogs for pending delete operations (after releasing borrow)
+        if !pending_deletes.is_empty() {
+            log::warn!("SHOWING {} DELETE CONFIRMATION DIALOG(S)", pending_deletes.len());
+        }
         for paths in pending_deletes {
             self.show_delete_confirmation_dialog(&paths, context.clone());
             update.insert(Update::DRAW);
@@ -575,12 +612,15 @@ struct StatusBarWrapper {
     status_text: StateSignal<String>,
     status_message_timeout: Option<std::time::Instant>,
     signals_hooked: bool,
+    selection_change_rx: Option<mpsc::UnboundedReceiver<Vec<PathBuf>>>, // Selection change notifications
+    selection_count: usize, // Current selection count
 }
 
 impl StatusBarWrapper {
     fn new(
         navigation: Arc<Mutex<crate::navigation::NavigationState>>,
         status_rx: mpsc::UnboundedReceiver<String>,
+        selection_change_rx: mpsc::UnboundedReceiver<Vec<PathBuf>>,
     ) -> Self {
         let status_text = StateSignal::new("Ready".to_string());
         
@@ -607,6 +647,8 @@ impl StatusBarWrapper {
             status_text,
             status_message_timeout: None,
             signals_hooked: false,
+            selection_change_rx: Some(selection_change_rx),
+            selection_count: 0,
         }
     }
 
@@ -618,23 +660,33 @@ impl StatusBarWrapper {
                 // Update to show current path after message timeout
                 if let Ok(nav) = self.navigation.lock() {
                     let current_path = nav.get_current_path();
-                    self.status_text.set(current_path.to_string_lossy().to_string());
+                    let path_str = current_path.to_string_lossy().to_string();
+                    let status_msg = if self.selection_count > 0 {
+                        format!("{} - {} item(s) selected", path_str, self.selection_count)
+                    } else {
+                        path_str
+                    };
+                    self.status_text.set(status_msg);
                 }
             }
         } else {
-            // No temporary message - show current path
-            // TODO: Enhance to show file count and selection count when available
+            // No temporary message - show current path (with selection count if applicable)
             if let Ok(nav) = self.navigation.lock() {
                 let current_path = nav.get_current_path();
                 let path_str = current_path.to_string_lossy().to_string();
-                // Only update if path actually changed to avoid unnecessary updates
+                let status_msg = if self.selection_count > 0 {
+                    format!("{} - {} item(s) selected", path_str, self.selection_count)
+                } else {
+                    path_str
+                };
+                // Only update if path or selection count actually changed to avoid unnecessary updates
                 // Get current status first, then compare and set if different
                 let should_update = {
                     let current_status = self.status_text.get();
-                    *current_status != path_str && !current_status.starts_with("Error:") && !current_status.contains("Created") && !current_status.contains("Deleted")
+                    *current_status != status_msg && !current_status.starts_with("Error:") && !current_status.contains("Created") && !current_status.contains("Deleted")
                 };
                 if should_update {
-                    self.status_text.set(path_str);
+                    self.status_text.set(status_msg);
                 }
             }
         }
@@ -662,6 +714,14 @@ impl Widget for StatusBarWrapper {
         if !self.signals_hooked {
             context.hook_signal(&mut self.status_text);
             self.signals_hooked = true;
+        }
+
+        // Poll selection change notifications
+        if let Some(ref mut rx) = self.selection_change_rx {
+            while let Ok(paths) = rx.try_recv() {
+                self.selection_count = paths.len();
+                update.insert(Update::DRAW);
+            }
         }
 
         // Poll status messages from operations (these are temporary messages)
@@ -716,6 +776,10 @@ pub fn build_window(_context: AppContext, state: AppState) -> impl Widget {
     let (selected_paths_request_tx, selected_paths_request_rx) = mpsc::unbounded_channel::<()>();
     let (selected_paths_response_tx, selected_paths_response_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
 
+    // Create selection change channels
+    let (selection_change_toolbar_tx, selection_change_toolbar_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
+    let (selection_change_status_tx, selection_change_status_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
+
     // Create FilemanSidebar
     let mut sidebar = FilemanSidebar::new()
         .with_places(true)
@@ -735,6 +799,8 @@ pub fn build_window(_context: AppContext, state: AppState) -> impl Widget {
         status_tx.clone(),
         selected_paths_request_rx,
         selected_paths_response_tx.clone(),
+        selection_change_toolbar_tx.clone(),
+        selection_change_status_tx.clone(),
     );
 
     // Create ToolbarWrapper
@@ -743,6 +809,7 @@ pub fn build_window(_context: AppContext, state: AppState) -> impl Widget {
         operation_tx.clone(),
         selected_paths_request_tx,
         selected_paths_response_rx,
+        selection_change_toolbar_rx,
     );
 
     // Create LocationBarWrapper
@@ -755,6 +822,7 @@ pub fn build_window(_context: AppContext, state: AppState) -> impl Widget {
     let statusbar = StatusBarWrapper::new(
         nav_clone.clone(),
         status_rx,
+        selection_change_status_rx,
     );
 
     // Build main layout

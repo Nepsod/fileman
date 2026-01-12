@@ -78,6 +78,9 @@ pub struct FileList {
 
     // Track if signals are hooked
     signals_hooked: bool,
+
+    // Selection change notification channel
+    selection_change_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
 }
 
 impl FileList {
@@ -88,15 +91,17 @@ impl FileList {
 
     /// Create a new file list widget.
     pub fn new(initial_path: PathBuf) -> Self {
-        Self::new_with_operations(initial_path, None)
+        Self::new_with_operations(initial_path, None, None)
     }
 
     /// Create a new file list widget with optional operation channel for file operations.
     /// 
     /// `operation_tx` - if provided, file operations (like delete) will be sent via this channel.
+    /// `selection_change_tx` - if provided, selection changes will be notified via this channel.
     pub fn new_with_operations(
         initial_path: PathBuf,
         operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
+        selection_change_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>,
     ) -> Self {
         let fs_model = Arc::new(FileSystemModel::new(initial_path.clone()).unwrap());
         let event_rx = Arc::new(Mutex::new(fs_model.subscribe_events()));
@@ -126,6 +131,9 @@ impl FileList {
         // Create channel for cache update notifications
         let (cache_update_tx, cache_update_rx) = tokio::sync::mpsc::unbounded_channel();
 
+        // Wrap selection_change_tx in Arc for sharing with FileListContent
+        let selection_change_tx_arc = selection_change_tx.map(|tx| Arc::new(tx));
+
         // Create content widget
         let content = FileListContent::new(
             entries.clone(),
@@ -140,6 +148,7 @@ impl FileList {
             cache_update_tx,
             cache_update_rx,
             operation_tx,
+            selection_change_tx_arc.clone(),
         );
 
         // Create scroll container (Both directions to support icon view)
@@ -163,6 +172,7 @@ impl FileList {
             .into(),
             scroll_container: Box::new(scroll_container),
             signals_hooked: false,
+            selection_change_tx: selection_change_tx_arc,
         }
     }
 
@@ -191,13 +201,21 @@ impl FileList {
     /// Clear the selection.
     pub fn clear_selection(&mut self) {
         self.selected_paths.set(Vec::new());
+        // Notify about selection change
+        if let Some(ref tx) = self.selection_change_tx {
+            let _ = tx.send(Vec::new());
+        }
     }
 
     /// Select all entries.
     pub fn select_all(&mut self) {
         let entries = self.entries.get();
         let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
-        self.selected_paths.set(paths);
+        self.selected_paths.set(paths.clone());
+        // Notify about selection change
+        if let Some(ref tx) = self.selection_change_tx {
+            let _ = tx.send(paths);
+        }
     }
 
     /// Set the view mode.
@@ -372,6 +390,7 @@ struct FileListContent {
     last_cursor: Option<Point>,
     menu_was_open: bool, // Track if menu was open in previous update to detect when it closes
     pending_delete_confirmation: Arc<Mutex<Option<Vec<PathBuf>>>>, // Paths waiting for delete confirmation
+    selection_change_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>, // Channel to notify about selection changes
 }
 
 #[derive(Clone)]
@@ -396,6 +415,7 @@ impl FileListContent {
         cache_update_tx: tokio::sync::mpsc::UnboundedSender<()>,
         cache_update_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
         operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
+        selection_change_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
     ) -> Self {
         Self {
             entries,
@@ -433,6 +453,7 @@ impl FileListContent {
             last_cursor: None,
             menu_was_open: false,
             pending_delete_confirmation: Arc::new(Mutex::new(None)),
+            selection_change_tx,
         }
         .with_thumbnail_size(128)
     }
@@ -440,6 +461,13 @@ impl FileListContent {
     pub fn with_thumbnail_size(mut self, size: u32) -> Self {
         self.thumbnail_size = size;
         self
+    }
+
+    /// Notify about selection changes via channel if available
+    fn notify_selection_change(&self, paths: &[PathBuf]) {
+        if let Some(ref tx) = self.selection_change_tx {
+            let _ = tx.send(paths.to_vec());
+        }
     }
 
     fn is_selected(&self, path: &PathBuf) -> bool {
@@ -528,7 +556,9 @@ impl FileListContent {
             }
         }
 
+        let new_selection_clone = new_selection.clone();
         self.selected_paths.set(new_selection);
+        self.notify_selection_change(&new_selection_clone);
     }
 
     /// Show a confirmation dialog asking if the user is sure they want to delete the selected files
@@ -905,8 +935,21 @@ impl Widget for FileListContent {
                                 } else {
                                     current_selection = vec![target_path.clone()];
                                 }
-                                self.selected_paths.set(current_selection.clone());
+                                let current_selection_clone = current_selection.clone();
+                                self.selected_paths.set(current_selection_clone.clone());
+                                self.notify_selection_change(&current_selection_clone);
                                 update.insert(Update::DRAW);
+                            }
+
+                            // IMPORTANT: Clear any stale pending_action when opening a new context menu
+                            // This prevents stale actions from previous menu sessions being processed
+                            if let Ok(mut pending_clear) = self.pending_action.lock() {
+                                if pending_clear.is_some() {
+                                    log::warn!("====== RIGHT-CLICK: Clearing stale pending_action when opening new context menu ======");
+                                    *pending_clear = None;
+                                } else {
+                                    log::debug!("Right-click: Opening context menu, no stale pending_action");
+                                }
                             }
 
                             let pending = self.pending_action.clone();
@@ -954,6 +997,7 @@ impl Widget for FileListContent {
                             core_items.push(
                                 MenuItem::new(MenuCommand::FileDelete, "Delete")
                                     .with_action(move || {
+                                        log::warn!("====== DELETE MENU ITEM CLICKED - setting pending_action for {} paths ======", delete_paths.len());
                                         if let Ok(mut pending_lock) = pending_delete.lock() {
                                             *pending_lock = Some(PendingAction {
                                                 paths: delete_paths.clone(),
@@ -961,6 +1005,7 @@ impl Widget for FileListContent {
                                                 properties: false,
                                                 delete: true,
                                             });
+                                            log::warn!("====== pending_action.delete set to true ======");
                                         }
                                         Update::DRAW
                                     }),
@@ -972,6 +1017,7 @@ impl Widget for FileListContent {
                             core_items.push(
                                 MenuItem::new(MenuCommand::Custom(0x2006), "Properties")
                                     .with_action(move || {
+                                        println!("DEBUG: Properties menu item clicked");
                                         if let Ok(mut pending_lock) = pending_props.lock() {
                                             *pending_lock = Some(PendingAction {
                                                 paths: props_paths.clone(),
@@ -979,6 +1025,7 @@ impl Widget for FileListContent {
                                                 properties: true,
                                                 delete: false,
                                             });
+                                            println!("DEBUG: Properties action set in pending_action");
                                         }
                                         Update::DRAW
                                     }),
@@ -1012,6 +1059,7 @@ impl Widget for FileListContent {
                         }
 
                         if *btn == MouseButton::Left && *el == ElementState::Pressed {
+                            log::debug!("LEFT-CLICK on file: {:?}", target_path.file_name());
                             let mut selected = self.selected_paths.get().clone();
                             let is_currently_selected = selected.contains(&target_path);
 
@@ -1038,7 +1086,9 @@ impl Widget for FileListContent {
                                 self.anchor_index = Some(index.unwrap_or(0));
                             }
 
+                            let selected_clone = selected.clone();
                             self.selected_paths.set(selected);
+                            self.notify_selection_change(&selected_clone);
                             update.insert(Update::DRAW);
 
                             let now = Instant::now();
@@ -1053,6 +1103,7 @@ impl Widget for FileListContent {
                                                 self.current_path.set(target_path.clone());
                                                 let _ = self.fs_model.refresh(&target_path);
                                                 self.selected_paths.set(Vec::new());
+                                                self.notify_selection_change(&Vec::new());
                                                 update.insert(Update::LAYOUT);
                                             }
                                         }
@@ -1074,6 +1125,7 @@ impl Widget for FileListContent {
 
                             if !info.modifiers.control_key() {
                                 self.selected_paths.set(Vec::new());
+                                self.notify_selection_change(&Vec::new());
                                 update.insert(Update::DRAW);
                             }
                         }
@@ -1135,17 +1187,24 @@ impl Widget for FileListContent {
         // immediately (menu item actions return Update::DRAW which triggers this update cycle).
         // However, we need to prevent stale actions from being processed when clicking elsewhere.
         // Strategy: Only process pending_action if:
-        // 1. Menu is currently open (action was just triggered by menu item click), OR
-        // 2. Menu just closed AND we had a pending action (menu item was clicked before menu closed)
-        // Clear pending_action if menu closes without an action being processed
-        let should_process = menu_is_open || (self.menu_was_open && !menu_is_open);
+        // 1. Menu just closed (menu_was_open && !menu_is_open)
+        // 2. There is actually a pending action set
+        // 3. The pending action was set by a menu item click (not stale from a previous session)
+        let menu_just_closed = !menu_is_open && self.menu_was_open;
         
-        if should_process {
+        if menu_just_closed {
+            log::debug!("Menu just closed, checking for pending_action");
             if let Ok(mut pending) = self.pending_action.lock() {
                 if let Some(action) = pending.take() {
+                    // Action was set by a menu item click during this menu session
+                    println!("DEBUG: Processing pending action - properties: {}, delete: {}, paths: {}", 
+                             action.properties, action.delete, action.paths.len());
+                    log::warn!("====== MENU CLOSED - PROCESSING PENDING ACTION: delete={}, properties={}, paths={} ======", 
+                              action.delete, action.properties, action.paths.len());
                     // Action was set - process it immediately
                     if action.delete {
                         // Delete action - show confirmation dialog first
+                        log::warn!("====== SHOWING DELETE CONFIRMATION DIALOG for {} paths ======", action.paths.len());
                         self.show_delete_confirmation_dialog(&action.paths, context);
                         update.insert(Update::DRAW);
                     } else if let Some(app_id) = action.app_id {
@@ -1160,6 +1219,8 @@ impl Widget for FileListContent {
                             }
                         }
                     } else if action.properties {
+                        println!("DEBUG: Properties action triggered for {} paths", action.paths.len());
+                        log::info!("Properties action triggered for {} paths", action.paths.len());
                         self.show_properties_popup(&action.paths, context);
                     } else {
                         if action.paths.len() == 1 {
@@ -1168,6 +1229,7 @@ impl Widget for FileListContent {
                                 self.current_path.set(path.clone());
                                 let _ = self.fs_model.refresh(path);
                                 self.selected_paths.set(Vec::new());
+                                self.notify_selection_change(&Vec::new());
                                 update.insert(Update::LAYOUT | Update::DRAW);
                             } else {
                                 FileListContent::launch_path(self.mime_registry.clone(), path.clone());
@@ -1182,9 +1244,9 @@ impl Widget for FileListContent {
                             }
                         }
                     }
-                } else if !menu_is_open && self.menu_was_open {
-                    // Menu closed without pending action - this is normal (menu closed without item click)
-                    // No action to process or clear
+                } else {
+                    // Menu closed but no pending action - this is normal (user clicked outside or pressed Esc)
+                    log::debug!("Menu closed without pending action - user dismissed menu");
                 }
             }
         } else if !menu_is_open {
@@ -1192,13 +1254,19 @@ impl Widget for FileListContent {
             // This prevents actions from being processed when clicking elsewhere after menu was closed
             if let Ok(mut pending) = self.pending_action.lock() {
                 if pending.is_some() {
-                    log::debug!("Clearing stale pending_action - no menu context");
+                    log::warn!("Clearing stale pending_action - no menu context (should not happen after fixes)");
                     *pending = None;
                 }
             }
         }
         
-        self.menu_was_open = menu_is_open;
+        // Update menu state AFTER processing but BEFORE next cycle
+        // Reset menu_was_open to false once we've processed the action to prevent re-processing
+        if menu_just_closed {
+            self.menu_was_open = false;
+        } else {
+            self.menu_was_open = menu_is_open;
+        }
 
         // Process confirmed delete operations (user clicked "Delete" in confirmation dialog)
         if let Ok(mut pending_delete) = self.pending_delete_confirmation.lock() {
