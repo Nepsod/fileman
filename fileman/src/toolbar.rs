@@ -64,7 +64,10 @@ impl ToolbarWrapper {
         let nav_clone5 = navigation.clone();
         let op_tx_clone = operation_tx.clone();
         
-        let back_btn = ToolbarButton::new(Text::new("←".to_string()))
+        let back_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("arrow-left", 24, None)),
+            Box::new(Text::new("←".to_string()))
+        ])
             .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
                 if let Ok(mut nav) = nav_clone1.lock() {
                     if nav.go_back().is_some() {
@@ -74,7 +77,10 @@ impl ToolbarWrapper {
                 Update::empty()
             }))));
 
-        let forward_btn = ToolbarButton::new(Text::new("→".to_string()))
+        let forward_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("arrow-right", 24, None)),
+            Box::new(Text::new("→".to_string()))
+        ])
             .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
                 if let Ok(mut nav) = nav_clone2.lock() {
                     if nav.go_forward().is_some() {
@@ -84,7 +90,10 @@ impl ToolbarWrapper {
                 Update::empty()
             }))));
 
-        let up_btn = ToolbarButton::new(Text::new("↑".to_string()))
+        let up_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("arrow-up", 24, None)),
+            Box::new(Text::new("↑".to_string()))
+        ])
             .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
                 if let Ok(mut nav) = nav_clone3.lock() {
                     if let Some(parent) = nav.parent_path() {
@@ -95,7 +104,10 @@ impl ToolbarWrapper {
                 Update::empty()
             }))));
 
-        let home_btn = ToolbarButton::new(Text::new("Home".to_string()))
+        let home_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("folder-home", 24, None)),
+            Box::new(Text::new("Home".to_string()))
+        ])
             .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
                 if let Ok(mut nav) = nav_clone4.lock() {
                     let home = std::env::var("HOME")
@@ -109,7 +121,10 @@ impl ToolbarWrapper {
             }))));
 
         let new_folder_requested = Arc::new(Mutex::new(false));
-        let new_folder_btn = ToolbarButton::new(Text::new("New Folder".to_string()))
+        let new_folder_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("folder-new", 24, None)),
+            Box::new(Text::new("New Folder".to_string()))
+        ])
             .with_on_pressed({
                 let new_folder_flag = new_folder_requested.clone();
                 nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
@@ -122,7 +137,10 @@ impl ToolbarWrapper {
 
         let properties_requested = Arc::new(Mutex::new(false));
         let pending_properties_request = Arc::new(Mutex::new(false));
-        let properties_btn = ToolbarButton::new(Text::new("Properties".to_string()))
+        let properties_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("document-properties", 24, None)),
+            Box::new(Text::new("Properties".to_string()))
+        ])
             .with_on_pressed({
                 let properties_flag = properties_requested.clone();
                 nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
@@ -138,7 +156,10 @@ impl ToolbarWrapper {
         let sel_request_tx = selected_paths_request_tx.clone();
         let pending_delete_flag = Arc::new(Mutex::new(false));
         let pending_delete_flag_clone = pending_delete_flag.clone();
-        let delete_btn = ToolbarButton::new(Text::new("Delete".to_string()))
+        let delete_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("delete", 24, None)),
+            Box::new(Text::new("Delete".to_string()))
+            ])
             .with_on_pressed({
                 let flag = pending_delete_flag_clone.clone();
                 let req_tx = sel_request_tx.clone();
