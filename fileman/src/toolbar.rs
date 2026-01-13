@@ -75,7 +75,8 @@ impl ToolbarWrapper {
                     }
                 }
                 Update::empty()
-            }))));
+            }))))
+            .with_tooltip("Go back");
 
         let forward_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-right", 24, None)),
@@ -88,7 +89,8 @@ impl ToolbarWrapper {
                     }
                 }
                 Update::empty()
-            }))));
+            }))))
+            .with_tooltip("Go forward");
 
         let up_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-up", 24, None)),
@@ -118,7 +120,8 @@ impl ToolbarWrapper {
                     return Update::LAYOUT | Update::DRAW;
                 }
                 Update::empty()
-            }))));
+            }))))
+            .with_tooltip("Go home");
 
         let new_folder_requested = Arc::new(Mutex::new(false));
         let new_folder_btn = ToolbarButton::with_children(vec![
@@ -133,7 +136,8 @@ impl ToolbarWrapper {
                     }
                     Update::DRAW
                 })))
-            });
+            })
+            .with_tooltip("New folder");
 
         let properties_requested = Arc::new(Mutex::new(false));
         let pending_properties_request = Arc::new(Mutex::new(false));
@@ -149,7 +153,8 @@ impl ToolbarWrapper {
                     }
                     Update::DRAW
                 })))
-            });
+            })
+            .with_tooltip("Properties");
 
         // Delete button - request selected paths and delete them
         let delete_op_tx = operation_tx.clone();
@@ -179,7 +184,8 @@ impl ToolbarWrapper {
                     }
                     Update::DRAW
                 })))
-            });
+            })
+            .with_tooltip("Delete");
 
         let toolbar = Toolbar::new()
             .with_child(back_btn)

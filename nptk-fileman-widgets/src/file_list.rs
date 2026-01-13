@@ -45,6 +45,8 @@ use std::path::PathBuf;
 use nptk::widgets::container::Container;
 use nptk::widgets::button::Button;
 use nptk::widgets::text::Text;
+use humansize::{format_size, BINARY};
+use std::fs;
 
 /// View mode for the file list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -391,6 +393,10 @@ struct FileListContent {
     menu_was_open: bool, // Track if menu was open in previous update to detect when it closes
     pending_delete_confirmation: Arc<Mutex<Option<Vec<PathBuf>>>>, // Paths waiting for delete confirmation
     selection_change_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>, // Channel to notify about selection changes
+    
+    // Tooltip state
+    hovered_item_index: Option<usize>, // Index of file item currently hovered
+    tooltip_shown: bool, // Track if tooltip popup is currently shown
 }
 
 #[derive(Clone)]
@@ -454,6 +460,8 @@ impl FileListContent {
             menu_was_open: false,
             pending_delete_confirmation: Arc::new(Mutex::new(None)),
             selection_change_tx,
+            hovered_item_index: None,
+            tooltip_shown: false,
         }
         .with_thumbnail_size(128)
     }
@@ -472,6 +480,65 @@ impl FileListContent {
 
     fn is_selected(&self, path: &PathBuf) -> bool {
         self.selected_paths.get().contains(path)
+    }
+
+    /// Format file size for tooltip display
+    fn format_file_size_for_tooltip(&self, path: &PathBuf) -> String {
+        if let Ok(metadata) = fs::metadata(path) {
+            if metadata.is_dir() {
+                // For directories, just show "Directory" (not recursive size - too expensive for tooltips)
+                "Directory".to_string()
+            } else {
+                // For files, show human-readable size
+                format_size(metadata.len(), BINARY)
+            }
+        } else {
+            "Unknown size".to_string()
+        }
+    }
+
+    /// Find the file item index under the given cursor position (for tooltip hover detection)
+    fn find_item_under_cursor(&self, local_x: f32, local_y: f32, layout_width: f32, view_mode: FileListViewMode, icon_size: u32, entries_len: usize) -> Option<usize> {
+        if view_mode == FileListViewMode::List {
+            // List view: simple row calculation
+            let idx = (local_y / self.item_height) as usize;
+            if idx < entries_len {
+                Some(idx)
+            } else {
+                None
+            }
+        } else if view_mode == FileListViewMode::Icon {
+            // Icon view: grid calculation
+            let (columns, cell_width, cell_height) = self.calculate_icon_view_layout(layout_width, icon_size);
+            let col = (local_x / cell_width).floor() as usize;
+            let row = (local_y / cell_height).floor() as usize;
+            let idx = row * columns + col;
+            if idx < entries_len {
+                Some(idx)
+            } else {
+                None
+            }
+        } else if view_mode == FileListViewMode::Compact {
+            // Compact view: grid calculation with spacing
+            let (columns, cell_width, cell_height, spacing) = self.calculate_compact_view_layout(layout_width);
+            let col = ((local_x - self.icon_view_padding) / (cell_width + spacing)).floor() as usize;
+            let row = ((local_y - self.icon_view_padding) / (cell_height + spacing)).floor() as usize;
+            let idx = row * columns + col;
+            if idx < entries_len {
+                let cell_x = self.icon_view_padding + col as f32 * (cell_width + spacing);
+                let cell_y = self.icon_view_padding + row as f32 * (cell_height + spacing);
+                // Check if cursor is within the cell bounds
+                if local_x >= cell_x && local_x < cell_x + cell_width && local_y >= cell_y && local_y < cell_y + cell_height {
+                    Some(idx)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
     }
 
     fn update_drag_selection(&mut self, selection_rect: Rect, toggle: bool, layout_width: f32) {
@@ -560,6 +627,7 @@ impl FileListContent {
         self.selected_paths.set(new_selection);
         self.notify_selection_change(&new_selection_clone);
     }
+
 
     /// Show a confirmation dialog asking if the user is sure they want to delete the selected files
     pub(super) fn show_delete_confirmation_dialog(&self, paths: &[PathBuf], context: AppContext) {
@@ -693,6 +761,57 @@ impl Widget for FileListContent {
 
         if let Some(cursor) = info.cursor_pos {
             self.last_cursor = Some(Point::new(cursor.x, cursor.y));
+        }
+
+        // Tooltip hover detection
+        let view_mode = *self.view_mode.get();
+        let entries_len = self.entries.get().len();
+        let icon_size = *self.icon_size.get();
+        let current_hovered_index = if let Some(cursor) = info.cursor_pos {
+            let local_y = cursor.y as f32 - layout.layout.location.y;
+            let local_x = cursor.x as f32 - layout.layout.location.x;
+            let in_bounds = local_x >= 0.0
+                && local_x < layout.layout.size.width
+                && local_y >= 0.0
+                && local_y < layout.layout.size.height;
+            
+            if in_bounds {
+                self.find_item_under_cursor(local_x, local_y, layout.layout.size.width, view_mode, icon_size, entries_len)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Update hover state and show/hide tooltip
+        if current_hovered_index != self.hovered_item_index {
+            // Hover state changed
+            if let Some(index) = current_hovered_index {
+                if index < entries_len {
+                    let entry_path = {
+                        let entries = self.entries.get();
+                        entries[index].path.clone()
+                    };
+                    let tooltip_text = self.format_file_size_for_tooltip(&entry_path);
+                    // Show tooltip using TooltipManager
+                    if let Some(cursor) = info.cursor_pos {
+                        context.request_tooltip_show(
+                            tooltip_text,
+                            self.widget_id(),
+                            (cursor.x, cursor.y),
+                        );
+                    }
+                    self.hovered_item_index = Some(index);
+                    self.tooltip_shown = true;
+                }
+            } else {
+                // Mouse left the item - hide tooltip
+                context.request_tooltip_hide();
+                self.hovered_item_index = None;
+                self.tooltip_shown = false;
+            }
+            update.insert(Update::DRAW);
         }
 
         // Track viewport width changes to keep height estimation accurate and invalidate cached layouts.
