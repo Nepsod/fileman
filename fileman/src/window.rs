@@ -1,6 +1,5 @@
 use nptk::prelude::*;
 use nptk::core::signal::eval::EvalSignal;
-use nptk::core::window::{ElementState, KeyCode, PhysicalKey};
 use nptk_fileman_widgets::file_list::{FileList, FileListOperation};
 use nptk_fileman_widgets::FilemanSidebar;
 use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem};
@@ -507,7 +506,7 @@ impl LocationBarWrapper {
             .with_text_signal(text_input_value.clone())
             .with_placeholder("Path...".to_string())
             .with_layout_style(LayoutStyle {
-                size: Vector2::new(Dimension::length(300.0), Dimension::auto()),
+                size: Vector2::new(Dimension::length(300.0), Dimension::length(30.0)),
                 ..Default::default()
             });
         
@@ -517,7 +516,8 @@ impl LocationBarWrapper {
         ]).with_layout_style(LayoutStyle {
             size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
             flex_direction: FlexDirection::Row,
-            gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
+            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(0.0)),
+            align_items: Some(AlignItems::Center),
             ..Default::default()
         });
         
@@ -578,26 +578,8 @@ impl Widget for LocationBarWrapper {
             update |= Update::LAYOUT | Update::DRAW;
         }
 
-        // Handle Enter key press in TextInput to navigate
-        let enter_pressed = info.keys.iter().any(|(_, key_event)| {
-            key_event.state == ElementState::Pressed
-                && matches!(key_event.physical_key, PhysicalKey::Code(KeyCode::Enter))
-        });
-
-        if enter_pressed {
-            let entered_text = (*self.text_input_value.get()).trim().to_string();
-            if !entered_text.is_empty() {
-                let entered_path = PathBuf::from(&entered_text);
-                if entered_path.exists() {
-                    let _ = self.navigation_tx.send(crate::toolbar::NavigationAction::NavigateTo(entered_path));
-                    update.insert(Update::LAYOUT | Update::DRAW);
-                } else {
-                    log::warn!("Navigation to non-existent path: {}", entered_text);
-                }
-            }
-        }
-
         // Update inner Container (which updates both breadcrumbs and text_input)
+        // Note: TextInput handles its own keyboard input internally via its signal binding
         update |= self.inner.update(layout, context, info);
         
         update
@@ -850,6 +832,7 @@ pub fn build_window(_context: AppContext, state: AppState) -> impl Widget {
         ]).with_layout_style(LayoutStyle {
             size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
             flex_direction: FlexDirection::Column,
+            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(4.0)),
             ..Default::default()
         })),
         // Content area (sidebar + file list)
