@@ -146,24 +146,24 @@ impl FileListContent {
             // Thumbnails will be rendered when ready via event system
             if entry.is_file() {
                 let mut pending = self.pending_thumbnails.lock().unwrap();
-                if !pending.contains(&entry.path) {
-                    if let Ok(file) = get_file_for_uri(&file_entry_to_uri(entry)) {
-                        let file_clone = get_file_for_uri(&file_entry_to_uri(entry)).ok();
-                        let service_clone = self.thumbnail_service.clone();
-                        let size = u32_to_thumbnail_size(self.thumbnail_size);
-                        let entry_path = entry.path.clone();
-                        
-                        // Spawn async task to generate thumbnail (non-blocking)
-                        tokio::spawn(async move {
-                            if let Some(f) = file_clone {
-                                let _ = service_clone
-                                    .get_or_generate_thumbnail(&*f, size, None)
-                                    .await;
-                            }
-                        });
-                        
-                        pending.insert(entry_path);
-                    }
+                // Use insert() which returns true if the value was newly inserted (atomic check-and-insert)
+                if pending.insert(entry.path.clone()) {
+                    let file_clone = get_file_for_uri(&file_entry_to_uri(entry)).ok();
+                    let service_clone = self.thumbnail_service.clone();
+                    let size = u32_to_thumbnail_size(self.thumbnail_size);
+                    
+                    // Spawn async task to generate thumbnail (non-blocking)
+                    let semaphore_clone = self.async_task_semaphore.clone();
+                    tokio::spawn(async move {
+                        // Acquire semaphore permit to limit concurrent tasks
+                        let _permit = semaphore_clone.acquire().await.ok();
+                        if let Some(f) = file_clone {
+                            let _ = service_clone
+                                .get_or_generate_thumbnail(&*f, size, None)
+                                .await;
+                        }
+                        // Permit is automatically released when dropped
+                    });
                 }
             }
 
@@ -181,7 +181,10 @@ impl FileListContent {
                 let entry_clone = entry.clone();
                 let cache_key_clone = cache_key.clone();
                 let cache_update_tx_clone = self.cache_update_tx.clone();
+                let semaphore_clone = self.async_task_semaphore.clone();
                 tokio::spawn(async move {
+                    // Acquire semaphore permit to limit concurrent tasks
+                    let _permit = semaphore_clone.acquire().await.ok();
                     let uri = file_entry_to_uri(&entry_clone);
                     if let Ok(file) = get_file_for_uri(&uri) {
                         let icon = registry_clone.get_file_icon(&*file, icon_size as u32).await;
@@ -190,6 +193,7 @@ impl FileListContent {
                         // Notify that cache was updated to trigger redraw
                         let _ = cache_update_tx_clone.send(());
                     }
+                    // Permit is automatically released when dropped
                 });
             }
 

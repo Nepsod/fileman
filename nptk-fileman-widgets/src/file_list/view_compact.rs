@@ -241,72 +241,76 @@ impl FileListContent {
                 // Request thumbnail generation asynchronously (non-blocking)
                 if entry.is_file() {
                     let mut pending = self.pending_thumbnails.lock().unwrap();
-                    if !pending.contains(&entry.path) {
-                        if let Ok(file) = get_file_for_uri(&file_entry_to_uri(&entry)) {
-                            let file_clone = get_file_for_uri(&file_entry_to_uri(&entry)).ok();
-                            let service_clone = self.thumbnail_service.clone();
-                            let size = u32_to_thumbnail_size(thumb_size);
-                            let entry_path = entry.path.clone();
-                            
-                            // Spawn async task to generate thumbnail (non-blocking)
-                            tokio::spawn(async move {
-                                if let Some(f) = file_clone {
-                                    let _ = service_clone
-                                        .get_or_generate_thumbnail(&*f, size, None)
-                                        .await;
-                                }
-                            });
-                            
-                            pending.insert(entry_path);
-                        }
+                    // Use insert() which returns true if the value was newly inserted (atomic check-and-insert)
+                    if pending.insert(entry.path.clone()) {
+                        let file_clone = get_file_for_uri(&file_entry_to_uri(&entry)).ok();
+                        let service_clone = self.thumbnail_service.clone();
+                        let size = u32_to_thumbnail_size(thumb_size);
+                        
+                        // Spawn async task to generate thumbnail (non-blocking)
+                        let semaphore_clone = self.async_task_semaphore.clone();
+                        tokio::spawn(async move {
+                            // Acquire semaphore permit to limit concurrent tasks
+                            let _permit = semaphore_clone.acquire().await.ok();
+                            if let Some(f) = file_clone {
+                                let _ = service_clone
+                                    .get_or_generate_thumbnail(&*f, size, None)
+                                    .await;
+                            }
+                            // Permit is automatically released when dropped
+                        });
                     }
                 }
+            }
 
-                // Get icon for this entry (only use cached, don't block on loading)
-                let cache_key = (entry.path.clone(), thumb_size);
-                let cached_icon = {
-                    let cache = self.icon_cache.lock().unwrap();
-                    cache.get(&cache_key).and_then(|opt| opt.clone())
-                };
-                
-                // If icon not cached, request it asynchronously (non-blocking)
-                if cached_icon.is_none() {
-                    let cache_clone = self.icon_cache.clone();
-                    let registry_clone = self.icon_registry.clone();
-                    let entry_clone = entry.clone();
-                    let cache_key_clone = cache_key.clone();
-                    let cache_update_tx_clone = self.cache_update_tx.clone();
-                    tokio::spawn(async move {
-                        let uri = file_entry_to_uri(&entry_clone);
-                        if let Ok(file) = get_file_for_uri(&uri) {
-                            let icon = registry_clone.get_file_icon(&*file, thumb_size).await;
-                            let mut cache = cache_clone.lock().unwrap();
-                            cache.insert(cache_key_clone, icon);
-                            // Notify that cache was updated to trigger redraw
-                            let _ = cache_update_tx_clone.send(());
-                        }
-                    });
-                }
+            // Get icon for this entry (only use cached, don't block on loading)
+            let cache_key = (entry.path.clone(), thumb_size);
+            let cached_icon = {
+                let cache = self.icon_cache.lock().unwrap();
+                cache.get(&cache_key).and_then(|opt| opt.clone())
+            };
+            
+            // If icon not cached, request it asynchronously (non-blocking)
+            if cached_icon.is_none() {
+                let cache_clone = self.icon_cache.clone();
+                let registry_clone = self.icon_registry.clone();
+                let entry_clone = entry.clone();
+                let cache_key_clone = cache_key.clone();
+                let cache_update_tx_clone = self.cache_update_tx.clone();
+                let semaphore_clone = self.async_task_semaphore.clone();
+                tokio::spawn(async move {
+                    // Acquire semaphore permit to limit concurrent tasks
+                    let _permit = semaphore_clone.acquire().await.ok();
+                    let uri = file_entry_to_uri(&entry_clone);
+                    if let Ok(file) = get_file_for_uri(&uri) {
+                        let icon = registry_clone.get_file_icon(&*file, thumb_size).await;
+                        let mut cache = cache_clone.lock().unwrap();
+                        cache.insert(cache_key_clone, icon);
+                        // Notify that cache was updated to trigger redraw
+                        let _ = cache_update_tx_clone.send(());
+                    }
+                    // Permit is automatically released when dropped
+                });
+            }
 
-                if let Some(icon) = cached_icon {
-                    render_cached_icon(
-                        graphics,
-                        theme,
-                        self.widget_id(),
-                        icon,
-                        icon_rect,
-                        &entry,
-                        &mut self.svg_scene_cache,
-                    );
-                } else {
-                    render_fallback_icon(
-                        graphics,
-                        theme,
-                        self.widget_id(),
-                        icon_rect,
-                        &entry,
-                    );
-                }
+            if let Some(icon) = cached_icon {
+                render_cached_icon(
+                    graphics,
+                    theme,
+                    self.widget_id(),
+                    icon,
+                    icon_rect,
+                    &entry,
+                    &mut self.svg_scene_cache,
+                );
+            } else {
+                render_fallback_icon(
+                    graphics,
+                    theme,
+                    self.widget_id(),
+                    icon_rect,
+                    &entry,
+                );
             }
 
             // 3. Draw Icon Overlay (Selection/Hover)

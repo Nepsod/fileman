@@ -18,7 +18,7 @@ use nptk::services::filesystem::model::{FileSystemEvent, FileSystemModel};
 use npio::service::icon::IconRegistry;
 use npio::{ThumbnailService, ThumbnailEvent, ThumbnailImage, get_file_for_uri, register_backend};
 use npio::backend::local::LocalBackend;
-use nptk::services::thumbnail::npio_adapter::{file_entry_to_uri, u32_to_thumbnail_size, uri_to_path, thumbnail_size_to_u32};
+use nptk::services::thumbnail::npio_adapter::{uri_to_path, thumbnail_size_to_u32};
 use nptk::theme::id::WidgetId;
 use nptk::theme::theme::Theme;
 use std::collections::HashSet;
@@ -105,7 +105,25 @@ impl FileList {
         operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
         selection_change_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>,
     ) -> Self {
-        let fs_model = Arc::new(FileSystemModel::new(initial_path.clone()).unwrap());
+        let fs_model = Arc::new(
+            FileSystemModel::new(initial_path.clone())
+                .unwrap_or_else(|e| {
+                    log::error!("Failed to create FileSystemModel for path {:?}: {}", initial_path, e);
+                    // Try fallback to current directory
+                    std::env::current_dir()
+                        .ok()
+                        .and_then(|dir| FileSystemModel::new(dir).ok())
+                        .unwrap_or_else(|| {
+                            // Last resort: try root path
+                            FileSystemModel::new(PathBuf::from("/"))
+                                .unwrap_or_else(|e2| {
+                                    log::error!("Failed to create FileSystemModel with root path: {}", e2);
+                                    // This should never happen, but if it does, panic with a clear message
+                                    panic!("Failed to create FileSystemModel with all fallback paths. This indicates a serious system issue.");
+                                })
+                        })
+                })
+        );
         let event_rx = Arc::new(Mutex::new(fs_model.subscribe_events()));
 
         // Initial load
@@ -407,6 +425,9 @@ struct FileListContent {
     // Tooltip state
     hovered_item_index: Option<usize>, // Index of file item currently hovered
     tooltip_shown: bool, // Track if tooltip popup is currently shown
+
+    // Semaphore to limit concurrent async tasks (icon/thumbnail loading)
+    async_task_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone)]
@@ -418,6 +439,15 @@ struct PendingAction {
 }
 
 impl FileListContent {
+    // Cache size limits to prevent unbounded memory growth
+    const MAX_ICON_CACHE_SIZE: usize = 1000;
+    const MAX_THUMBNAIL_CACHE_SIZE: usize = 500;
+    const MAX_LAYOUT_CACHE_SIZE: usize = 2000;
+    const MAX_SVG_SCENE_CACHE_SIZE: usize = 500;
+
+    // Maximum number of concurrent async tasks (icon/thumbnail loading)
+    const MAX_CONCURRENT_ASYNC_TASKS: usize = 50;
+
     fn new(
         entries: StateSignal<Vec<FileEntry>>,
         selected_paths: StateSignal<Vec<PathBuf>>,
@@ -472,6 +502,7 @@ impl FileListContent {
             selection_change_tx,
             hovered_item_index: None,
             tooltip_shown: false,
+            async_task_semaphore: Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_ASYNC_TASKS)),
         }
         .with_thumbnail_size(128)
     }
@@ -479,6 +510,60 @@ impl FileListContent {
     pub fn with_thumbnail_size(mut self, size: u32) -> Self {
         self.thumbnail_size = size;
         self
+    }
+
+    /// Evict entries from icon cache if it exceeds the limit
+    fn evict_icon_cache_if_needed(&self) {
+        let mut cache = self.icon_cache.lock().unwrap();
+        if cache.len() > Self::MAX_ICON_CACHE_SIZE {
+            // Simple eviction: remove oldest entries (first N entries)
+            let to_remove = cache.len() - Self::MAX_ICON_CACHE_SIZE;
+            let keys: Vec<_> = cache.keys().take(to_remove).cloned().collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+            log::debug!("Evicted {} entries from icon cache", to_remove);
+        }
+    }
+
+    /// Evict entries from thumbnail cache if it exceeds the limit
+    fn evict_thumbnail_cache_if_needed(&self) {
+        let mut cache = self.thumbnail_cache.lock().unwrap();
+        if cache.len() > Self::MAX_THUMBNAIL_CACHE_SIZE {
+            // Simple eviction: remove oldest entries (first N entries)
+            let to_remove = cache.len() - Self::MAX_THUMBNAIL_CACHE_SIZE;
+            let keys: Vec<_> = cache.keys().take(to_remove).cloned().collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+            log::debug!("Evicted {} entries from thumbnail cache", to_remove);
+        }
+    }
+
+    /// Evict entries from layout cache if it exceeds the limit
+    fn evict_layout_cache_if_needed(&mut self) {
+        if self.layout_cache.len() > Self::MAX_LAYOUT_CACHE_SIZE {
+            // Simple eviction: remove oldest entries (first N entries)
+            let to_remove = self.layout_cache.len() - Self::MAX_LAYOUT_CACHE_SIZE;
+            let keys: Vec<_> = self.layout_cache.keys().take(to_remove).cloned().collect();
+            for key in keys {
+                self.layout_cache.remove(&key);
+            }
+            log::debug!("Evicted {} entries from layout cache", to_remove);
+        }
+    }
+
+    /// Evict entries from SVG scene cache if it exceeds the limit
+    fn evict_svg_scene_cache_if_needed(&mut self) {
+        if self.svg_scene_cache.len() > Self::MAX_SVG_SCENE_CACHE_SIZE {
+            // Simple eviction: remove oldest entries (first N entries)
+            let to_remove = self.svg_scene_cache.len() - Self::MAX_SVG_SCENE_CACHE_SIZE;
+            let keys: Vec<_> = self.svg_scene_cache.keys().take(to_remove).cloned().collect();
+            for key in keys {
+                self.svg_scene_cache.remove(&key);
+            }
+            log::debug!("Evicted {} entries from SVG scene cache", to_remove);
+        }
     }
 
     /// Notify about selection changes via channel if available
@@ -509,8 +594,16 @@ impl FileListContent {
 
     /// Find the file item index under the given cursor position (for tooltip hover detection)
     fn find_item_under_cursor(&self, local_x: f32, local_y: f32, layout_width: f32, view_mode: FileListViewMode, icon_size: u32, entries_len: usize) -> Option<usize> {
+        // Guard against negative coordinates and division by zero
+        if local_x < 0.0 || local_y < 0.0 {
+            return None;
+        }
+
         if view_mode == FileListViewMode::List {
             // List view: simple row calculation
+            if self.item_height <= 0.0 {
+                return None;
+            }
             let idx = (local_y / self.item_height) as usize;
             if idx < entries_len {
                 Some(idx)
@@ -520,6 +613,9 @@ impl FileListContent {
         } else if view_mode == FileListViewMode::Icon {
             // Icon view: grid calculation
             let (columns, cell_width, cell_height) = self.calculate_icon_view_layout(layout_width, icon_size);
+            if cell_width <= 0.0 || cell_height <= 0.0 {
+                return None;
+            }
             let col = (local_x / cell_width).floor() as usize;
             let row = (local_y / cell_height).floor() as usize;
             let idx = row * columns + col;
@@ -531,6 +627,9 @@ impl FileListContent {
         } else if view_mode == FileListViewMode::Compact {
             // Compact view: grid calculation with spacing
             let (columns, cell_width, cell_height, spacing) = self.calculate_compact_view_layout(layout_width);
+            if cell_width <= 0.0 || cell_height <= 0.0 || (cell_width + spacing) <= 0.0 || (cell_height + spacing) <= 0.0 {
+                return None;
+            }
             let col = ((local_x - self.icon_view_padding) / (cell_width + spacing)).floor() as usize;
             let row = ((local_y - self.icon_view_padding) / (cell_height + spacing)).floor() as usize;
             let idx = row * columns + col;
@@ -831,6 +930,16 @@ impl Widget for FileListContent {
             self.layout_cache.clear();
         }
 
+        // Periodically evict cache entries if they exceed limits (every 60 updates to avoid overhead)
+        static UPDATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let counter = UPDATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if counter % 60 == 0 {
+            self.evict_icon_cache_if_needed();
+            self.evict_thumbnail_cache_if_needed();
+            self.evict_layout_cache_if_needed();
+            self.evict_svg_scene_cache_if_needed();
+        }
+
         // Poll thumbnail events
         if let Ok(mut rx) = self.thumbnail_event_rx.try_lock() {
             while let Ok(event) = rx.try_recv() {
@@ -851,7 +960,10 @@ impl Widget for FileListContent {
                             if let Ok(file) = get_file_for_uri(&uri) {
                                 let update_mgr_clone = self.update_manager.clone();
                                 let cache_update_tx_clone = self.cache_update_tx.clone();
+                                let semaphore_clone = self.async_task_semaphore.clone();
                                 tokio::spawn(async move {
+                                    // Acquire semaphore permit to limit concurrent tasks
+                                    let _permit = semaphore_clone.acquire().await.ok();
                                     if let Ok(thumbnail_image) = service_clone
                                         .get_thumbnail_image(&*file, size, None)
                                         .await
@@ -869,6 +981,7 @@ impl Widget for FileListContent {
                                         // Also send notification via channel (backup mechanism)
                                         let _ = cache_update_tx_clone.send(());
                                     }
+                                    // Permit is automatically released when dropped
                                 });
                             }
                             
@@ -911,73 +1024,12 @@ impl Widget for FileListContent {
                     let icon_size = *self.icon_size.get();
                     let (columns, cell_width, cell_height) =
                         self.calculate_icon_view_layout(layout.layout.size.width, icon_size);
-                    let col = (local_x / cell_width).floor() as usize;
-                    let row = (local_y / cell_height).floor() as usize;
-                    let idx = row * columns + col;
-
-                    let entry_opt = {
-                        let entries = self.entries.get();
-                        if idx < entries.len() {
-                            Some(entries[idx].clone())
-                        } else {
-                            None
-                        }
-                    };
-
-                    if let Some(entry) = entry_opt {
-                        let cell_x = col as f32 * cell_width;
-                        let cell_y = row as f32 * cell_height;
-                        let cell_rect = Rect::new(
-                            cell_x as f64,
-                            cell_y as f64,
-                            (cell_x + cell_width) as f64,
-                            (cell_y + cell_height) as f64,
-                        );
-                        let is_selected = self.is_selected(&entry.path);
-                        let (icon_rect, label_rect, _, _) = self.get_icon_item_layout(
-                            &mut info.font_context,
-                            &entry,
-                            cell_rect,
-                            cell_width,
-                            icon_size as f32,
-                            is_selected,
-                        );
-
-                        let cursor_x = local_x as f64;
-                        let cursor_y = local_y as f64;
-
-                        if (cursor_x >= icon_rect.x0
-                            && cursor_x < icon_rect.x1
-                            && cursor_y >= icon_rect.y0
-                            && cursor_y < icon_rect.y1)
-                            || (cursor_x >= label_rect.x0
-                                && cursor_x < label_rect.x1
-                                && cursor_y >= label_rect.y0
-                                && cursor_y < label_rect.y1)
-                        {
-                            Some(idx)
-                        } else {
-                            None
-                        }
-                    } else {
+                    // Guard against negative coordinates and division by zero
+                    if local_x < 0.0 || local_y < 0.0 || cell_width <= 0.0 || cell_height <= 0.0 {
                         None
-                    }
-                } else if view_mode == FileListViewMode::Compact {
-                    let (columns, cell_width, cell_height, spacing) =
-                        self.calculate_compact_view_layout(layout.layout.size.width);
-                    let col = ((local_x - self.icon_view_padding) / (cell_width + spacing)).floor()
-                        as usize;
-                    let row = ((local_y - self.icon_view_padding) / (cell_height + spacing)).floor()
-                        as usize;
-
-                    let cell_x = self.icon_view_padding + col as f32 * (cell_width + spacing);
-                    let cell_y = self.icon_view_padding + row as f32 * (cell_height + spacing);
-
-                    if local_x >= cell_x
-                        && local_x < cell_x + cell_width
-                        && local_y >= cell_y
-                        && local_y < cell_y + cell_height
-                    {
+                    } else {
+                        let col = (local_x / cell_width).floor() as usize;
+                        let row = (local_y / cell_height).floor() as usize;
                         let idx = row * columns + col;
 
                         let entry_opt = {
@@ -990,14 +1042,23 @@ impl Widget for FileListContent {
                         };
 
                         if let Some(entry) = entry_opt {
-                            let (mut icon_rect, mut label_rect) = self.get_compact_item_layout(
+                            let cell_x = col as f32 * cell_width;
+                            let cell_y = row as f32 * cell_height;
+                            let cell_rect = Rect::new(
+                                cell_x as f64,
+                                cell_y as f64,
+                                (cell_x + cell_width) as f64,
+                                (cell_y + cell_height) as f64,
+                            );
+                            let is_selected = self.is_selected(&entry.path);
+                            let (icon_rect, label_rect, _, _) = self.get_icon_item_layout(
                                 &mut info.font_context,
                                 &entry,
-                                cell_height,
+                                cell_rect,
                                 cell_width,
+                                icon_size as f32,
+                                is_selected,
                             );
-                            icon_rect = icon_rect + Vec2::new(cell_x as f64, cell_y as f64);
-                            label_rect = label_rect + Vec2::new(cell_x as f64, cell_y as f64);
 
                             let cursor_x = local_x as f64;
                             let cursor_y = local_y as f64;
@@ -1018,16 +1079,84 @@ impl Widget for FileListContent {
                         } else {
                             None
                         }
-                    } else {
+                    }
+                } else if view_mode == FileListViewMode::Compact {
+                    let (columns, cell_width, cell_height, spacing) =
+                        self.calculate_compact_view_layout(layout.layout.size.width);
+                    // Guard against negative coordinates and division by zero
+                    if local_x < 0.0 || local_y < 0.0 || (cell_width + spacing) <= 0.0 || (cell_height + spacing) <= 0.0 {
                         None
+                    } else {
+                        let col = ((local_x - self.icon_view_padding) / (cell_width + spacing)).floor()
+                            as usize;
+                        let row = ((local_y - self.icon_view_padding) / (cell_height + spacing)).floor()
+                            as usize;
+
+                        let cell_x = self.icon_view_padding + col as f32 * (cell_width + spacing);
+                        let cell_y = self.icon_view_padding + row as f32 * (cell_height + spacing);
+
+                        if local_x >= cell_x
+                            && local_x < cell_x + cell_width
+                            && local_y >= cell_y
+                            && local_y < cell_y + cell_height
+                        {
+                            let idx = row * columns + col;
+
+                            let entry_opt = {
+                                let entries = self.entries.get();
+                                if idx < entries.len() {
+                                    Some(entries[idx].clone())
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(entry) = entry_opt {
+                                let (mut icon_rect, mut label_rect) = self.get_compact_item_layout(
+                                    &mut info.font_context,
+                                    &entry,
+                                    cell_height,
+                                    cell_width,
+                                );
+                                icon_rect = icon_rect + Vec2::new(cell_x as f64, cell_y as f64);
+                                label_rect = label_rect + Vec2::new(cell_x as f64, cell_y as f64);
+
+                                let cursor_x = local_x as f64;
+                                let cursor_y = local_y as f64;
+
+                                if (cursor_x >= icon_rect.x0
+                                    && cursor_x < icon_rect.x1
+                                    && cursor_y >= icon_rect.y0
+                                    && cursor_y < icon_rect.y1)
+                                    || (cursor_x >= label_rect.x0
+                                        && cursor_x < label_rect.x1
+                                        && cursor_y >= label_rect.y0
+                                        && cursor_y < label_rect.y1)
+                                {
+                                    Some(idx)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     }
                 } else {
-                    let idx = (local_y / self.item_height) as usize;
-                    let entries = self.entries.get();
-                    if idx < entries.len() {
-                        Some(idx)
-                    } else {
+                    // List view
+                    // Guard against negative coordinates and division by zero
+                    if local_y < 0.0 || self.item_height <= 0.0 {
                         None
+                    } else {
+                        let idx = (local_y / self.item_height) as usize;
+                        let entries = self.entries.get();
+                        if idx < entries.len() {
+                            Some(idx)
+                        } else {
+                            None
+                        }
                     }
                 };
 
@@ -1039,15 +1168,21 @@ impl Widget for FileListContent {
                         file_type = Some(entry.file_type);
 
                         if info.modifiers.shift_key() {
-                            let anchor = self.anchor_index.unwrap_or(0);
-                            let start = anchor.min(index);
-                            let end = anchor.max(index);
-                            range_paths = Some(
-                                entries[start..=end]
-                                    .iter()
-                                    .map(|e| e.path.clone())
-                                    .collect::<Vec<_>>(),
-                            );
+                            if let Some(anchor) = self.anchor_index {
+                                let start = anchor.min(index).min(entries.len().saturating_sub(1));
+                                let end = anchor.max(index).min(entries.len().saturating_sub(1));
+                                if start <= end && end < entries.len() {
+                                    range_paths = Some(
+                                        entries[start..=end]
+                                            .iter()
+                                            .map(|e| e.path.clone())
+                                            .collect::<Vec<_>>(),
+                                    );
+                                }
+                            } else {
+                                // No anchor set yet, set it to current index
+                                self.anchor_index = Some(index);
+                            }
                         }
                     }
                 }
@@ -1209,10 +1344,10 @@ impl Widget for FileListContent {
                                 } else {
                                     selected.push(target_path.clone());
                                 }
-                                self.anchor_index = Some(index.unwrap_or(0));
+                                self.anchor_index = index;
                             } else {
                                 selected = vec![target_path.clone()];
-                                self.anchor_index = Some(index.unwrap_or(0));
+                                self.anchor_index = index;
                             }
 
                             let selected_clone = selected.clone();
