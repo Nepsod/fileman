@@ -1,11 +1,10 @@
 use nptk::prelude::*;
 use nptk::core::signal::eval::EvalSignal;
-use nptk::core::window::{ElementState, KeyCode, PhysicalKey};
 use nptk_fileman_widgets::file_list::{FileList, FileListOperation};
 use nptk_fileman_widgets::FilemanSidebar;
+use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem};
 use crate::app::AppState;
 use crate::operations;
-use crate::toolbar;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -393,15 +392,43 @@ impl WidgetLayoutExt for FileListWrapper {
     }
 }
 
-    /// Wrapper widget for location bar (path input) with bidirectional sync
+/// Helper function to convert PathBuf to breadcrumb items
+fn path_to_breadcrumb_items(path: &PathBuf) -> Vec<BreadcrumbItem> {
+    let mut items = Vec::new();
+    let mut current_path = PathBuf::new();
+    
+    // Handle root path
+    if path.has_root() {
+        items.push(BreadcrumbItem::new("/").with_id("/".to_string()));
+        current_path.push("/");
+    }
+    
+    // Add each component
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            current_path.push(name);
+            let label = name.to_string_lossy().to_string();
+            let id = current_path.to_string_lossy().to_string();
+            items.push(BreadcrumbItem::new(label).with_id(id));
+        }
+    }
+    
+    // Last item is not clickable (current location)
+    if let Some(last) = items.last_mut() {
+        last.clickable = false;
+    }
+    
+    items
+}
+
+/// Wrapper widget for location bar (breadcrumbs) with bidirectional sync
 struct LocationBarWrapper {
-    inner: TextInput,
+    inner: Breadcrumbs,
     navigation: Arc<Mutex<crate::navigation::NavigationState>>,
     navigation_tx: mpsc::UnboundedSender<crate::toolbar::NavigationAction>,
     navigation_path_signal: StateSignal<PathBuf>,
-    current_path_text: StateSignal<String>,
+    breadcrumb_items_signal: StateSignal<Vec<BreadcrumbItem>>,
     signals_hooked: bool,
-    text_input_value: String, // Track TextInput value for Enter key navigation
 }
 
 impl LocationBarWrapper {
@@ -411,16 +438,70 @@ impl LocationBarWrapper {
         navigation_path_signal: StateSignal<PathBuf>,
     ) -> Self {
         let initial_path = (*navigation_path_signal.get()).clone();
-        let initial_text = initial_path.to_string_lossy().to_string();
+        let initial_items = path_to_breadcrumb_items(&initial_path);
+        let breadcrumb_items_signal = StateSignal::new(initial_items.clone());
+        
+        let nav_tx_clone1 = navigation_tx.clone();
+        let nav_tx_clone2 = navigation_tx.clone();
+        
+        let breadcrumbs = Breadcrumbs::new()
+            .with_items_signal(breadcrumb_items_signal.clone())
+            .with_on_click(move |item: &BreadcrumbItem| {
+                // Navigate to the clicked breadcrumb path
+                if let Some(id) = &item.id {
+                    let path = PathBuf::from(id);
+                    if path.exists() {
+                        let _ = nav_tx_clone1.send(crate::toolbar::NavigationAction::NavigateTo(path));
+                        return Update::LAYOUT | Update::DRAW;
+                    }
+                }
+                Update::empty()
+            })
+            .with_neighbors_provider(move |item: &BreadcrumbItem| {
+                // Show sibling directories when clicking separator
+                if let Some(id) = &item.id {
+                    let parent_path = PathBuf::from(id);
+                    if let Ok(entries) = std::fs::read_dir(&parent_path) {
+                        let mut neighbors = Vec::new();
+                        for entry in entries.flatten() {
+                            if let Ok(metadata) = entry.metadata() {
+                                if metadata.is_dir() {
+                                    let entry_path = entry.path();
+                                    let label = entry_path.file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let path_str = entry_path.to_string_lossy().to_string();
+                                    neighbors.push(BreadcrumbItem::new(label).with_id(path_str));
+                                }
+                            }
+                        }
+                        if !neighbors.is_empty() {
+                            return Some(neighbors);
+                        }
+                    }
+                }
+                None
+            })
+            .with_on_neighbor_select(move |_original_item: &BreadcrumbItem, selected_neighbor: &BreadcrumbItem| {
+                // Navigate to selected neighbor directory
+                if let Some(id) = &selected_neighbor.id {
+                    let path = PathBuf::from(id);
+                    if path.exists() {
+                        let _ = nav_tx_clone2.send(crate::toolbar::NavigationAction::NavigateTo(path));
+                        return Update::LAYOUT | Update::DRAW;
+                    }
+                }
+                Update::empty()
+            });
         
         Self {
-            inner: TextInput::new().with_placeholder("Location...".to_string()),
+            inner: breadcrumbs,
             navigation,
             navigation_tx,
             navigation_path_signal,
-            current_path_text: StateSignal::new(initial_text.clone()),
+            breadcrumb_items_signal,
             signals_hooked: false,
-            text_input_value: initial_text,
         }
     }
 }
@@ -444,65 +525,25 @@ impl Widget for LocationBarWrapper {
 
         // Hook signals on first update
         if !self.signals_hooked {
-            context.hook_signal(&mut self.current_path_text);
             context.hook_signal(&mut self.navigation_path_signal);
+            context.hook_signal(&mut self.breadcrumb_items_signal);
             self.signals_hooked = true;
         }
 
-        // Reactively sync text from navigation path signal changes
+        // Reactively update breadcrumb items when navigation path changes
         let nav_path = (*self.navigation_path_signal.get()).clone();
-        let path_str = nav_path.to_string_lossy().to_string();
-        let current_text = (*self.current_path_text.get()).clone();
-        if path_str != current_text {
-            self.current_path_text.set(path_str.clone());
-            self.text_input_value = path_str;
+        let current_items = (*self.breadcrumb_items_signal.get()).clone();
+        let new_items = path_to_breadcrumb_items(&nav_path);
+        
+        // Only update if items changed (compare by path IDs to avoid unnecessary updates)
+        if current_items.len() != new_items.len() 
+            || current_items.iter().zip(new_items.iter()).any(|(a, b)| a.id != b.id) {
+            self.breadcrumb_items_signal.set(new_items);
+            update |= Update::LAYOUT | Update::DRAW;
         }
 
-        // Update inner TextInput first
+        // Update inner Breadcrumbs widget
         update |= self.inner.update(layout, context, info);
-
-        // Check for Enter key press to navigate to entered path
-        // Check if Enter key was pressed (similar to how Button widget checks)
-        let enter_pressed = info.keys.iter().any(|(_, key_event)| {
-            key_event.state == ElementState::Pressed
-                && matches!(key_event.physical_key, PhysicalKey::Code(KeyCode::Enter))
-        });
-
-        if enter_pressed {
-            // Try to get the current text value from the signal
-            // Note: TextInput manages its own internal state, so we use current_path_text
-            // as the source. Ideally, TextInput would expose its value via a signal that we
-            // could bind to. For now, this works when the user types in the location bar
-            // and presses Enter. The actual value might need to be tracked differently
-            // if TextInput doesn't sync with our signal automatically.
-            let entered_text = self.current_path_text.get().trim().to_string();
-            
-            if !entered_text.is_empty() {
-                // Try to parse as path and navigate
-                let entered_path = PathBuf::from(&entered_text);
-                
-                // Check if path exists
-                if entered_path.exists() {
-                    // Update navigation state (signal will reactively update text)
-                    if let Ok(mut nav) = self.navigation.lock() {
-                        nav.navigate_to(entered_path.clone());
-                    }
-                    // Send navigation action
-                    let _ = self.navigation_tx.send(crate::toolbar::NavigationAction::NavigateTo(
-                        entered_path
-                    ));
-                    update.insert(Update::LAYOUT | Update::DRAW);
-                } else {
-                    // Path doesn't exist - log warning (could show error message in status bar)
-                    log::warn!("Navigation to non-existent path: {}", entered_text);
-                }
-            }
-        }
-
-        // Try to sync text from TextInput (if it changed)
-        // Note: This is a simplified approach - ideally TextInput would expose its value via a signal
-        // For now, we rely on the Enter key press to capture the value
-        // The text_input_value will be updated when navigation changes or when Enter is pressed
         
         update
     }
