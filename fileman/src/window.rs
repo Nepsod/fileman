@@ -25,25 +25,19 @@ pub enum FileOperationRequest {
 struct FileListWrapper {
     file_list: FileList,
     navigation: Arc<Mutex<crate::navigation::NavigationState>>,
-    last_path: PathBuf,
     navigation_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
-    // Track if we need to check path sync (only after navigation-related events)
-    should_check_path_sync: bool,
+    // Reactive signals - cloned from NavigationState and FileList
+    navigation_path_signal: StateSignal<PathBuf>,
+    file_list_path_signal: StateSignal<PathBuf>,
+    signals_hooked: bool,
     // File operation processing - receives from FileList widget (already confirmed)
     file_list_operation_rx: Option<mpsc::UnboundedReceiver<FileListOperation>>,
     // File operation processing - receives from toolbar/other UI (needs confirmation)
     operation_rx: Option<mpsc::UnboundedReceiver<FileOperationRequest>>,
     // Status message sender (for displaying operation results)
     status_tx: Option<mpsc::UnboundedSender<String>>,
-    // Selected paths request/response channels for toolbar delete button
-    selected_paths_request_rx: Option<mpsc::UnboundedReceiver<()>>,
-    selected_paths_response_tx: Option<mpsc::UnboundedSender<Vec<PathBuf>>>,
     // Pending delete operations waiting for confirmation (from toolbar)
     pending_delete_confirmation: Arc<Mutex<Option<Vec<PathBuf>>>>,
-    // Selection change notification channels
-    selection_change_rx: Option<mpsc::UnboundedReceiver<Vec<PathBuf>>>,
-    selection_change_toolbar_tx: Option<mpsc::UnboundedSender<Vec<PathBuf>>>,
-    selection_change_status_tx: Option<mpsc::UnboundedSender<Vec<PathBuf>>>,
 }
 
 impl FileListWrapper {
@@ -53,33 +47,34 @@ impl FileListWrapper {
         navigation_rx: mpsc::UnboundedReceiver<PathBuf>,
         operation_rx: mpsc::UnboundedReceiver<FileOperationRequest>,
         status_tx: mpsc::UnboundedSender<String>,
-        selected_paths_request_rx: mpsc::UnboundedReceiver<()>,
-        selected_paths_response_tx: mpsc::UnboundedSender<Vec<PathBuf>>,
-        selection_change_toolbar_tx: mpsc::UnboundedSender<Vec<PathBuf>>,
-        selection_change_status_tx: mpsc::UnboundedSender<Vec<PathBuf>>,
+        navigation_path_signal: StateSignal<PathBuf>,
     ) -> Self {
         // Create channel for FileList operations
         let (file_list_op_tx, file_list_op_rx) = mpsc::unbounded_channel::<FileListOperation>();
         
-        // Create channel to receive selection changes from FileList
-        let (selection_change_file_list_tx, selection_change_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
+        // Create FileList (selection_change_tx is optional for backward compatibility)
+        let file_list = FileList::new_with_operations(initial_path.clone(), Some(file_list_op_tx), None);
+        
+        // Clone signals from FileList for reactive subscription
+        let file_list_path_signal = file_list.current_path_signal().clone();
         
         Self {
-            file_list: FileList::new_with_operations(initial_path.clone(), Some(file_list_op_tx), Some(selection_change_file_list_tx)),
+            file_list,
             navigation,
-            last_path: initial_path,
             navigation_rx: Some(navigation_rx),
-            should_check_path_sync: false,
+            navigation_path_signal,
+            file_list_path_signal,
+            signals_hooked: false,
             file_list_operation_rx: Some(file_list_op_rx),
             operation_rx: Some(operation_rx),
             status_tx: Some(status_tx),
-            selected_paths_request_rx: Some(selected_paths_request_rx),
-            selected_paths_response_tx: Some(selected_paths_response_tx),
             pending_delete_confirmation: Arc::new(Mutex::new(None)),
-            selection_change_rx: Some(selection_change_rx),
-            selection_change_toolbar_tx: Some(selection_change_toolbar_tx),
-            selection_change_status_tx: Some(selection_change_status_tx),
         }
+    }
+
+    /// Get the selected paths signal (for reactive subscription by other widgets)
+    pub fn selected_paths_signal(&self) -> &StateSignal<Vec<PathBuf>> {
+        self.file_list.selected_paths_signal()
     }
 
     /// Show properties popup for the given paths
@@ -181,95 +176,41 @@ impl Widget for FileListWrapper {
     ) -> nptk::core::app::update::Update {
         let mut update = Update::empty();
 
-        // Poll navigation events from sidebar (only check when we have events)
+        // Hook signals on first update for reactive subscription
+        if !self.signals_hooked {
+            context.hook_signal(&mut self.navigation_path_signal);
+            context.hook_signal(&mut self.file_list_path_signal);
+            self.signals_hooked = true;
+        }
+
+        // Handle sidebar navigation events (sync to NavigationState, which will reactively update FileList)
         if let Some(ref mut rx) = self.navigation_rx {
-            // Use try_recv to poll non-blockingly
             while let Ok(path) = rx.try_recv() {
                 if let Ok(mut nav) = self.navigation.lock() {
                     nav.navigate_to(path.clone());
-                    self.file_list.set_path(path.clone());
-                    self.last_path = path;
-                    self.should_check_path_sync = true;
                     update.insert(Update::LAYOUT | Update::DRAW);
                 }
             }
         }
 
-        // Check if navigation state changed externally (e.g., from toolbar buttons)
-        // ToolbarWrapper updates NavigationState directly, so we need to detect those changes
-        if let Ok(nav) = self.navigation.lock() {
-            let current_nav_path = nav.get_current_path();
-            if current_nav_path != self.last_path {
-                // Navigation changed externally (e.g., from toolbar)
-                self.file_list.set_path(current_nav_path.clone());
-                self.last_path = current_nav_path;
-                self.should_check_path_sync = true;
-                update.insert(Update::LAYOUT | Update::DRAW);
-            }
+        // Reactively sync NavigationState path changes to FileList
+        let nav_path = (*self.navigation_path_signal.get()).clone();
+        let file_list_path = (*self.file_list_path_signal.get()).clone();
+        if nav_path != file_list_path {
+            self.file_list.set_path(nav_path.clone());
+            update.insert(Update::LAYOUT | Update::DRAW);
         }
 
-        // Update the wrapped FileList first to let it handle internal navigation
+        // Update the wrapped FileList to let it handle internal updates
         let file_list_update = self.file_list.update(layout, context.clone(), info);
         update |= file_list_update;
 
-        // Only check path sync when:
-        // 1. We received navigation from sidebar (should_check_path_sync is set), OR
-        // 2. FileList requested LAYOUT update (structural change, might be navigation)
-        // This avoids checking on every hover/redraw cycle which causes infinite loops
-        if self.should_check_path_sync || file_list_update.contains(Update::LAYOUT) {
-            self.should_check_path_sync = false;
-            
-            // Check if FileList's path has changed internally (e.g., from double-click navigation)
-            let file_list_path = self.file_list.get_current_path();
-            if file_list_path != self.last_path {
-                // Sync FileList's path change to NavigationState
-                if let Ok(mut nav) = self.navigation.lock() {
-                    nav.navigate_to(file_list_path.clone());
-                    self.last_path = file_list_path;
-                    update.insert(Update::LAYOUT | Update::DRAW);
-                }
-            } else {
-                // Check if navigation path has changed externally (e.g., from toolbar buttons)
-                if let Ok(nav) = self.navigation.lock() {
-                    let current_nav_path = nav.get_current_path();
-                    if current_nav_path != self.last_path {
-                        self.file_list.set_path(current_nav_path.clone());
-                        self.last_path = current_nav_path;
-                        update.insert(Update::LAYOUT | Update::DRAW);
-                    }
-                }
-            }
-        }
-
-        // Handle selected paths requests (for toolbar delete button)
-        // IMPORTANT: Only respond if there was an actual request - this prevents
-        // selection changes from accidentally triggering delete operations
-        if let Some(ref mut rx) = self.selected_paths_request_rx {
-            while rx.try_recv().is_ok() {
-                // Only respond if there's actually a selection - this prevents empty responses
-                // that might be misinterpreted
-                let selected = self.file_list.selected_paths();
-                if !selected.is_empty() {
-                    if let Some(ref tx) = self.selected_paths_response_tx {
-                        let _ = tx.send(selected);
-                    }
-                }
-            }
-        }
-
-        // Forward selection changes to toolbar and statusbar
-        // IMPORTANT: These go through selection_change_toolbar_tx, NOT selected_paths_response_tx
-        if let Some(ref mut rx) = self.selection_change_rx {
-            while let Ok(selected_paths) = rx.try_recv() {
-                log::debug!("Forwarding selection change ({} path(s)) to toolbar and statusbar", selected_paths.len());
-                // Forward to toolbar
-                if let Some(ref tx) = self.selection_change_toolbar_tx {
-                    let _ = tx.send(selected_paths.clone());
-                }
-                // Forward to statusbar
-                if let Some(ref tx) = self.selection_change_status_tx {
-                    let _ = tx.send(selected_paths);
-                }
+        // Reactively sync FileList path changes to NavigationState (e.g., from double-click navigation)
+        let file_list_path_after = (*self.file_list_path_signal.get()).clone();
+        if file_list_path_after != nav_path {
+            if let Ok(mut nav) = self.navigation.lock() {
+                nav.navigate_to(file_list_path_after.clone());
+                update.insert(Update::LAYOUT | Update::DRAW);
             }
         }
 
@@ -457,8 +398,8 @@ struct LocationBarWrapper {
     inner: TextInput,
     navigation: Arc<Mutex<crate::navigation::NavigationState>>,
     navigation_tx: mpsc::UnboundedSender<crate::toolbar::NavigationAction>,
+    navigation_path_signal: StateSignal<PathBuf>,
     current_path_text: StateSignal<String>,
-    last_synced_path: PathBuf,
     signals_hooked: bool,
     text_input_value: String, // Track TextInput value for Enter key navigation
 }
@@ -467,23 +408,17 @@ impl LocationBarWrapper {
     fn new(
         navigation: Arc<Mutex<crate::navigation::NavigationState>>,
         navigation_tx: mpsc::UnboundedSender<crate::toolbar::NavigationAction>,
+        navigation_path_signal: StateSignal<PathBuf>,
     ) -> Self {
-        let initial_path = {
-            if let Ok(nav) = navigation.lock() {
-                nav.get_current_path()
-            } else {
-                PathBuf::from("/")
-            }
-        };
-        
+        let initial_path = (*navigation_path_signal.get()).clone();
         let initial_text = initial_path.to_string_lossy().to_string();
         
         Self {
             inner: TextInput::new().with_placeholder("Location...".to_string()),
             navigation,
             navigation_tx,
+            navigation_path_signal,
             current_path_text: StateSignal::new(initial_text.clone()),
-            last_synced_path: initial_path.clone(),
             signals_hooked: false,
             text_input_value: initial_text,
         }
@@ -510,18 +445,17 @@ impl Widget for LocationBarWrapper {
         // Hook signals on first update
         if !self.signals_hooked {
             context.hook_signal(&mut self.current_path_text);
+            context.hook_signal(&mut self.navigation_path_signal);
             self.signals_hooked = true;
         }
 
-        // Sync text from navigation state changes
-        if let Ok(nav) = self.navigation.lock() {
-            let current_path = nav.get_current_path();
-            if current_path != self.last_synced_path {
-                let path_str = current_path.to_string_lossy().to_string();
-                self.current_path_text.set(path_str.clone());
-                self.text_input_value = path_str;
-                self.last_synced_path = current_path.clone();
-            }
+        // Reactively sync text from navigation path signal changes
+        let nav_path = (*self.navigation_path_signal.get()).clone();
+        let path_str = nav_path.to_string_lossy().to_string();
+        let current_text = (*self.current_path_text.get()).clone();
+        if path_str != current_text {
+            self.current_path_text.set(path_str.clone());
+            self.text_input_value = path_str;
         }
 
         // Update inner TextInput first
@@ -549,13 +483,9 @@ impl Widget for LocationBarWrapper {
                 
                 // Check if path exists
                 if entered_path.exists() {
-                    // Update navigation state and sync
+                    // Update navigation state (signal will reactively update text)
                     if let Ok(mut nav) = self.navigation.lock() {
                         nav.navigate_to(entered_path.clone());
-                        self.last_synced_path = entered_path.clone();
-                        let path_str = entered_path.to_string_lossy().to_string();
-                        self.current_path_text.set(path_str.clone());
-                        self.text_input_value = path_str.clone();
                     }
                     // Send navigation action
                     let _ = self.navigation_tx.send(crate::toolbar::NavigationAction::NavigateTo(
@@ -608,19 +538,20 @@ pub struct StatusUpdate {
 struct StatusBarWrapper {
     inner: Container,
     navigation: Arc<Mutex<crate::navigation::NavigationState>>,
+    navigation_path_signal: StateSignal<PathBuf>,
+    selected_paths_signal: StateSignal<Vec<PathBuf>>,
     status_rx: Option<mpsc::UnboundedReceiver<String>>, // Temporary operation messages
     status_text: StateSignal<String>,
     status_message_timeout: Option<std::time::Instant>,
     signals_hooked: bool,
-    selection_change_rx: Option<mpsc::UnboundedReceiver<Vec<PathBuf>>>, // Selection change notifications
-    selection_count: usize, // Current selection count
 }
 
 impl StatusBarWrapper {
     fn new(
         navigation: Arc<Mutex<crate::navigation::NavigationState>>,
+        navigation_path_signal: StateSignal<PathBuf>,
+        selected_paths_signal: StateSignal<Vec<PathBuf>>,
         status_rx: mpsc::UnboundedReceiver<String>,
-        selection_change_rx: mpsc::UnboundedReceiver<Vec<PathBuf>>,
     ) -> Self {
         let status_text = StateSignal::new("Ready".to_string());
         
@@ -643,12 +574,12 @@ impl StatusBarWrapper {
         Self {
             inner: container,
             navigation,
+            navigation_path_signal,
+            selected_paths_signal,
             status_rx: Some(status_rx),
             status_text,
             status_message_timeout: None,
             signals_hooked: false,
-            selection_change_rx: Some(selection_change_rx),
-            selection_count: 0,
         }
     }
 
@@ -658,36 +589,34 @@ impl StatusBarWrapper {
             if timeout.elapsed() > std::time::Duration::from_secs(3) {
                 self.status_message_timeout = None;
                 // Update to show current path after message timeout
-                if let Ok(nav) = self.navigation.lock() {
-                    let current_path = nav.get_current_path();
-                    let path_str = current_path.to_string_lossy().to_string();
-                    let status_msg = if self.selection_count > 0 {
-                        format!("{} - {} item(s) selected", path_str, self.selection_count)
-                    } else {
-                        path_str
-                    };
-                    self.status_text.set(status_msg);
-                }
-            }
-        } else {
-            // No temporary message - show current path (with selection count if applicable)
-            if let Ok(nav) = self.navigation.lock() {
-                let current_path = nav.get_current_path();
-                let path_str = current_path.to_string_lossy().to_string();
-                let status_msg = if self.selection_count > 0 {
-                    format!("{} - {} item(s) selected", path_str, self.selection_count)
+                let nav_path = (*self.navigation_path_signal.get()).clone();
+                let path_str = nav_path.to_string_lossy().to_string();
+                let selection_count = (*self.selected_paths_signal.get()).len();
+                let status_msg = if selection_count > 0 {
+                    format!("{} - {} item(s) selected", path_str, selection_count)
                 } else {
                     path_str
                 };
-                // Only update if path or selection count actually changed to avoid unnecessary updates
-                // Get current status first, then compare and set if different
-                let should_update = {
-                    let current_status = self.status_text.get();
-                    *current_status != status_msg && !current_status.starts_with("Error:") && !current_status.contains("Created") && !current_status.contains("Deleted")
-                };
-                if should_update {
-                    self.status_text.set(status_msg);
-                }
+                self.status_text.set(status_msg);
+            }
+        } else {
+            // No temporary message - show current path (with selection count if applicable)
+            let nav_path = (*self.navigation_path_signal.get()).clone();
+            let path_str = nav_path.to_string_lossy().to_string();
+            let selection_count = (*self.selected_paths_signal.get()).len();
+            let status_msg = if selection_count > 0 {
+                format!("{} - {} item(s) selected", path_str, selection_count)
+            } else {
+                path_str
+            };
+            // Only update if status actually changed to avoid unnecessary updates
+            let current_status = (*self.status_text.get()).clone();
+            let should_update = current_status != status_msg 
+                && !current_status.starts_with("Error:") 
+                && !current_status.contains("Created") 
+                && !current_status.contains("Deleted");
+            if should_update {
+                self.status_text.set(status_msg);
             }
         }
     }
@@ -713,15 +642,9 @@ impl Widget for StatusBarWrapper {
         // Hook signals on first update
         if !self.signals_hooked {
             context.hook_signal(&mut self.status_text);
+            context.hook_signal(&mut self.navigation_path_signal);
+            context.hook_signal(&mut self.selected_paths_signal);
             self.signals_hooked = true;
-        }
-
-        // Poll selection change notifications
-        if let Some(ref mut rx) = self.selection_change_rx {
-            while let Ok(paths) = rx.try_recv() {
-                self.selection_count = paths.len();
-                update.insert(Update::DRAW);
-            }
         }
 
         // Poll status messages from operations (these are temporary messages)
@@ -767,18 +690,14 @@ impl nptk::core::widget::WidgetLayoutExt for StatusBarWrapper {
 pub fn build_window(_context: AppContext, state: AppState) -> impl Widget {
     let navigation = state.navigation.lock().unwrap();
     let initial_path = navigation.get_current_path();
+    // Clone navigation path signal for reactive subscription
+    let navigation_path_signal = navigation.current_path().clone();
     let nav_clone = state.navigation.clone();
     drop(navigation);
 
-    // Create channels for operations and status
+    // Create channels for operations and status (async operations still use channels)
     let (operation_tx, operation_rx) = mpsc::unbounded_channel::<FileOperationRequest>();
     let (status_tx, status_rx) = mpsc::unbounded_channel::<String>();
-    let (selected_paths_request_tx, selected_paths_request_rx) = mpsc::unbounded_channel::<()>();
-    let (selected_paths_response_tx, selected_paths_response_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
-
-    // Create selection change channels
-    let (selection_change_toolbar_tx, selection_change_toolbar_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
-    let (selection_change_status_tx, selection_change_status_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
 
     // Create FilemanSidebar
     let mut sidebar = FilemanSidebar::new()
@@ -791,38 +710,39 @@ pub fn build_window(_context: AppContext, state: AppState) -> impl Widget {
         .expect("FilemanSidebar should provide navigation receiver");
 
     // Create FileList wrapper that syncs with navigation state
-    let file_list = FileListWrapper::new(
+    let mut file_list_wrapper = FileListWrapper::new(
         initial_path.clone(),
         nav_clone.clone(),
         sidebar_nav_rx,
         operation_rx,
         status_tx.clone(),
-        selected_paths_request_rx,
-        selected_paths_response_tx.clone(),
-        selection_change_toolbar_tx.clone(),
-        selection_change_status_tx.clone(),
+        navigation_path_signal.clone(),
     );
+
+    // Clone selected paths signal from FileList for ToolbarWrapper and StatusBarWrapper
+    let selected_paths_signal = file_list_wrapper.selected_paths_signal().clone();
 
     // Create ToolbarWrapper
     let (mut toolbar_wrapper, toolbar_nav_tx) = crate::toolbar::ToolbarWrapper::new(
         nav_clone.clone(),
         operation_tx.clone(),
-        selected_paths_request_tx,
-        selected_paths_response_rx,
-        selection_change_toolbar_rx,
+        navigation_path_signal.clone(),
+        selected_paths_signal.clone(),
     );
 
     // Create LocationBarWrapper
     let location_bar = LocationBarWrapper::new(
         nav_clone.clone(),
         toolbar_nav_tx.clone(),
+        navigation_path_signal.clone(),
     );
 
     // Create StatusBarWrapper
     let statusbar = StatusBarWrapper::new(
         nav_clone.clone(),
+        navigation_path_signal.clone(),
+        selected_paths_signal.clone(),
         status_rx,
-        selection_change_status_rx,
     );
 
     // Build main layout
@@ -839,7 +759,7 @@ pub fn build_window(_context: AppContext, state: AppState) -> impl Widget {
         // Content area (sidebar + file list)
         Box::new(Container::new(vec![
             Box::new(sidebar),
-            Box::new(file_list),
+            Box::new(file_list_wrapper),
         ]).with_layout_style(LayoutStyle {
             size: Vector2::new(Dimension::percent(1.0), Dimension::percent(1.0)),
             flex_direction: FlexDirection::Row,

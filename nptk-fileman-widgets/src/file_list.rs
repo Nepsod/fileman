@@ -200,6 +200,16 @@ impl FileList {
         self.selected_paths.get().first().cloned()
     }
 
+    /// Get the selected paths signal (for reactive subscription)
+    pub fn selected_paths_signal(&self) -> &StateSignal<Vec<PathBuf>> {
+        &self.selected_paths
+    }
+    
+    /// Get the current path signal (for reactive subscription)
+    pub fn current_path_signal(&self) -> &StateSignal<PathBuf> {
+        &self.current_path
+    }
+
     /// Clear the selection.
     pub fn clear_selection(&mut self) {
         self.selected_paths.set(Vec::new());
