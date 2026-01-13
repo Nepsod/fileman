@@ -1,5 +1,6 @@
 use nptk::prelude::*;
 use nptk::core::signal::eval::EvalSignal;
+use nptk::core::window::{ElementState, KeyCode, PhysicalKey};
 use nptk_fileman_widgets::file_list::{FileList, FileListOperation};
 use nptk_fileman_widgets::FilemanSidebar;
 use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem};
@@ -421,13 +422,14 @@ fn path_to_breadcrumb_items(path: &PathBuf) -> Vec<BreadcrumbItem> {
     items
 }
 
-/// Wrapper widget for location bar (breadcrumbs) with bidirectional sync
+/// Wrapper widget for location bar (breadcrumbs and text input) with bidirectional sync
 struct LocationBarWrapper {
-    inner: Breadcrumbs,
+    inner: Container,
     navigation: Arc<Mutex<crate::navigation::NavigationState>>,
     navigation_tx: mpsc::UnboundedSender<crate::toolbar::NavigationAction>,
     navigation_path_signal: StateSignal<PathBuf>,
     breadcrumb_items_signal: StateSignal<Vec<BreadcrumbItem>>,
+    text_input_value: StateSignal<String>,
     signals_hooked: bool,
 }
 
@@ -440,6 +442,8 @@ impl LocationBarWrapper {
         let initial_path = (*navigation_path_signal.get()).clone();
         let initial_items = path_to_breadcrumb_items(&initial_path);
         let breadcrumb_items_signal = StateSignal::new(initial_items.clone());
+        let initial_text = initial_path.to_string_lossy().to_string();
+        let text_input_value = StateSignal::new(initial_text.clone());
         
         let nav_tx_clone1 = navigation_tx.clone();
         let nav_tx_clone2 = navigation_tx.clone();
@@ -493,14 +497,37 @@ impl LocationBarWrapper {
                     }
                 }
                 Update::empty()
+            })
+            .with_layout_style(LayoutStyle {
+                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+                ..Default::default()
             });
         
+        let text_input = TextInput::new()
+            .with_text_signal(text_input_value.clone())
+            .with_placeholder("Path...".to_string())
+            .with_layout_style(LayoutStyle {
+                size: Vector2::new(Dimension::length(300.0), Dimension::auto()),
+                ..Default::default()
+            });
+        
+        let container = Container::new(vec![
+            Box::new(breadcrumbs),
+            Box::new(text_input),
+        ]).with_layout_style(LayoutStyle {
+            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+            flex_direction: FlexDirection::Row,
+            gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
+            ..Default::default()
+        });
+        
         Self {
-            inner: breadcrumbs,
+            inner: container,
             navigation,
             navigation_tx,
             navigation_path_signal,
             breadcrumb_items_signal,
+            text_input_value,
             signals_hooked: false,
         }
     }
@@ -527,6 +554,7 @@ impl Widget for LocationBarWrapper {
         if !self.signals_hooked {
             context.hook_signal(&mut self.navigation_path_signal);
             context.hook_signal(&mut self.breadcrumb_items_signal);
+            context.hook_signal(&mut self.text_input_value);
             self.signals_hooked = true;
         }
 
@@ -542,7 +570,34 @@ impl Widget for LocationBarWrapper {
             update |= Update::LAYOUT | Update::DRAW;
         }
 
-        // Update inner Breadcrumbs widget
+        // Sync text input value from navigation path signal
+        let path_str = nav_path.to_string_lossy().to_string();
+        let current_text = (*self.text_input_value.get()).clone();
+        if path_str != current_text {
+            self.text_input_value.set(path_str);
+            update |= Update::LAYOUT | Update::DRAW;
+        }
+
+        // Handle Enter key press in TextInput to navigate
+        let enter_pressed = info.keys.iter().any(|(_, key_event)| {
+            key_event.state == ElementState::Pressed
+                && matches!(key_event.physical_key, PhysicalKey::Code(KeyCode::Enter))
+        });
+
+        if enter_pressed {
+            let entered_text = (*self.text_input_value.get()).trim().to_string();
+            if !entered_text.is_empty() {
+                let entered_path = PathBuf::from(&entered_text);
+                if entered_path.exists() {
+                    let _ = self.navigation_tx.send(crate::toolbar::NavigationAction::NavigateTo(entered_path));
+                    update.insert(Update::LAYOUT | Update::DRAW);
+                } else {
+                    log::warn!("Navigation to non-existent path: {}", entered_text);
+                }
+            }
+        }
+
+        // Update inner Container (which updates both breadcrumbs and text_input)
         update |= self.inner.update(layout, context, info);
         
         update
