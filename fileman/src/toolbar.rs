@@ -68,7 +68,8 @@ impl ToolbarWrapper {
                 }
                 Update::empty()
             }))))
-            .with_tooltip("Go back");
+            .with_tooltip("Go back")
+            .with_status_tip("Navigate to the previous directory in history");
 
         let forward_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-right", 24, None)),
@@ -82,7 +83,8 @@ impl ToolbarWrapper {
                 }
                 Update::empty()
             }))))
-            .with_tooltip("Go forward");
+            .with_tooltip("Go forward")
+            .with_status_tip("Navigate to the next directory in history");
 
         let up_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-up", 24, None)),
@@ -96,7 +98,8 @@ impl ToolbarWrapper {
                     }
                 }
                 Update::empty()
-            }))));
+            }))))
+            .with_status_tip("Navigate to the parent directory");
 
         let home_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("folder-home", 24, None)),
@@ -113,7 +116,8 @@ impl ToolbarWrapper {
                 }
                 Update::empty()
             }))))
-            .with_tooltip("Go home");
+            .with_tooltip("Go home")
+            .with_status_tip("Navigate to the home directory");
 
         let new_folder_requested = Arc::new(Mutex::new(false));
         let new_folder_btn = ToolbarButton::with_children(vec![
@@ -129,7 +133,8 @@ impl ToolbarWrapper {
                     Update::DRAW
                 })))
             })
-            .with_tooltip("New folder");
+            .with_tooltip("New folder")
+            .with_status_tip("Create a new folder in the current directory");
 
         let properties_requested = Arc::new(Mutex::new(false));
         let properties_btn = ToolbarButton::with_children(vec![
@@ -145,7 +150,8 @@ impl ToolbarWrapper {
                     Update::DRAW
                 })))
             })
-            .with_tooltip("Properties");
+            .with_tooltip("Properties")
+            .with_status_tip("Show properties of the selected items");
 
         // Delete button - read selected paths from signal directly
         let delete_requested = Arc::new(Mutex::new(false));
@@ -163,7 +169,8 @@ impl ToolbarWrapper {
                     Update::DRAW
                 })))
             })
-            .with_tooltip("Delete");
+            .with_tooltip("Delete")
+            .with_status_tip("Delete the selected items");
 
         let toolbar = Toolbar::new()
             .with_child(back_btn)

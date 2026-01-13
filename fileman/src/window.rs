@@ -1,5 +1,7 @@
 use nptk::prelude::*;
 use nptk::core::signal::eval::EvalSignal;
+use nptk::core::shortcut::{Shortcut, ShortcutRegistry};
+use nptk::core::window::KeyCode;
 use nptk_fileman_widgets::file_list::{FileList, FileListOperation};
 use nptk_fileman_widgets::FilemanSidebar;
 use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem};
@@ -203,6 +205,29 @@ impl Widget for FileListWrapper {
         // Update the wrapped FileList to let it handle internal updates
         let file_list_update = self.file_list.update(layout, context.clone(), info);
         update |= file_list_update;
+
+        // Path refresh/recovery logic: If current directory no longer exists, navigate to parent
+        // This handles the case where a directory is deleted externally (similar to SerenityOS)
+        let current_path = (*self.file_list_path_signal.get()).clone();
+        if !current_path.exists() {
+            // Navigate to parent directory, continuing up until we find a valid directory
+            let mut recovery_path = current_path.clone();
+            while !recovery_path.exists() && recovery_path != PathBuf::from("/") {
+                if let Some(parent) = recovery_path.parent() {
+                    recovery_path = parent.to_path_buf();
+                } else {
+                    break;
+                }
+            }
+            // If we found a valid parent, navigate there
+            if recovery_path.exists() && recovery_path != current_path {
+                if let Ok(mut nav) = self.navigation.lock() {
+                    nav.navigate_to(recovery_path.clone());
+                    self.file_list.set_path(recovery_path);
+                    update.insert(Update::LAYOUT | Update::DRAW);
+                }
+            }
+        }
 
         // Reactively sync FileList path changes to NavigationState (e.g., from double-click navigation)
         let file_list_path_after = (*self.file_list_path_signal.get()).clone();
@@ -429,6 +454,7 @@ struct LocationBarWrapper {
     navigation_path_signal: StateSignal<PathBuf>,
     breadcrumb_items_signal: StateSignal<Vec<BreadcrumbItem>>,
     text_input_value: StateSignal<String>,
+    last_synced_nav_path: PathBuf, // Track last synced navigation path to only update text input when nav path changes
     signals_hooked: bool,
 }
 
@@ -528,6 +554,7 @@ impl LocationBarWrapper {
             navigation_path_signal,
             breadcrumb_items_signal,
             text_input_value,
+            last_synced_nav_path: initial_path,
             signals_hooked: false,
         }
     }
@@ -570,11 +597,12 @@ impl Widget for LocationBarWrapper {
             update |= Update::LAYOUT | Update::DRAW;
         }
 
-        // Sync text input value from navigation path signal
-        let path_str = nav_path.to_string_lossy().to_string();
-        let current_text = (*self.text_input_value.get()).clone();
-        if path_str != current_text {
+        // Sync text input value from navigation path signal (only when navigation path changes)
+        // Don't overwrite user input - only sync when the navigation path itself changes
+        if nav_path != self.last_synced_nav_path {
+            let path_str = nav_path.to_string_lossy().to_string();
             self.text_input_value.set(path_str);
+            self.last_synced_nav_path = nav_path;
             update |= Update::LAYOUT | Update::DRAW;
         }
 
@@ -726,6 +754,7 @@ impl Widget for StatusBarWrapper {
         }
 
         // Poll status messages from operations (these are temporary messages)
+        let mut has_active_temporary_message = false;
         if let Some(ref mut rx) = self.status_rx {
             while let Ok(msg) = rx.try_recv() {
                 self.status_text.set(msg.clone());
@@ -733,9 +762,28 @@ impl Widget for StatusBarWrapper {
                 update.insert(Update::DRAW);
             }
         }
+        
+        // Check if we have an active temporary message (within timeout)
+        if let Some(timeout) = self.status_message_timeout {
+            if timeout.elapsed() <= std::time::Duration::from_secs(3) {
+                has_active_temporary_message = true;
+            }
+        }
 
-        // Update status from navigation (shows current path when no temporary message)
-        self.update_status_from_navigation();
+        // Priority: 1) Temporary messages, 2) Framework status bar text (button status tips), 3) Default navigation info
+        if !has_active_temporary_message {
+            // Get framework status bar text (from button status tips)
+            let framework_status_text = context.status_bar.get_text();
+            if !framework_status_text.is_empty() {
+                // Framework status bar has text (e.g., from button hover) - use it
+                self.status_text.set(framework_status_text);
+                update.insert(Update::DRAW);
+            } else {
+                // No framework status text - update status from navigation
+                self.update_status_from_navigation();
+            }
+        }
+        // If has_active_temporary_message is true, status_text was already set when the message was received
         
         // If status changed, trigger redraw
         if !update.is_empty() {
@@ -765,7 +813,7 @@ impl nptk::core::widget::WidgetLayoutExt for StatusBarWrapper {
     }
 }
 
-pub fn build_window(_context: AppContext, state: AppState) -> impl Widget {
+pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     let navigation = state.navigation.lock().unwrap();
     let initial_path = navigation.get_current_path();
     // Clone navigation path signal for reactive subscription
@@ -776,6 +824,17 @@ pub fn build_window(_context: AppContext, state: AppState) -> impl Widget {
     // Create channels for operations and status (async operations still use channels)
     let (operation_tx, operation_rx) = mpsc::unbounded_channel::<FileOperationRequest>();
     let (status_tx, status_rx) = mpsc::unbounded_channel::<String>();
+    
+    // Register keyboard shortcuts
+    // TODO: Implement focus text input functionality for "Go to Location" shortcuts
+    context.shortcut_registry.register(
+        Shortcut::ctrl(KeyCode::KeyL),
+        || Update::DRAW, // Placeholder - will implement focus text input later
+    );
+    context.shortcut_registry.register(
+        Shortcut::new(KeyCode::F6, nptk::core::window::ModifiersState::empty()),
+        || Update::DRAW, // Placeholder - will implement focus text input later
+    );
 
     // Create FilemanSidebar
     let mut sidebar = FilemanSidebar::new()
