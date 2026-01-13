@@ -145,7 +145,7 @@ impl FileListContent {
             // Request thumbnail generation asynchronously (non-blocking)
             // Thumbnails will be rendered when ready via event system
             if entry.is_file() {
-                let mut pending = self.pending_thumbnails.lock().unwrap();
+                let mut pending = self.pending_thumbnails.lock().expect("Failed to lock pending_thumbnails in view_list");
                 // Use insert() which returns true if the value was newly inserted (atomic check-and-insert)
                 if pending.insert(entry.path.clone()) {
                     let file_clone = get_file_for_uri(&file_entry_to_uri(entry)).ok();
@@ -170,7 +170,7 @@ impl FileListContent {
             // Get icon for this entry (only use cached, don't block on loading)
             let cache_key = (entry.path.clone(), icon_size as u32);
             let cached_icon = {
-                let cache = self.icon_cache.lock().unwrap();
+                let cache = self.icon_cache.lock().expect("Failed to lock icon_cache in view_list");
                 cache.get(&cache_key).and_then(|opt| opt.clone())
             };
             
@@ -188,25 +188,39 @@ impl FileListContent {
                     let uri = file_entry_to_uri(&entry_clone);
                     if let Ok(file) = get_file_for_uri(&uri) {
                         let icon = registry_clone.get_file_icon(&*file, icon_size as u32).await;
-                        let mut cache = cache_clone.lock().unwrap();
+                        let mut cache = cache_clone.lock().expect("Failed to lock icon_cache in async task (view_list)");
                         cache.insert(cache_key_clone, icon);
                         // Notify that cache was updated to trigger redraw
-                        let _ = cache_update_tx_clone.send(());
+                        if cache_update_tx_clone.try_send(()).is_err() {
+                            log::debug!("Cache update channel full, skipping notification");
+                        }
                     }
                     // Permit is automatically released when dropped
                 });
             }
 
             if let Some(icon) = cached_icon {
-                render_cached_icon(
-                    graphics,
-                    theme,
-                    self.widget_id(),
-                    icon,
-                    icon_rect,
-                    &entry,
-                    &mut self.svg_scene_cache,
-                );
+                // Validate that the file still exists before using cached icon
+                if entry.path.exists() {
+                    render_cached_icon(
+                        graphics,
+                        theme,
+                        self.widget_id(),
+                        icon,
+                        icon_rect,
+                        &entry,
+                        &mut self.svg_scene_cache,
+                    );
+                } else {
+                    // File was deleted, use fallback
+                    render_fallback_icon(
+                        graphics,
+                        theme,
+                        self.widget_id(),
+                        icon_rect,
+                        &entry,
+                    );
+                }
             } else {
                 render_fallback_icon(
                     graphics,

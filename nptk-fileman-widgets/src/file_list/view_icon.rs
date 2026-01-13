@@ -22,9 +22,12 @@ impl FileListContent {
         icon_size: u32,
     ) -> (usize, f32, f32) {
         let icon_size_f = icon_size as f32;
-        let cell_width = icon_size_f + self.icon_view_spacing * 2.0;
-        let available_width = viewport_width - self.icon_view_padding * 2.0;
-        let columns = (available_width / cell_width).floor().max(1.0) as usize;
+        let cell_width = (icon_size_f + self.icon_view_spacing * 2.0).max(1.0);
+        let available_width = (viewport_width - self.icon_view_padding * 2.0).max(1.0);
+        let mut columns = (available_width / cell_width).floor().max(1.0) as usize;
+        if columns == 0 {
+            columns = 1;
+        }
         // Calculate cell height: icon + spacing + text area (2-3 lines)
         // Text area: ~37.5px for 2-3 lines, plus spacing between icon and text
         let text_area_height = 12.0 * 1.25 * 2.5; // ~37.5px for 2-3 lines
@@ -276,9 +279,9 @@ impl FileListContent {
         // 2. Draw Icon
         // Try to get thumbnail from cache first, fall back to icon
         let mut use_thumbnail = false;
-        let thumbnail_cache_key = (entry.path.clone(), icon_size);
-        if let Some(thumbnail_image) = {
-            let cache = self.thumbnail_cache.lock().unwrap();
+            let thumbnail_cache_key = (entry.path.clone(), icon_size);
+            if let Some(thumbnail_image) = {
+                let cache = self.thumbnail_cache.lock().expect("Failed to lock thumbnail_cache in view_icon");
             cache.get(&thumbnail_cache_key).cloned()
         } {
             use nptk::core::vg::peniko::{
@@ -307,7 +310,7 @@ impl FileListContent {
         if !use_thumbnail {
             // Request thumbnail generation asynchronously (non-blocking)
             if entry.is_file() {
-                let mut pending = self.pending_thumbnails.lock().unwrap();
+                let mut pending = self.pending_thumbnails.lock().expect("Failed to lock pending_thumbnails in view_icon");
                 // Use insert() which returns true if the value was newly inserted (atomic check-and-insert)
                 if pending.insert(entry.path.clone()) {
                     let file_clone = get_file_for_uri(&file_entry_to_uri(entry)).ok();
@@ -333,7 +336,7 @@ impl FileListContent {
         // Get icon for this entry (only use cached, don't block on loading)
         let cache_key = (entry.path.clone(), icon_size);
         let cached_icon = {
-            let cache = self.icon_cache.lock().unwrap();
+            let cache = self.icon_cache.lock().expect("Failed to lock icon_cache in view_icon");
             cache.get(&cache_key).and_then(|opt| opt.clone())
         };
         
@@ -348,13 +351,15 @@ impl FileListContent {
             tokio::spawn(async move {
                 // Acquire semaphore permit to limit concurrent tasks
                 let _permit = semaphore_clone.acquire().await.ok();
-                let uri = file_entry_to_uri(&entry_clone);
-                if let Ok(file) = get_file_for_uri(&uri) {
-                    let icon = registry_clone.get_file_icon(&*file, icon_size).await;
-                    let mut cache = cache_clone.lock().unwrap();
+                    let uri = file_entry_to_uri(&entry_clone);
+                    if let Ok(file) = get_file_for_uri(&uri) {
+                        let icon = registry_clone.get_file_icon(&*file, icon_size).await;
+                        let mut cache = cache_clone.lock().expect("Failed to lock icon_cache in async task (view_icon)");
                     cache.insert(cache_key_clone, icon);
                     // Notify that cache was updated to trigger redraw
-                    let _ = cache_update_tx_clone.send(());
+                    if cache_update_tx_clone.try_send(()).is_err() {
+                        log::debug!("Cache update channel full, skipping notification");
+                    }
                 }
                 // Permit is automatically released when dropped
             });

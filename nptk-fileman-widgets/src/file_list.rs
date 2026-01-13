@@ -83,6 +83,9 @@ pub struct FileList {
 
     // Selection change notification channel
     selection_change_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
+    
+    // Cache invalidation channel sender
+    cache_invalidate_tx: Arc<tokio::sync::mpsc::UnboundedSender<PathBuf>>,
 }
 
 impl FileList {
@@ -148,8 +151,11 @@ impl FileList {
         let thumbnail_service = Arc::new(ThumbnailService::new());
         let thumbnail_event_rx = thumbnail_service.subscribe();
         
-        // Create channel for cache update notifications
-        let (cache_update_tx, cache_update_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Create channel for cache update notifications (bounded to prevent unbounded growth)
+        let (cache_update_tx, cache_update_rx) = tokio::sync::mpsc::channel(100);
+        
+        // Create channel for cache invalidation requests
+        let (cache_invalidate_tx, cache_invalidate_rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Wrap selection_change_tx in Arc for sharing with FileListContent
         let selection_change_tx_arc = selection_change_tx.map(|tx| Arc::new(tx));
@@ -167,9 +173,13 @@ impl FileList {
             thumbnail_event_rx,
             cache_update_tx,
             cache_update_rx,
+            cache_invalidate_rx,
             operation_tx,
             selection_change_tx_arc.clone(),
         );
+        
+        // Store cache invalidation sender for use in FileList::update()
+        let cache_invalidate_tx_arc = Arc::new(cache_invalidate_tx);
 
         // Create scroll container (Both directions to support icon view)
         let scroll_container = ScrollContainer::new()
@@ -193,6 +203,7 @@ impl FileList {
             scroll_container: Box::new(scroll_container),
             signals_hooked: false,
             selection_change_tx: selection_change_tx_arc,
+            cache_invalidate_tx: cache_invalidate_tx_arc,
         }
     }
 
@@ -308,6 +319,10 @@ impl Widget for FileList {
                         if let Some(parent) = path.parent() {
                             if parent == *self.current_path.get() {
                                 let _ = self.fs_model.refresh(parent);
+                                // Invalidate caches for the affected path
+                                if let Err(e) = self.cache_invalidate_tx.send(path.clone()) {
+                                    log::warn!("Failed to send cache invalidation request: {}", e);
+                                }
                             }
                         }
                     },
@@ -389,8 +404,11 @@ struct FileListContent {
     update_manager: Arc<Mutex<Option<nptk::core::app::update::UpdateManager>>>,
     
     // Channel to notify when caches are updated (for triggering redraws)
-    cache_update_tx: tokio::sync::mpsc::UnboundedSender<()>,
-    cache_update_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>>,
+    cache_update_tx: tokio::sync::mpsc::Sender<()>,
+    cache_update_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
+    
+    // Channel to receive cache invalidation requests
+    cache_invalidate_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<PathBuf>>>,
 
     // Drag selection state
     drag_start: Option<Point>,
@@ -428,6 +446,9 @@ struct FileListContent {
 
     // Semaphore to limit concurrent async tasks (icon/thumbnail loading)
     async_task_semaphore: Arc<tokio::sync::Semaphore>,
+    
+    // Track previous path to detect directory changes
+    previous_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -458,8 +479,9 @@ impl FileListContent {
         icon_registry: Arc<IconRegistry>,
         thumbnail_service: Arc<ThumbnailService>,
         thumbnail_event_rx: tokio::sync::broadcast::Receiver<ThumbnailEvent>,
-        cache_update_tx: tokio::sync::mpsc::UnboundedSender<()>,
-        cache_update_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+        cache_update_tx: tokio::sync::mpsc::Sender<()>,
+        cache_update_rx: tokio::sync::mpsc::Receiver<()>,
+        cache_invalidate_rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
         operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
         selection_change_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
     ) -> Self {
@@ -485,6 +507,7 @@ impl FileListContent {
             update_manager: Arc::new(Mutex::new(None)),
             cache_update_tx,
             cache_update_rx: Arc::new(Mutex::new(cache_update_rx)),
+            cache_invalidate_rx: Arc::new(Mutex::new(cache_invalidate_rx)),
             drag_start: None,
             current_drag_pos: None,
             is_dragging: false,
@@ -503,6 +526,7 @@ impl FileListContent {
             hovered_item_index: None,
             tooltip_shown: false,
             async_task_semaphore: Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_ASYNC_TASKS)),
+            previous_path: None,
         }
         .with_thumbnail_size(128)
     }
@@ -513,10 +537,16 @@ impl FileListContent {
     }
 
     /// Evict entries from icon cache if it exceeds the limit
+    /// 
+    /// NOTE: This is NOT a true LRU (Least Recently Used) eviction strategy.
+    /// HashMap iteration order is not guaranteed, so this removes arbitrary entries.
+    /// For proper LRU behavior, consider using LinkedHashMap or a custom LRU cache structure.
+    /// This simple eviction prevents unbounded memory growth but may evict frequently-used entries.
     fn evict_icon_cache_if_needed(&self) {
-        let mut cache = self.icon_cache.lock().unwrap();
+        let mut cache = self.icon_cache.lock().expect("Failed to lock icon_cache for eviction");
         if cache.len() > Self::MAX_ICON_CACHE_SIZE {
             // Simple eviction: remove oldest entries (first N entries)
+            // NOTE: HashMap iteration order is not guaranteed, so this is not true LRU
             let to_remove = cache.len() - Self::MAX_ICON_CACHE_SIZE;
             let keys: Vec<_> = cache.keys().take(to_remove).cloned().collect();
             for key in keys {
@@ -527,10 +557,14 @@ impl FileListContent {
     }
 
     /// Evict entries from thumbnail cache if it exceeds the limit
+    /// 
+    /// NOTE: This is NOT a true LRU (Least Recently Used) eviction strategy.
+    /// See evict_icon_cache_if_needed() for details.
     fn evict_thumbnail_cache_if_needed(&self) {
-        let mut cache = self.thumbnail_cache.lock().unwrap();
+        let mut cache = self.thumbnail_cache.lock().expect("Failed to lock thumbnail_cache for eviction");
         if cache.len() > Self::MAX_THUMBNAIL_CACHE_SIZE {
             // Simple eviction: remove oldest entries (first N entries)
+            // NOTE: HashMap iteration order is not guaranteed, so this is not true LRU
             let to_remove = cache.len() - Self::MAX_THUMBNAIL_CACHE_SIZE;
             let keys: Vec<_> = cache.keys().take(to_remove).cloned().collect();
             for key in keys {
@@ -541,9 +575,17 @@ impl FileListContent {
     }
 
     /// Evict entries from layout cache if it exceeds the limit
+    /// 
+    /// NOTE: This is NOT a true LRU (Least Recently Used) eviction strategy.
+    /// See evict_icon_cache_if_needed() for details.
+    /// 
+    /// Additionally, layout_cache is cleared when viewport width changes significantly,
+    /// as layout calculations depend on available width. Icon and thumbnail caches are
+    /// size-independent and are not cleared on viewport changes.
     fn evict_layout_cache_if_needed(&mut self) {
         if self.layout_cache.len() > Self::MAX_LAYOUT_CACHE_SIZE {
             // Simple eviction: remove oldest entries (first N entries)
+            // NOTE: HashMap iteration order is not guaranteed, so this is not true LRU
             let to_remove = self.layout_cache.len() - Self::MAX_LAYOUT_CACHE_SIZE;
             let keys: Vec<_> = self.layout_cache.keys().take(to_remove).cloned().collect();
             for key in keys {
@@ -554,9 +596,13 @@ impl FileListContent {
     }
 
     /// Evict entries from SVG scene cache if it exceeds the limit
+    /// 
+    /// NOTE: This is NOT a true LRU (Least Recently Used) eviction strategy.
+    /// See evict_icon_cache_if_needed() for details.
     fn evict_svg_scene_cache_if_needed(&mut self) {
         if self.svg_scene_cache.len() > Self::MAX_SVG_SCENE_CACHE_SIZE {
             // Simple eviction: remove oldest entries (first N entries)
+            // NOTE: HashMap iteration order is not guaranteed, so this is not true LRU
             let to_remove = self.svg_scene_cache.len() - Self::MAX_SVG_SCENE_CACHE_SIZE;
             let keys: Vec<_> = self.svg_scene_cache.keys().take(to_remove).cloned().collect();
             for key in keys {
@@ -564,6 +610,58 @@ impl FileListContent {
             }
             log::debug!("Evicted {} entries from SVG scene cache", to_remove);
         }
+    }
+
+    /// Invalidate all caches for a given path (used when files are deleted or moved)
+    /// 
+    /// This method is called automatically when FileSystemEvent::EntryRemoved is received,
+    /// ensuring that cached data for deleted files is removed to prevent memory leaks and
+    /// potential panics from accessing non-existent file paths.
+    /// 
+    /// Cache invalidation strategy:
+    /// - icon_cache: Removed by path (key is (PathBuf, u32))
+    /// - thumbnail_cache: Removed by path (key is (PathBuf, u32))
+    /// - layout_cache: Removed by path (key includes PathBuf)
+    /// - pending_thumbnails: Removed from HashSet
+    /// - svg_scene_cache: Not invalidated (keys are based on icon content, not paths)
+    fn invalidate_caches_for_path(&mut self, path: &PathBuf) {
+        // Remove from icon_cache
+        {
+            let mut cache = self.icon_cache.lock().expect("Failed to lock icon_cache for invalidation");
+            cache.retain(|(key_path, _), _| key_path != path);
+        }
+        
+        // Remove from thumbnail_cache
+        {
+            let mut cache = self.thumbnail_cache.lock().expect("Failed to lock thumbnail_cache for invalidation");
+            cache.retain(|(key_path, _), _| key_path != path);
+        }
+        
+        // Remove from pending_thumbnails
+        {
+            let mut pending = self.pending_thumbnails.lock().expect("Failed to lock pending_thumbnails for invalidation");
+            pending.remove(path);
+        }
+        
+        // Remove from layout_cache
+        self.layout_cache.retain(|(key_path, _, _, _), _| key_path != path);
+        
+        // Note: svg_scene_cache keys are based on icon content (strings), not paths,
+        // so we don't need to invalidate them based on file paths
+        
+        log::debug!("Invalidated caches for path: {:?}", path);
+    }
+
+    /// Clear selection-related state (anchor_index, tooltip state, click indices)
+    /// Called when directory changes or entries are refreshed to prevent stale state
+    fn clear_selection_state(&mut self, context: &AppContext) {
+        self.anchor_index = None;
+        self.last_click_index = None;
+        self.hovered_item_index = None;
+        self.tooltip_shown = false;
+        // Hide tooltip if it was shown
+        context.request_tooltip_hide();
+        log::debug!("Cleared selection state (anchor_index, tooltip, click indices)");
     }
 
     /// Notify about selection changes via channel if available
@@ -855,17 +953,43 @@ impl Widget for FileListContent {
     fn update(&mut self, layout: &LayoutNode, context: AppContext, info: &mut AppInfo) -> Update {
         // Store update manager for async tasks to trigger redraws
         {
-            let mut update_mgr = self.update_manager.lock().unwrap();
+            let mut update_mgr = self.update_manager.lock().expect("Failed to lock update_manager");
             *update_mgr = Some(context.update());
         }
         
         let mut update = Update::empty();
+        
+        // Check if directory changed and clear selection state if so
+        let current_path = self.current_path.get().clone();
+        if let Some(ref prev_path) = self.previous_path {
+            if prev_path != &current_path {
+                // Directory changed - clear selection state
+                self.clear_selection_state(&context);
+                update.insert(Update::DRAW);
+            }
+        }
+        self.previous_path = Some(current_path);
         
         // Poll cache update notifications (non-blocking)
         if let Ok(mut rx) = self.cache_update_rx.try_lock() {
             while rx.try_recv().is_ok() {
                 update.insert(Update::DRAW);
             }
+        } else {
+            log::warn!("Failed to lock cache_update_rx, skipping cache update poll");
+        }
+        
+        // Poll cache invalidation requests (non-blocking)
+        let mut paths_to_invalidate = Vec::new();
+        if let Ok(mut rx) = self.cache_invalidate_rx.try_lock() {
+            while let Ok(path) = rx.try_recv() {
+                paths_to_invalidate.push(path);
+            }
+        }
+        // Invalidate caches after releasing the lock to avoid borrow checker issues
+        for path in paths_to_invalidate {
+            self.invalidate_caches_for_path(&path);
+            update.insert(Update::DRAW);
         }
 
         if let Some(cursor) = info.cursor_pos {
@@ -948,7 +1072,7 @@ impl Widget for FileListContent {
                         // Convert URI to path for pending tracking
                         if let Some(entry_path) = uri_to_path(&uri) {
                             log::debug!("Thumbnail ready for {:?}", entry_path);
-                            let mut pending = self.pending_thumbnails.lock().unwrap();
+                            let mut pending = self.pending_thumbnails.lock().expect("Failed to lock pending_thumbnails");
                             pending.remove(&entry_path);
                             
                             // Fetch and cache the thumbnail image (non-blocking spawn)
@@ -968,7 +1092,7 @@ impl Widget for FileListContent {
                                         .get_thumbnail_image(&*file, size, None)
                                         .await
                                     {
-                                        let mut cache = cache_clone.lock().unwrap();
+                                        let mut cache = cache_clone.lock().expect("Failed to lock thumbnail_cache in async task");
                                         cache.insert((path_clone, size_u32), thumbnail_image);
                                         
                                         // Trigger redraw when thumbnail is cached
@@ -979,7 +1103,10 @@ impl Widget for FileListContent {
                                         }
                                         
                                         // Also send notification via channel (backup mechanism)
-                                        let _ = cache_update_tx_clone.send(());
+                                        // Use try_send for non-blocking behavior with bounded channel
+                                        if cache_update_tx_clone.try_send(()).is_err() {
+                                            log::debug!("Cache update channel full, skipping notification");
+                                        }
                                     }
                                     // Permit is automatically released when dropped
                                 });
@@ -997,7 +1124,7 @@ impl Widget for FileListContent {
                                 entry_path,
                                 error_message
                             );
-                            let mut pending = self.pending_thumbnails.lock().unwrap();
+                            let mut pending = self.pending_thumbnails.lock().expect("Failed to lock pending_thumbnails on failure");
                             pending.remove(&entry_path);
                         }
                     },
@@ -1358,7 +1485,12 @@ impl Widget for FileListContent {
                             let now = Instant::now();
                             if let Some(last_time) = self.last_click_time {
                                 if let Some(last_index) = self.last_click_index {
-                                    if Some(last_index) == index
+                                    let entries_len = {
+                                        let entries = self.entries.get();
+                                        entries.len()
+                                    };
+                                    if last_index < entries_len
+                                        && Some(last_index) == index
                                         && now.duration_since(last_time)
                                             < Duration::from_millis(500)
                                     {
@@ -1368,6 +1500,8 @@ impl Widget for FileListContent {
                                                 let _ = self.fs_model.refresh(&target_path);
                                                 self.selected_paths.set(Vec::new());
                                                 self.notify_selection_change(&Vec::new());
+                                                // Clear selection state when navigating to new directory
+                                                self.clear_selection_state(&context);
                                                 update.insert(Update::LAYOUT);
                                             }
                                         }

@@ -1,6 +1,5 @@
 use nptk::prelude::*;
 use nptk::core::signal::eval::EvalSignal;
-use crate::app::AppState;
 use crate::navigation::NavigationState;
 use crate::window::FileOperationRequest;
 use std::path::PathBuf;
@@ -58,7 +57,7 @@ impl ToolbarWrapper {
         
         let back_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-left", 24, None)),
-            Box::new(Text::new("←".to_string()))
+            Box::new(Text::new("Back".to_string()))
         ])
             .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
                 if let Ok(mut nav) = nav_clone1.lock() {
@@ -73,7 +72,7 @@ impl ToolbarWrapper {
 
         let forward_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-right", 24, None)),
-            Box::new(Text::new("→".to_string()))
+            Box::new(Text::new("Forward".to_string()))
         ])
             .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
                 if let Ok(mut nav) = nav_clone2.lock() {
@@ -88,7 +87,7 @@ impl ToolbarWrapper {
 
         let up_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-up", 24, None)),
-            Box::new(Text::new("↑".to_string()))
+            Box::new(Text::new("Up".to_string()))
         ])
             .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
                 if let Ok(mut nav) = nav_clone3.lock() {
@@ -357,17 +356,4 @@ impl nptk::core::widget::WidgetLayoutExt for ToolbarWrapper {
     fn set_layout_style(&mut self, layout_style: impl Into<nptk::core::signal::MaybeSignal<nptk::core::layout::LayoutStyle>>) {
         self.inner.set_layout_style(layout_style)
     }
-}
-
-// Legacy function - kept for compatibility but not used
-pub fn build_toolbar(_context: &AppContext, _state: &AppState) -> impl Widget {
-    Toolbar::new()
-        .with_child(ToolbarButton::new(Text::new("←".to_string())))
-        .with_child(ToolbarButton::new(Text::new("→".to_string())))
-        .with_child(ToolbarButton::new(Text::new("↑".to_string())))
-        .with_separator()
-        .with_child(ToolbarButton::new(Text::new("Home".to_string())))
-        .with_separator()
-        .with_child(ToolbarButton::new(Text::new("New Folder".to_string())))
-        .with_child(ToolbarButton::new(Text::new("Delete".to_string())))
 }
