@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use nptk::prelude::*;
 use nptk::widgets::sidebar::{Sidebar, SidebarSection, SidebarItem};
 use nptk::services::{
-    get_home_file, get_user_special_file, UserDirectory,
+    get_user_special_dir_path, UserDirectory,
     get_home_icon_name, get_directory_icon_name,
 };
 use nptk::services::bookmarks::BookmarksService;
@@ -262,45 +262,44 @@ impl FilemanSidebar {
     fn build_places_section(config: &FilemanSidebarConfig) -> Option<SidebarSection> {
         let mut items = Vec::new();
 
-        // Home directory
-        let home_path = get_home_file()
+        // Home directory - use env var directly to avoid requiring npio backend
+        let home_path = std::env::var("HOME")
             .ok()
-            .and_then(|f| {
-                let uri = f.uri();
-                uri_to_path(&uri)
-            })
-            .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
+            .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/"));
 
+        let home_icon = get_home_icon_name(config.use_symbolic_icons);
+        log::debug!("Home icon name: '{}'", home_icon);
         items.push(
             SidebarItem::new("home", "Home")
-                .with_icon(get_home_icon_name(config.use_symbolic_icons))
+                .with_icon(home_icon)
                 .with_uri(format!("file://{}", home_path.display())),
         );
 
         // User directories - load synchronously using tokio runtime handle
         // This works because we're in a tokio runtime context from #[tokio::main].
         // We use block_in_place + block_on to safely convert async call to sync during widget construction.
+        // Use get_user_special_dir_path instead of get_user_special_file to avoid requiring npio backend
         for dir_type in &config.user_directories {
             // Use block_in_place to move to a blocking thread, then block_on the async call
             // This prevents blocking the async runtime if we're already on an async thread
-            let file_result = tokio::task::block_in_place(|| {
+            let path_result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::try_current()
                     .map(|handle| {
                         handle.block_on(async {
-                            get_user_special_file(*dir_type).await
+                            get_user_special_dir_path(*dir_type).await
                         })
                     })
                     .unwrap_or_else(|_| {
                         // If no runtime available (shouldn't happen in normal execution),
-                        // return error so we skip this directory
+                        // return None so we skip this directory
                         log::warn!("No tokio runtime available for loading user directory {:?}", dir_type);
-                        Ok(None)
+                        None
                     })
             });
             
-            if let Ok(Some(file)) = file_result {
-                let uri = file.uri();
+            if let Some(path) = path_result {
+                let uri = format!("file://{}", path.display());
                 let label = match dir_type {
                     UserDirectory::Desktop => "Desktop",
                     UserDirectory::Documents => "Documents",
@@ -312,12 +311,15 @@ impl FilemanSidebar {
                     UserDirectory::Templates => "Templates",
                 };
                 let icon = get_directory_icon_name(*dir_type, config.use_symbolic_icons);
+                log::debug!("Adding sidebar item: {} with icon '{}' and path {:?}", label, icon, path);
 
                 items.push(
                     SidebarItem::new(format!("{:?}", dir_type).to_lowercase(), label)
                         .with_icon(icon)
                         .with_uri(uri),
                 );
+            } else {
+                log::warn!("User directory {:?} not found or could not be loaded", dir_type);
             }
         }
 
