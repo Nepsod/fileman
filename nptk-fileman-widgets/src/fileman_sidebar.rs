@@ -3,6 +3,7 @@
 //! A reusable sidebar widget for file managers and file choosers.
 //! Provides Places (user directories), Bookmarks, Devices, and custom sections.
 
+use async_trait::async_trait;
 use nptk::prelude::*;
 use nptk::widgets::sidebar::{Sidebar, SidebarSection, SidebarItem};
 use nptk::services::{
@@ -353,6 +354,7 @@ impl Default for FilemanSidebar {
     }
 }
 
+#[async_trait(?Send)]
 impl Widget for FilemanSidebar {
     fn widget_id(&self) -> WidgetId {
         WidgetId::new("nptk-fileman-widgets", "FilemanSidebar")
@@ -365,7 +367,7 @@ impl Widget for FilemanSidebar {
         }
     }
 
-    fn update(
+    async fn update(
         &mut self,
         layout: &LayoutNode,
         context: AppContext,
@@ -376,7 +378,7 @@ impl Widget for FilemanSidebar {
         // For now, just delegate to inner sidebar
         
         if !layout.children.is_empty() {
-            self.inner.update(&layout.children[0], context, info)
+            self.inner.update(&layout.children[0], context, info).await
         } else {
             Update::empty()
         }

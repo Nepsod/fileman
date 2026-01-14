@@ -24,3 +24,4 @@ nalgebra = { version = "0.34", default-features = false, features = ["std"] }
 tokio = { version = "1.48", features = ["parking_lot", "sync", "fs", "rt", "rt-multi-thread"] }
 log = "0.4.29"
 smol = "2.0"
+async-trait = "0.1"

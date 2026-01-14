@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use super::FileListContent;
 use nptk::prelude::LengthPercentage;
 use nptk::widgets::file_icon::renderer::{render_image_icon, render_svg_icon_with_arc_cache};
@@ -406,6 +407,7 @@ impl PropertiesContent {
     }
 }
 
+#[async_trait(?Send)]
 impl Widget for PropertiesContent {
     fn widget_id(&self) -> WidgetId {
         WidgetId::new("nptk-fileman-widgets", "FileListProperties")
@@ -421,7 +423,7 @@ impl Widget for PropertiesContent {
         }
     }
 
-    fn update(&mut self, _: &LayoutNode, _: AppContext, _: &mut AppInfo) -> Update {
+    async fn update(&mut self, _: &LayoutNode, _: AppContext, _: &mut AppInfo) -> Update {
         Update::empty()
     }
 

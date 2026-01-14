@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use nalgebra::Vector2;
 use nptk::core::app::context::AppContext;
 use nptk::core::app::info::AppInfo;
@@ -280,6 +281,7 @@ impl FileList {
     }
 }
 
+#[async_trait(?Send)]
 impl Widget for FileList {
     fn widget_id(&self) -> WidgetId {
         WidgetId::new("nptk-widgets", "FileList")
@@ -292,7 +294,7 @@ impl Widget for FileList {
         }
     }
 
-    fn update(&mut self, layout: &LayoutNode, context: AppContext, info: &mut AppInfo) -> Update {
+    async fn update(&mut self, layout: &LayoutNode, context: AppContext, info: &mut AppInfo) -> Update {
         // Hook signals on first update to make them reactive
         if !self.signals_hooked {
             context.hook_signal(&mut self.entries);
@@ -338,7 +340,7 @@ impl Widget for FileList {
         if !layout.children.is_empty() {
             update |= self
                 .scroll_container
-                .update(&layout.children[0], context.clone(), info);
+                .update(&layout.children[0], context.clone(), info).await;
         }
 
         update
@@ -916,6 +918,7 @@ impl FileListContent {
     }
 }
 
+#[async_trait(?Send)]
 impl Widget for FileListContent {
     fn widget_id(&self) -> WidgetId {
         WidgetId::new("nptk-widgets", "FileListContent")
@@ -950,7 +953,7 @@ impl Widget for FileListContent {
         }
     }
 
-    fn update(&mut self, layout: &LayoutNode, context: AppContext, info: &mut AppInfo) -> Update {
+    async fn update(&mut self, layout: &LayoutNode, context: AppContext, info: &mut AppInfo) -> Update {
         // Store update manager for async tasks to trigger redraws
         {
             let mut update_mgr = self.update_manager.lock().expect("Failed to lock update_manager");

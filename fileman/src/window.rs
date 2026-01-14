@@ -1,4 +1,5 @@
 use nptk::prelude::*;
+use async_trait::async_trait;
 use nptk::core::signal::eval::EvalSignal;
 use nptk::core::shortcut::{Shortcut, ShortcutRegistry};
 use nptk::core::window::KeyCode;
@@ -160,6 +161,7 @@ impl FileListWrapper {
     }
 }
 
+#[async_trait(?Send)]
 impl Widget for FileListWrapper {
     fn widget_id(&self) -> nptk::theme::id::WidgetId {
         self.file_list.widget_id()
@@ -169,7 +171,7 @@ impl Widget for FileListWrapper {
         self.file_list.layout_style()
     }
 
-    fn update(
+    async fn update(
         &mut self,
         layout: &nptk::core::layout::LayoutNode,
         context: nptk::core::app::context::AppContext,
@@ -203,7 +205,7 @@ impl Widget for FileListWrapper {
         }
 
         // Update the wrapped FileList to let it handle internal updates
-        let file_list_update = self.file_list.update(layout, context.clone(), info);
+        let file_list_update = self.file_list.update(layout, context.clone(), info).await;
         update |= file_list_update;
 
         // Path refresh/recovery logic: If current directory no longer exists, navigate to parent
@@ -560,6 +562,7 @@ impl LocationBarWrapper {
     }
 }
 
+#[async_trait(?Send)]
 impl Widget for LocationBarWrapper {
     fn widget_id(&self) -> nptk::theme::id::WidgetId {
         nptk::theme::id::WidgetId::new("fileman", "LocationBarWrapper")
@@ -569,7 +572,7 @@ impl Widget for LocationBarWrapper {
         self.inner.layout_style()
     }
 
-    fn update(
+    async fn update(
         &mut self,
         layout: &nptk::core::layout::LayoutNode,
         context: nptk::core::app::context::AppContext,
@@ -608,7 +611,7 @@ impl Widget for LocationBarWrapper {
 
         // Update inner Container (which updates both breadcrumbs and text_input)
         // Note: TextInput handles its own keyboard input internally via its signal binding
-        update |= self.inner.update(layout, context, info);
+        update |= self.inner.update(layout, context, info).await;
         
         update
     }
@@ -728,6 +731,7 @@ impl StatusBarWrapper {
     }
 }
 
+#[async_trait(?Send)]
 impl Widget for StatusBarWrapper {
     fn widget_id(&self) -> nptk::theme::id::WidgetId {
         nptk::theme::id::WidgetId::new("fileman", "StatusBarWrapper")
@@ -737,7 +741,7 @@ impl Widget for StatusBarWrapper {
         self.inner.layout_style()
     }
 
-    fn update(
+    async fn update(
         &mut self,
         layout: &nptk::core::layout::LayoutNode,
         context: nptk::core::app::context::AppContext,
@@ -791,7 +795,7 @@ impl Widget for StatusBarWrapper {
         }
 
         // Update inner container
-        update |= self.inner.update(layout, context, info);
+        update |= self.inner.update(layout, context, info).await;
         update
     }
 

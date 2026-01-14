@@ -13,4 +13,5 @@ nptk-fileman-widgets = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
 smol = { workspace = true }
+async-trait = { workspace = true }
 env_logger = "0.11"

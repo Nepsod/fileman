@@ -1,4 +1,5 @@
 use nptk::prelude::*;
+use async_trait::async_trait;
 use nptk::core::signal::eval::EvalSignal;
 use crate::navigation::NavigationState;
 use crate::window::FileOperationRequest;
@@ -219,6 +220,7 @@ impl ToolbarWrapper {
 
 }
 
+#[async_trait(?Send)]
 impl Widget for ToolbarWrapper {
     fn widget_id(&self) -> nptk::theme::id::WidgetId {
         nptk::theme::id::WidgetId::new("fileman", "ToolbarWrapper")
@@ -228,7 +230,7 @@ impl Widget for ToolbarWrapper {
         self.inner.layout_style()
     }
 
-    fn update(
+    async fn update(
         &mut self,
         layout: &nptk::core::layout::LayoutNode,
         context: nptk::core::app::context::AppContext,
@@ -336,7 +338,7 @@ impl Widget for ToolbarWrapper {
         self.has_selection.set(!selected_paths.is_empty());
 
         // Update inner toolbar
-        update |= self.inner.update(layout, context, info);
+        update |= self.inner.update(layout, context, info).await;
         update
     }
 
