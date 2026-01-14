@@ -662,23 +662,12 @@ impl StatusBarWrapper {
         selected_paths_signal: StateSignal<Vec<PathBuf>>,
         status_rx: mpsc::UnboundedReceiver<String>,
     ) -> Self {
-        let status_text = StateSignal::new("Ready".to_string());
+        let status_text = StateSignal::new("".to_string());
         
         let status_text_clone = status_text.clone();
         let container = Container::new(vec![
-            Box::new(Text::new(status_text_clone.maybe())),
-        ]).with_layout_style(LayoutStyle {
-            size: Vector2::new(Dimension::percent(1.0), Dimension::length(24.0)),
-            flex_direction: FlexDirection::Row,
-            align_items: Some(AlignItems::Center),
-            padding: nptk::core::layout::Rect {
-                left: LengthPercentage::length(8.0),
-                right: LengthPercentage::length(8.0),
-                top: LengthPercentage::length(4.0),
-                bottom: LengthPercentage::length(4.0),
-            },
-            ..Default::default()
-        });
+            Box::new(Text::new(status_text_clone.maybe()).with_font_size(16.0)),
+        ]);
 
         Self {
             inner: container,

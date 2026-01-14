@@ -58,7 +58,7 @@ impl ToolbarWrapper {
         
         let back_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-left", 24, None)),
-            Box::new(Text::new("Back".to_string()))
+            Box::new(Text::new("Back".to_string()).with_font_size(14.0))
         ])
             .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
                 if let Ok(mut nav) = nav_clone1.lock() {
@@ -73,7 +73,7 @@ impl ToolbarWrapper {
 
         let forward_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-right", 24, None)),
-            Box::new(Text::new("Forward".to_string()))
+            Box::new(Text::new("Forward".to_string()).with_font_size(14.0))
         ])
             .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
                 if let Ok(mut nav) = nav_clone2.lock() {
@@ -88,7 +88,7 @@ impl ToolbarWrapper {
 
         let up_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-up", 24, None)),
-            Box::new(Text::new("Up".to_string()))
+            Box::new(Text::new("Up".to_string()).with_font_size(14.0))
         ])
             .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
                 if let Ok(mut nav) = nav_clone3.lock() {
@@ -103,7 +103,7 @@ impl ToolbarWrapper {
 
         let home_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("folder-home", 24, None)),
-            Box::new(Text::new("Home".to_string()))
+            Box::new(Text::new("Home".to_string()).with_font_size(14.0))
         ])
             .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
                 if let Ok(mut nav) = nav_clone4.lock() {
@@ -122,7 +122,7 @@ impl ToolbarWrapper {
         let new_folder_requested = Arc::new(Mutex::new(false));
         let new_folder_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("folder-new", 24, None)),
-            Box::new(Text::new("New Folder".to_string()))
+            Box::new(Text::new("New Folder".to_string()).with_font_size(14.0))
         ])
             .with_on_pressed({
                 let new_folder_flag = new_folder_requested.clone();
@@ -139,7 +139,7 @@ impl ToolbarWrapper {
         let properties_requested = Arc::new(Mutex::new(false));
         let properties_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("document-properties", 24, None)),
-            Box::new(Text::new("Properties".to_string()))
+            Box::new(Text::new("Properties".to_string()).with_font_size(14.0))
         ])
             .with_on_pressed({
                 let properties_flag = properties_requested.clone();
@@ -158,7 +158,7 @@ impl ToolbarWrapper {
         let delete_requested_clone = delete_requested.clone();
         let delete_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("delete", 24, None)),
-            Box::new(Text::new("Delete".to_string()))
+            Box::new(Text::new("Delete".to_string()).with_font_size(14.0))
             ])
             .with_on_pressed({
                 let delete_flag = delete_requested_clone.clone();
