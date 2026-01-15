@@ -362,10 +362,11 @@ impl Widget for FilemanSidebar {
         WidgetId::new("nptk-fileman-widgets", "FilemanSidebar")
     }
 
-    fn layout_style(&self) -> StyleNode {
+    fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
         StyleNode {
             style: self.layout_style.get().clone(),
-            children: vec![self.inner.layout_style()],
+            children: vec![self.inner.layout_style(_context)],
+            measure_func: None,
         }
     }
 

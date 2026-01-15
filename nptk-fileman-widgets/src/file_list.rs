@@ -14,6 +14,7 @@ use nptk::core::vg::peniko::{Brush, Color, Fill};
 use nptk::core::vgi::Graphics;
 use nptk::core::widget::{BoxedWidget, Widget, WidgetLayoutExt};
 use nptk::core::window::{ElementState, MouseButton};
+use nptk::prelude::LayoutContext;
 use nptk::services::filesystem::entry::{FileEntry, FileType};
 use nptk::services::filesystem::model::{FileSystemEvent, FileSystemModel};
 use npio::service::icon::IconRegistry;
@@ -287,10 +288,11 @@ impl Widget for FileList {
         WidgetId::new("nptk-widgets", "FileList")
     }
 
-    fn layout_style(&self) -> StyleNode {
+    fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
         StyleNode {
             style: self.layout_style.get().clone(),
-            children: vec![self.scroll_container.layout_style()],
+            children: vec![self.scroll_container.layout_style(_context)],
+            measure_func: None,
         }
     }
 
@@ -924,7 +926,7 @@ impl Widget for FileListContent {
         WidgetId::new("nptk-widgets", "FileListContent")
     }
 
-    fn layout_style(&self) -> StyleNode {
+    fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
         let view_mode = *self.view_mode.get();
         let count = self.entries.get().len();
         let width = self.last_layout_width.max(1.0);
@@ -950,6 +952,7 @@ impl Widget for FileListContent {
                 ..Default::default()
             },
             children: vec![],
+            measure_func: None,
         }
     }
 

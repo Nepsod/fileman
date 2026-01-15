@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use super::FileListContent;
-use nptk::prelude::LengthPercentage;
+use nptk::prelude::{LayoutContext, LengthPercentage};
 use nptk::widgets::file_icon::renderer::{render_image_icon, render_svg_icon_with_arc_cache};
 use nptk::widgets::tabs_container::{TabItem, TabsContainer};
 use chrono::{DateTime, Local};
@@ -413,13 +413,14 @@ impl Widget for PropertiesContent {
         WidgetId::new("nptk-fileman-widgets", "FileListProperties")
     }
 
-    fn layout_style(&self) -> StyleNode {
+    fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
         StyleNode {
             style: LayoutStyle {
                 size: Vector2::new(Dimension::percent(1.0), Dimension::percent(1.0)),
                 ..Default::default()
             },
             children: vec![],
+            measure_func: None,
         }
     }
 
