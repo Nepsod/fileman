@@ -926,11 +926,14 @@ impl Widget for FileListContent {
         WidgetId::new("nptk-widgets", "FileListContent")
     }
 
-    fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
+    fn layout_style(&self, context: &LayoutContext) -> StyleNode {
         let view_mode = *self.view_mode.get();
-        let count = self.entries.get().len();
+        let entries = self.entries.get();
+        let count = entries.len();
         let width = self.last_layout_width.max(1.0);
 
+        // Calculate total height (needed for scrollbar calculation)
+        // This is always calculated for the full list to ensure correct scrollbar behavior
         let height = if view_mode == FileListViewMode::Icon {
             let icon_size = *self.icon_size.get();
             let (columns, _, cell_height) = self.calculate_icon_view_layout(width, icon_size);
@@ -945,6 +948,12 @@ impl Widget for FileListContent {
         } else {
             (count as f32 * self.item_height).max(100.0)
         };
+
+        // Note: FileListContent doesn't create child widgets currently - it renders manually.
+        // The viewport culling optimization happens at the collect_layout level in AppHandler,
+        // which will skip processing FileListContent if it's outside the viewport.
+        // If viewport info is available, we could potentially create StyleNode children for
+        // visible items only in the future, but that would require architectural changes.
 
         StyleNode {
             style: LayoutStyle {
