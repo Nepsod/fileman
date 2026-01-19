@@ -100,6 +100,7 @@ impl FilemanSidebar {
             bookmarks_service: None,
             layout_style: LayoutStyle {
                 size: Vector2::new(Dimension::length(200.0), Dimension::percent(1.0)),
+                flex_shrink: 0.0, // Prevent sidebar from shrinking below its width
                 ..Default::default()
             }
             .into(),
@@ -155,6 +156,7 @@ impl FilemanSidebar {
             s.config.width = width;
             s.layout_style = LayoutStyle {
                 size: Vector2::new(Dimension::length(width), Dimension::percent(1.0)),
+                flex_shrink: 0.0, // Prevent sidebar from shrinking below its width
                 ..Default::default()
             }
             .into();

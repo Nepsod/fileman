@@ -142,7 +142,7 @@ impl FileListWrapper {
                 ..Default::default()
             })),
         ]).with_layout_style(LayoutStyle {
-            size: Vector2::new(Dimension::length(400.0), Dimension::auto()),
+                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
             flex_direction: FlexDirection::Column,
             padding: Rect {
                 left: LengthPercentage::length(16.0),
@@ -534,7 +534,9 @@ impl LocationBarWrapper {
             .with_text_signal(text_input_value.clone())
             .with_placeholder("Path...".to_string())
             .with_layout_style(LayoutStyle {
-                size: Vector2::new(Dimension::length(300.0), Dimension::length(30.0)),
+                size: Vector2::new(Dimension::auto(), Dimension::length(30.0)),
+                flex_grow: 1.0, // Take remaining space in row
+                min_size: Vector2::new(Dimension::length(200.0), Dimension::auto()), // Minimum width
                 ..Default::default()
             });
         
@@ -544,7 +546,7 @@ impl LocationBarWrapper {
         ]).with_layout_style(LayoutStyle {
             size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
             flex_direction: FlexDirection::Row,
-            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(0.0)),
+            gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)), // Add gap between breadcrumbs and input
             align_items: Some(AlignItems::Center),
             ..Default::default()
         });
@@ -848,6 +850,14 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         status_tx.clone(),
         navigation_path_signal.clone(),
     );
+    
+    // Set file list to grow and fill remaining space
+    file_list_wrapper.set_layout_style(LayoutStyle {
+        size: Vector2::new(Dimension::auto(), Dimension::percent(1.0)),
+        flex_grow: 1.0, // Grow to fill remaining horizontal space
+        flex_shrink: 1.0, // Allow shrinking if needed
+        ..Default::default()
+    });
 
     // Clone selected paths signal from FileList for ToolbarWrapper and StatusBarWrapper
     let selected_paths_signal = file_list_wrapper.selected_paths_signal().clone();
@@ -894,6 +904,7 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         ]).with_layout_style(LayoutStyle {
             size: Vector2::new(Dimension::percent(1.0), Dimension::percent(1.0)),
             flex_direction: FlexDirection::Row,
+            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(0.0)),
             ..Default::default()
         })),
         // Statusbar

@@ -897,7 +897,7 @@ impl FileListContent {
                 ..Default::default()
             })),
         ]).with_layout_style(LayoutStyle {
-            size: Vector2::new(Dimension::length(400.0), Dimension::auto()),
+            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
             flex_direction: nptk::core::layout::FlexDirection::Column,
             padding: nptk::core::layout::Rect {
                 left: LengthPercentage::length(16.0),
