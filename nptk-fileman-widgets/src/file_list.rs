@@ -21,8 +21,8 @@ use npio::service::icon::IconRegistry;
 use npio::{ThumbnailService, ThumbnailEvent, ThumbnailImage, get_file_for_uri, register_backend};
 use npio::backend::local::LocalBackend;
 use nptk::services::thumbnail::npio_adapter::{uri_to_path, thumbnail_size_to_u32};
+use nptk::core::theme::{ColorRole, Palette};
 use nptk::theme::id::WidgetId;
-use nptk::theme::theme::Theme;
 use std::collections::HashSet;
 use tokio::{sync::broadcast, time::{Duration, Instant}};
 
@@ -351,7 +351,6 @@ impl Widget for FileList {
     fn render(
         &mut self,
         graphics: &mut dyn Graphics,
-        theme: &mut dyn Theme,
         layout: &LayoutNode,
         info: &mut AppInfo,
         context: AppContext,
@@ -359,7 +358,7 @@ impl Widget for FileList {
         // Render ScrollContainer
         if !layout.children.is_empty() {
             self.scroll_container
-                .render(graphics, theme, &layout.children[0], info, context);
+                .render(graphics, &layout.children[0], info, context);
         }
     }
 }
@@ -1704,11 +1703,12 @@ impl Widget for FileListContent {
     fn render(
         &mut self,
         graphics: &mut dyn Graphics,
-        theme: &mut dyn Theme,
         layout: &LayoutNode,
         info: &mut AppInfo,
-        _context: AppContext,
+        context: AppContext,
     ) {
+        let palette = context.palette();
+        
         // DEBUG: Log render calls to investigate frequency
         // use std::sync::atomic::{AtomicU64, Ordering};
         // static RENDER_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1720,11 +1720,11 @@ impl Widget for FileListContent {
         let view_mode = *self.view_mode.get();
 
         if view_mode == FileListViewMode::Icon {
-            self.render_icon_view(graphics, theme, layout, info);
+            self.render_icon_view(graphics, palette, layout, info);
         } else if view_mode == FileListViewMode::Compact {
-            self.render_compact_view(graphics, theme, layout, info);
+            self.render_compact_view(graphics, palette, layout, info);
         } else {
-            self.render_list_view(graphics, theme, layout, info);
+            self.render_list_view(graphics, palette, layout, info);
         }
 
         // Draw drag selection rectangle
@@ -1737,17 +1737,7 @@ impl Widget for FileListContent {
 
                 let rect = Rect::new(min_x, min_y, max_x, max_y);
 
-                let selection_color = theme
-                    .get_property(
-                        self.widget_id(),
-                        &nptk::theme::properties::ThemeProperty::ColorBackgroundSelected,
-                    )
-                    .or_else(|| {
-                        theme.get_default_property(
-                            &nptk::theme::properties::ThemeProperty::ColorBackgroundSelected,
-                        )
-                    })
-                    .unwrap_or_else(|| Color::from_rgb8(100, 150, 255));
+                let selection_color = palette.color(ColorRole::Selection);
 
                 // Draw selection fill
                 graphics.fill(

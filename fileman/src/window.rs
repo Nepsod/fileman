@@ -209,7 +209,7 @@ impl Widget for FileListWrapper {
         update |= file_list_update;
 
         // Path refresh/recovery logic: If current directory no longer exists, navigate to parent
-        // This handles the case where a directory is deleted externally (similar to SerenityOS)
+        // This handles the case where a directory is deleted externally
         let current_path = (*self.file_list_path_signal.get()).clone();
         if !current_path.exists() {
             // Navigate to parent directory, continuing up until we find a valid directory
@@ -404,12 +404,11 @@ impl Widget for FileListWrapper {
     fn render(
         &mut self,
         graphics: &mut dyn nptk::core::vgi::Graphics,
-        theme: &mut dyn nptk::theme::theme::Theme,
         layout: &nptk::core::layout::LayoutNode,
         info: &mut nptk::core::app::info::AppInfo,
         context: nptk::core::app::context::AppContext,
     ) {
-        self.file_list.render(graphics, theme, layout, info, context)
+        self.file_list.render(graphics, layout, info, context)
     }
 }
 
@@ -621,12 +620,11 @@ impl Widget for LocationBarWrapper {
     fn render(
         &mut self,
         graphics: &mut dyn nptk::core::vgi::Graphics,
-        theme: &mut dyn nptk::theme::theme::Theme,
         layout: &nptk::core::layout::LayoutNode,
         info: &mut nptk::core::app::info::AppInfo,
         context: nptk::core::app::context::AppContext,
     ) {
-        self.inner.render(graphics, theme, layout, info, context)
+        self.inner.render(graphics, layout, info, context)
     }
 }
 
@@ -793,12 +791,11 @@ impl Widget for StatusBarWrapper {
     fn render(
         &mut self,
         graphics: &mut dyn nptk::core::vgi::Graphics,
-        theme: &mut dyn nptk::theme::theme::Theme,
         layout: &nptk::core::layout::LayoutNode,
         info: &mut nptk::core::app::info::AppInfo,
         context: nptk::core::app::context::AppContext,
     ) {
-        self.inner.render(graphics, theme, layout, info, context)
+        self.inner.render(graphics, layout, info, context)
     }
 }
 

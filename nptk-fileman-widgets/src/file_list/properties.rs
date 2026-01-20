@@ -21,8 +21,8 @@ use npio::service::filesystem::mime_detector::MimeDetector;
 use npio::service::icon::IconRegistry;
 use nptk::services::thumbnail::npio_adapter::{file_entry_to_uri, u32_to_thumbnail_size};
 use npio::{ThumbnailService, get_file_for_uri};
+use nptk::core::theme::{ColorRole, Palette};
 use nptk::theme::id::WidgetId;
-use nptk::theme::theme::Theme;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -431,12 +431,12 @@ impl Widget for PropertiesContent {
     fn render(
         &mut self,
         graphics: &mut dyn Graphics,
-        theme: &mut dyn Theme,
         layout: &LayoutNode,
         info: &mut AppInfo,
-        _: AppContext,
+        context: AppContext,
     ) {
-        let bg = theme.window_background();
+        let palette = context.palette();
+        let bg = palette.color(ColorRole::Window);
         let rect = Rect::new(
             layout.layout.location.x as f64,
             layout.layout.location.y as f64,
@@ -451,44 +451,8 @@ impl Widget for PropertiesContent {
             &rect.to_path(4.0),
         );
 
-        let widget_id = self.widget_id();
-        let text_color = theme
-            .get_property(
-                widget_id.clone(),
-                &nptk::theme::properties::ThemeProperty::ColorText,
-            )
-            .or_else(|| {
-                let text_widget_id = nptk::theme::id::WidgetId::new("nptk-widgets", "Text");
-                theme.get_property(
-                    text_widget_id,
-                    &nptk::theme::properties::ThemeProperty::ColorText,
-                )
-            })
-            .or_else(|| {
-                let text_widget_id = nptk::theme::id::WidgetId::new("nptk-widgets", "Text");
-                theme.get_property(
-                    text_widget_id,
-                    &nptk::theme::properties::ThemeProperty::Color,
-                )
-            })
-            .unwrap_or_else(|| Color::BLACK);
-
-        let label_color = theme
-            .get_property(
-                widget_id.clone(),
-                &nptk::theme::properties::ThemeProperty::ColorTextDisabled,
-            )
-            .or_else(|| {
-                let text_widget_id = nptk::theme::id::WidgetId::new("nptk-widgets", "Text");
-                theme.get_property(
-                    text_widget_id,
-                    &nptk::theme::properties::ThemeProperty::ColorTextDisabled,
-                )
-            })
-            .or_else(|| {
-                theme.get_default_property(&nptk::theme::properties::ThemeProperty::ColorDisabled)
-            })
-            .unwrap_or_else(|| Color::from_rgb8(140, 140, 140));
+        let text_color = palette.color(ColorRole::BaseText);
+        let label_color = palette.color(ColorRole::DisabledTextFront);
 
         let padding = 12.0;
         let icon_size = 48.0;

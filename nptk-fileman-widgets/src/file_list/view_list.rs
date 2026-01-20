@@ -8,7 +8,7 @@ use nptk::core::vg::peniko::{Brush, Color, Fill};
 use nptk::core::vgi::Graphics;
 use nptk::core::widget::Widget;
 use nptk::services::thumbnail::npio_adapter::{file_entry_to_uri, u32_to_thumbnail_size};
-use nptk::theme::theme::Theme;
+use nptk::core::theme::{ColorRole, Palette};
 use npio::get_file_for_uri;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -17,7 +17,7 @@ impl FileListContent {
     pub(super) fn render_list_view(
         &mut self,
         graphics: &mut dyn Graphics,
-        theme: &mut dyn Theme,
+        palette: &Palette,
         layout: &LayoutNode,
         info: &mut AppInfo,
     ) {
@@ -34,15 +34,7 @@ impl FileListContent {
             (layout.layout.location.y + layout.layout.size.height) as f64,
         );
 
-        let bg_color = theme
-            .get_property(
-                self.widget_id(),
-                &nptk::theme::properties::ThemeProperty::ColorBackground,
-            )
-            .or_else(|| {
-                theme.get_default_property(&nptk::theme::properties::ThemeProperty::ColorBackground)
-            })
-            .unwrap_or_else(|| theme.window_background());
+        let bg_color = palette.color(ColorRole::Window);
 
         graphics.fill(
             Fill::NonZero,
@@ -89,17 +81,7 @@ impl FileListContent {
 
             // Draw hover background (if not selected)
             if is_hovered && !selected_set.contains(&entry.path) {
-                let hover_color = theme
-                    .get_property(
-                        self.widget_id(),
-                        &nptk::theme::properties::ThemeProperty::ColorMenuHovered,
-                    )
-                    .or_else(|| {
-                        theme.get_default_property(
-                            &nptk::theme::properties::ThemeProperty::ColorMenuHovered,
-                        )
-                    })
-                    .unwrap_or_else(|| Color::from_rgb8(240, 240, 240));
+                let hover_color = palette.color(ColorRole::HoverHighlight);
 
                 graphics.fill(
                     Fill::NonZero,
@@ -112,17 +94,7 @@ impl FileListContent {
 
             // Draw selection background
             if selected_set.contains(&entry.path) {
-                let color = theme
-                    .get_property(
-                        self.widget_id(),
-                        &nptk::theme::properties::ThemeProperty::ColorBackgroundSelected,
-                    )
-                    .or_else(|| {
-                        theme.get_default_property(
-                            &nptk::theme::properties::ThemeProperty::ColorBackgroundSelected,
-                        )
-                    })
-                    .unwrap_or_else(|| Color::from_rgb8(100, 150, 255));
+                let color = palette.color(ColorRole::Selection);
 
                 graphics.fill(
                     Fill::NonZero,
@@ -204,8 +176,7 @@ impl FileListContent {
                 if entry.path.exists() {
                     render_cached_icon(
                         graphics,
-                        theme,
-                        self.widget_id(),
+                        palette,
                         icon,
                         icon_rect,
                         &entry,
@@ -215,8 +186,7 @@ impl FileListContent {
                     // File was deleted, use fallback
                     render_fallback_icon(
                         graphics,
-                        theme,
-                        self.widget_id(),
+                        palette,
                         icon_rect,
                         &entry,
                     );
@@ -224,23 +194,14 @@ impl FileListContent {
             } else {
                 render_fallback_icon(
                     graphics,
-                    theme,
-                    self.widget_id(),
+                    palette,
                     icon_rect,
                     &entry,
                 );
             }
 
             // Draw text
-            let text_color = theme
-                .get_property(
-                    self.widget_id(),
-                    &nptk::theme::properties::ThemeProperty::ColorText,
-                )
-                .or_else(|| {
-                    theme.get_default_property(&nptk::theme::properties::ThemeProperty::ColorText)
-                })
-                .unwrap_or(Color::BLACK);
+            let text_color = palette.color(ColorRole::BaseText);
 
             let transform = Affine::translate((row_rect.x0 + 35.0, row_rect.y0 + 5.0));
 

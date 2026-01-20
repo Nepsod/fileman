@@ -14,7 +14,7 @@ use nptk::services::bookmarks::BookmarksService;
 use nptk::services::thumbnail::npio_adapter::uri_to_path;
 use nptk::core::app::info::AppInfo;
 use nptk::core::vgi::Graphics;
-use nptk::theme::theme::Theme;
+use nptk::core::theme::{ColorRole, Palette};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
@@ -392,13 +392,12 @@ impl Widget for FilemanSidebar {
     fn render(
         &mut self,
         graphics: &mut dyn Graphics,
-        theme: &mut dyn Theme,
         layout: &LayoutNode,
         info: &mut AppInfo,
         context: AppContext,
     ) {
         if !layout.children.is_empty() {
-            self.inner.render(graphics, theme, &layout.children[0], info, context);
+            self.inner.render(graphics, &layout.children[0], info, context);
         }
     }
 }

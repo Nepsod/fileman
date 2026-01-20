@@ -10,7 +10,7 @@ use nptk::core::vgi::Graphics;
 use nptk::core::widget::Widget;
 use nptk::services::filesystem::entry::FileEntry;
 use nptk::services::thumbnail::npio_adapter::{file_entry_to_uri, u32_to_thumbnail_size};
-use nptk::theme::theme::Theme;
+use nptk::core::theme::{ColorRole, Palette};
 use npio::get_file_for_uri;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -95,7 +95,7 @@ impl FileListContent {
     pub(super) fn render_compact_view(
         &mut self,
         graphics: &mut dyn Graphics,
-        theme: &mut dyn Theme,
+        palette: &Palette,
         layout: &LayoutNode,
         info: &mut AppInfo,
     ) {
@@ -174,22 +174,11 @@ impl FileListContent {
 
             // 1. Draw Label Background (Selection/Hover)
             if is_selected || is_hovered {
-                let color_prop = if is_selected {
-                    nptk::theme::properties::ThemeProperty::ColorBackgroundSelected
+                let color = if is_selected {
+                    palette.color(ColorRole::Selection)
                 } else {
-                    nptk::theme::properties::ThemeProperty::ColorMenuHovered
+                    palette.color(ColorRole::HoverHighlight)
                 };
-
-                let color = theme
-                    .get_property(self.widget_id(), &color_prop)
-                    .or_else(|| theme.get_default_property(&color_prop))
-                    .unwrap_or_else(|| {
-                        if is_selected {
-                            Color::from_rgb8(100, 150, 255)
-                        } else {
-                            Color::from_rgb8(240, 240, 240)
-                        }
-                    });
 
                 let alpha = if is_selected { 0.7 } else { 0.5 };
 
@@ -299,8 +288,7 @@ impl FileListContent {
             if let Some(icon) = cached_icon {
                 render_cached_icon(
                     graphics,
-                    theme,
-                    self.widget_id(),
+                    palette,
                     icon,
                     icon_rect,
                     &entry,
@@ -309,8 +297,7 @@ impl FileListContent {
             } else {
                 render_fallback_icon(
                     graphics,
-                    theme,
-                    self.widget_id(),
+                    palette,
                     icon_rect,
                     &entry,
                 );
@@ -318,22 +305,11 @@ impl FileListContent {
 
             // 3. Draw Icon Overlay (Selection/Hover)
             if is_selected || is_hovered {
-                let color_prop = if is_selected {
-                    nptk::theme::properties::ThemeProperty::ColorBackgroundSelected
+                let color = if is_selected {
+                    palette.color(ColorRole::Selection)
                 } else {
-                    nptk::theme::properties::ThemeProperty::ColorMenuHovered
+                    palette.color(ColorRole::HoverHighlight)
                 };
-
-                let color = theme
-                    .get_property(self.widget_id(), &color_prop)
-                    .or_else(|| theme.get_default_property(&color_prop))
-                    .unwrap_or_else(|| {
-                        if is_selected {
-                            Color::from_rgb8(100, 150, 255)
-                        } else {
-                            Color::from_rgb8(240, 240, 240)
-                        }
-                    });
 
                 let alpha = if is_selected { 0.5 } else { 0.3 };
 
@@ -350,15 +326,7 @@ impl FileListContent {
             }
 
             // 4. Draw Label Text
-            let text_color = theme
-                .get_property(
-                    self.widget_id(),
-                    &nptk::theme::properties::ThemeProperty::ColorText,
-                )
-                .or_else(|| {
-                    theme.get_default_property(&nptk::theme::properties::ThemeProperty::ColorText)
-                })
-                .unwrap_or(Color::BLACK);
+            let text_color = palette.color(ColorRole::BaseText);
 
             // Use label_rect to position text (reverse padding)
             let text_x = label_rect.x0 + 4.0; // label_padding_x

@@ -345,12 +345,11 @@ impl Widget for ToolbarWrapper {
     fn render(
         &mut self,
         graphics: &mut dyn nptk::core::vgi::Graphics,
-        theme: &mut dyn nptk::theme::theme::Theme,
         layout: &nptk::core::layout::LayoutNode,
         info: &mut nptk::core::app::info::AppInfo,
         context: nptk::core::app::context::AppContext,
     ) {
-        self.inner.render(graphics, theme, layout, info, context)
+        self.inner.render(graphics, layout, info, context)
     }
 }
 

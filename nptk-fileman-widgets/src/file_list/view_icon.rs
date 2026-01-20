@@ -10,7 +10,7 @@ use nptk::core::vgi::Graphics;
 use nptk::core::widget::Widget;
 use nptk::services::filesystem::entry::FileEntry;
 use nptk::services::thumbnail::npio_adapter::{file_entry_to_uri, u32_to_thumbnail_size};
-use nptk::theme::theme::Theme;
+use nptk::core::theme::{ColorRole, Palette};
 use npio::get_file_for_uri;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -50,7 +50,7 @@ impl FileListContent {
     pub(super) fn render_icon_view(
         &mut self,
         graphics: &mut dyn Graphics,
-        theme: &mut dyn Theme,
+        palette: &Palette,
         layout: &LayoutNode,
         info: &mut AppInfo,
     ) {
@@ -67,15 +67,7 @@ impl FileListContent {
             (layout.layout.location.y + layout.layout.size.height) as f64,
         );
 
-        let bg_color = theme
-            .get_property(
-                self.widget_id(),
-                &nptk::theme::properties::ThemeProperty::ColorBackground,
-            )
-            .or_else(|| {
-                theme.get_default_property(&nptk::theme::properties::ThemeProperty::ColorBackground)
-            })
-            .unwrap_or_else(|| theme.window_background());
+        let bg_color = palette.color(ColorRole::Window);
 
         graphics.fill(
             Fill::NonZero,
@@ -126,7 +118,7 @@ impl FileListContent {
             let entry = &visible_entries[entry_idx];
             self.render_icon_item(
                 graphics,
-                theme,
+                palette,
                 layout,
                 info,
                 *i,
@@ -145,7 +137,7 @@ impl FileListContent {
             let entry = &visible_entries[entry_idx];
             self.render_icon_item(
                 graphics,
-                theme,
+                palette,
                 layout,
                 info,
                 *i,
@@ -161,7 +153,7 @@ impl FileListContent {
     pub(super) fn render_icon_item(
         &mut self,
         graphics: &mut dyn Graphics,
-        theme: &mut dyn Theme,
+        palette: &Palette,
         layout: &LayoutNode,
         info: &mut AppInfo,
         i: usize,
@@ -215,17 +207,7 @@ impl FileListContent {
         };
 
         if is_hovered && !is_selected {
-            let hover_color = theme
-                .get_property(
-                    self.widget_id(),
-                    &nptk::theme::properties::ThemeProperty::ColorMenuHovered,
-                )
-                .or_else(|| {
-                    theme.get_default_property(
-                        &nptk::theme::properties::ThemeProperty::ColorMenuHovered,
-                    )
-                })
-                .unwrap_or_else(|| Color::from_rgb8(240, 240, 240));
+            let hover_color = palette.color(ColorRole::HoverHighlight);
 
             // Draw label hover rectangle
             let label_hover_rect = RoundedRect::new(
@@ -246,17 +228,7 @@ impl FileListContent {
         }
 
         if is_selected {
-            let color = theme
-                .get_property(
-                    self.widget_id(),
-                    &nptk::theme::properties::ThemeProperty::ColorBackgroundSelected,
-                )
-                .or_else(|| {
-                    theme.get_default_property(
-                        &nptk::theme::properties::ThemeProperty::ColorBackgroundSelected,
-                    )
-                })
-                .unwrap_or_else(|| Color::from_rgb8(100, 150, 255));
+            let color = palette.color(ColorRole::Selection);
 
             // Draw label selection rectangle
             let label_selection_rect = RoundedRect::new(
@@ -368,8 +340,7 @@ impl FileListContent {
         if let Some(icon) = cached_icon {
             render_cached_icon(
                 graphics,
-                theme,
-                self.widget_id(),
+                palette,
                 icon,
                 icon_rect,
                 &entry,
@@ -378,8 +349,7 @@ impl FileListContent {
         } else {
             render_fallback_icon(
                 graphics,
-                theme,
-                self.widget_id(),
+                palette,
                 icon_rect,
                 &entry,
             );
@@ -387,17 +357,7 @@ impl FileListContent {
 
         // 3. Draw Icon Overlays (Hover/Selection) - on top of icon (tint)
         if is_hovered && !is_selected {
-            let hover_color = theme
-                .get_property(
-                    self.widget_id(),
-                    &nptk::theme::properties::ThemeProperty::ColorMenuHovered,
-                )
-                .or_else(|| {
-                    theme.get_default_property(
-                        &nptk::theme::properties::ThemeProperty::ColorMenuHovered,
-                    )
-                })
-                .unwrap_or_else(|| Color::from_rgb8(240, 240, 240));
+            let hover_color = palette.color(ColorRole::HoverHighlight);
 
             // Draw icon hover rectangle (overlay)
             let icon_hover_rect = RoundedRect::new(
@@ -418,17 +378,7 @@ impl FileListContent {
         }
 
         if is_selected {
-            let color = theme
-                .get_property(
-                    self.widget_id(),
-                    &nptk::theme::properties::ThemeProperty::ColorBackgroundSelected,
-                )
-                .or_else(|| {
-                    theme.get_default_property(
-                        &nptk::theme::properties::ThemeProperty::ColorBackgroundSelected,
-                    )
-                })
-                .unwrap_or_else(|| Color::from_rgb8(100, 150, 255));
+            let color = palette.color(ColorRole::Selection);
 
             // Draw icon selection rectangle (overlay)
             let icon_selection_rect = RoundedRect::new(
@@ -449,15 +399,7 @@ impl FileListContent {
         }
 
         // Draw filename in label rectangle
-        let text_color = theme
-            .get_property(
-                self.widget_id(),
-                &nptk::theme::properties::ThemeProperty::ColorText,
-            )
-            .or_else(|| {
-                theme.get_default_property(&nptk::theme::properties::ThemeProperty::ColorText)
-            })
-            .unwrap_or(Color::BLACK);
+        let text_color = palette.color(ColorRole::BaseText);
 
         // Text position: Start at the left edge of the max_text_width area.
         // We use max_text_width as the wrap width, and ask Parley to center align.
