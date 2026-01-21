@@ -22,7 +22,6 @@ use npio::service::icon::IconRegistry;
 use nptk::services::thumbnail::npio_adapter::{file_entry_to_uri, u32_to_thumbnail_size};
 use npio::{ThumbnailService, get_file_for_uri};
 use nptk::core::theme::{ColorRole, Palette};
-use nptk::theme::id::WidgetId;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -409,10 +408,6 @@ impl PropertiesContent {
 
 #[async_trait(?Send)]
 impl Widget for PropertiesContent {
-    fn widget_id(&self) -> WidgetId {
-        WidgetId::new("nptk-fileman-widgets", "FileListProperties")
-    }
-
     fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
         StyleNode {
             style: LayoutStyle {

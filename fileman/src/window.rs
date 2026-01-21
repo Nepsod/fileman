@@ -163,9 +163,6 @@ impl FileListWrapper {
 
 #[async_trait(?Send)]
 impl Widget for FileListWrapper {
-    fn widget_id(&self) -> nptk::theme::id::WidgetId {
-        self.file_list.widget_id()
-    }
 
     fn layout_style(&self, _context: &nptk::core::layout::LayoutContext) -> nptk::core::layout::StyleNode {
         self.file_list.layout_style(_context)
@@ -565,9 +562,6 @@ impl LocationBarWrapper {
 
 #[async_trait(?Send)]
 impl Widget for LocationBarWrapper {
-    fn widget_id(&self) -> nptk::theme::id::WidgetId {
-        nptk::theme::id::WidgetId::new("fileman", "LocationBarWrapper")
-    }
 
     fn layout_style(&self, _context: &nptk::core::layout::LayoutContext) -> nptk::core::layout::StyleNode {
         self.inner.layout_style(_context)
@@ -722,9 +716,6 @@ impl StatusBarWrapper {
 
 #[async_trait(?Send)]
 impl Widget for StatusBarWrapper {
-    fn widget_id(&self) -> nptk::theme::id::WidgetId {
-        nptk::theme::id::WidgetId::new("fileman", "StatusBarWrapper")
-    }
 
     fn layout_style(&self, _context: &nptk::core::layout::LayoutContext) -> nptk::core::layout::StyleNode {
         self.inner.layout_style(_context)

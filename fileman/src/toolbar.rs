@@ -222,9 +222,6 @@ impl ToolbarWrapper {
 
 #[async_trait(?Send)]
 impl Widget for ToolbarWrapper {
-    fn widget_id(&self) -> nptk::theme::id::WidgetId {
-        nptk::theme::id::WidgetId::new("fileman", "ToolbarWrapper")
-    }
 
     fn layout_style(&self, _context: &nptk::core::layout::LayoutContext) -> nptk::core::layout::StyleNode {
         self.inner.layout_style(_context)

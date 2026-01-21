@@ -22,7 +22,6 @@ use npio::{ThumbnailService, ThumbnailEvent, ThumbnailImage, get_file_for_uri, r
 use npio::backend::local::LocalBackend;
 use nptk::services::thumbnail::npio_adapter::{uri_to_path, thumbnail_size_to_u32};
 use nptk::core::theme::{ColorRole, Palette};
-use nptk::theme::id::WidgetId;
 use std::collections::HashSet;
 use tokio::{sync::broadcast, time::{Duration, Instant}};
 
@@ -284,10 +283,6 @@ impl FileList {
 
 #[async_trait(?Send)]
 impl Widget for FileList {
-    fn widget_id(&self) -> WidgetId {
-        WidgetId::new("nptk-widgets", "FileList")
-    }
-
     fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
         StyleNode {
             style: self.layout_style.get().clone(),
@@ -921,10 +916,6 @@ impl FileListContent {
 
 #[async_trait(?Send)]
 impl Widget for FileListContent {
-    fn widget_id(&self) -> WidgetId {
-        WidgetId::new("nptk-widgets", "FileListContent")
-    }
-
     fn layout_style(&self, context: &LayoutContext) -> StyleNode {
         let view_mode = *self.view_mode.get();
         let entries = self.entries.get();
@@ -1045,7 +1036,6 @@ impl Widget for FileListContent {
                     if let Some(cursor) = info.cursor_pos {
                         context.request_tooltip_show(
                             tooltip_text,
-                            self.widget_id(),
                             (cursor.x, cursor.y),
                         );
                     }

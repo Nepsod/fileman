@@ -360,10 +360,6 @@ impl Default for FilemanSidebar {
 
 #[async_trait(?Send)]
 impl Widget for FilemanSidebar {
-    fn widget_id(&self) -> WidgetId {
-        WidgetId::new("nptk-fileman-widgets", "FilemanSidebar")
-    }
-
     fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
         StyleNode {
             style: self.layout_style.get().clone(),
