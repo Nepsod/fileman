@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use nptk::core::signal::eval::EvalSignal;
 use crate::navigation::NavigationState;
 use crate::window::FileOperationRequest;
+use nptk_fileman_widgets::file_list::FileListViewMode;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -38,6 +39,7 @@ pub struct ToolbarWrapper {
     new_folder_requested: Arc<Mutex<bool>>,
     properties_requested: Arc<Mutex<bool>>,
     delete_requested: Arc<Mutex<bool>>,
+    view_mode_signal: nptk::core::signal::state::StateSignal<FileListViewMode>,
 }
 
 impl ToolbarWrapper {
@@ -46,6 +48,7 @@ impl ToolbarWrapper {
         operation_tx: mpsc::UnboundedSender<FileOperationRequest>,
         navigation_path_signal: nptk::core::signal::state::StateSignal<PathBuf>,
         selected_paths_signal: nptk::core::signal::state::StateSignal<Vec<PathBuf>>,
+        view_mode_signal: nptk::core::signal::state::StateSignal<FileListViewMode>,
     ) -> (Self, mpsc::UnboundedSender<NavigationAction>) {
         let (nav_tx, nav_rx) = mpsc::unbounded_channel();
         
@@ -172,6 +175,24 @@ impl ToolbarWrapper {
             .with_tooltip("Delete")
             .with_status_tip("Delete the selected items");
 
+        let view_mode_signal_clone = view_mode_signal.clone();
+        let view_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("view-list-details", 24, None)), // Fallback icon name, hopefully exists or falls back text
+            Box::new(Text::new("View".to_string()).with_font_size(14.0))
+        ])
+         .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                let current = *view_mode_signal_clone.get();
+                let next = match current {
+                    FileListViewMode::List => FileListViewMode::Icon,
+                    FileListViewMode::Icon => FileListViewMode::Table, // New Table mode
+                    FileListViewMode::Table | FileListViewMode::Compact => FileListViewMode::List,
+                };
+                view_mode_signal_clone.set(next);
+                Update::DRAW
+            }))))
+            .with_tooltip("Change View")
+            .with_status_tip("Switch between List, Icon, and Details views");
+
         let toolbar = Toolbar::new()
             .with_child(back_btn)
             .with_child(forward_btn)
@@ -182,7 +203,9 @@ impl ToolbarWrapper {
             .with_child(new_folder_btn)
             .with_child(delete_btn)
             .with_separator()
-            .with_child(properties_btn);
+            .with_child(properties_btn)
+            .with_separator()
+            .with_child(view_btn);
 
         let wrapper = Self {
             inner: toolbar,
@@ -199,6 +222,7 @@ impl ToolbarWrapper {
             new_folder_requested,
             properties_requested,
             delete_requested,
+            view_mode_signal,
         };
 
         (wrapper, nav_tx)
@@ -242,6 +266,7 @@ impl Widget for ToolbarWrapper {
             context.hook_signal(&mut self.has_selection);
             context.hook_signal(&mut self.navigation_path_signal);
             context.hook_signal(&mut self.selected_paths_signal);
+            context.hook_signal(&mut self.view_mode_signal);
             self.signals_hooked = true;
         }
 

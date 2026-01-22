@@ -12,3 +12,5 @@ pub mod fileman_sidebar;
 
 // Re-export for convenience
 pub use fileman_sidebar::FilemanSidebar;
+pub mod location_bar;
+pub mod status_bar;

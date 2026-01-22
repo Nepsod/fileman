@@ -78,6 +78,11 @@ impl FileListWrapper {
     pub fn selected_paths_signal(&self) -> &StateSignal<Vec<PathBuf>> {
         self.file_list.selected_paths_signal()
     }
+    
+    /// Get the view mode signal
+    pub fn view_mode_signal(&self) -> &StateSignal<nptk_fileman_widgets::file_list::FileListViewMode> {
+        self.file_list.view_mode_signal()
+    }
 
     /// Show properties popup for the given paths
     pub fn show_properties_for_paths(&mut self, paths: &[PathBuf], context: nptk::core::app::context::AppContext) {
@@ -444,189 +449,7 @@ fn path_to_breadcrumb_items(path: &PathBuf) -> Vec<BreadcrumbItem> {
     items
 }
 
-/// Wrapper widget for location bar (breadcrumbs and text input) with bidirectional sync
-struct LocationBarWrapper {
-    inner: Container,
-    navigation: Arc<Mutex<crate::navigation::NavigationState>>,
-    navigation_tx: mpsc::UnboundedSender<crate::toolbar::NavigationAction>,
-    navigation_path_signal: StateSignal<PathBuf>,
-    breadcrumb_items_signal: StateSignal<Vec<BreadcrumbItem>>,
-    text_input_value: StateSignal<String>,
-    last_synced_nav_path: PathBuf, // Track last synced navigation path to only update text input when nav path changes
-    signals_hooked: bool,
-}
-
-impl LocationBarWrapper {
-    fn new(
-        navigation: Arc<Mutex<crate::navigation::NavigationState>>,
-        navigation_tx: mpsc::UnboundedSender<crate::toolbar::NavigationAction>,
-        navigation_path_signal: StateSignal<PathBuf>,
-    ) -> Self {
-        let initial_path = (*navigation_path_signal.get()).clone();
-        let initial_items = path_to_breadcrumb_items(&initial_path);
-        let breadcrumb_items_signal = StateSignal::new(initial_items.clone());
-        let initial_text = initial_path.to_string_lossy().to_string();
-        let text_input_value = StateSignal::new(initial_text.clone());
-        
-        let nav_tx_clone1 = navigation_tx.clone();
-        let nav_tx_clone2 = navigation_tx.clone();
-        
-        let breadcrumbs = Breadcrumbs::new()
-            .with_items_signal(breadcrumb_items_signal.clone())
-            .with_on_click(move |item: &BreadcrumbItem| {
-                // Navigate to the clicked breadcrumb path
-                if let Some(id) = &item.id {
-                    let path = PathBuf::from(id);
-                    if path.exists() {
-                        let _ = nav_tx_clone1.send(crate::toolbar::NavigationAction::NavigateTo(path));
-                        return Update::LAYOUT | Update::DRAW;
-                    }
-                }
-                Update::empty()
-            })
-            .with_neighbors_provider(move |item: &BreadcrumbItem| {
-                // Show sibling directories when clicking separator
-                if let Some(id) = &item.id {
-                    let parent_path = PathBuf::from(id);
-                    if let Ok(entries) = std::fs::read_dir(&parent_path) {
-                        let mut neighbors = Vec::new();
-                        for entry in entries.flatten() {
-                            if let Ok(metadata) = entry.metadata() {
-                                if metadata.is_dir() {
-                                    let entry_path = entry.path();
-                                    let label = entry_path.file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("")
-                                        .to_string();
-                                    let path_str = entry_path.to_string_lossy().to_string();
-                                    neighbors.push(BreadcrumbItem::new(label).with_id(path_str));
-                                }
-                            }
-                        }
-                        if !neighbors.is_empty() {
-                            return Some(neighbors);
-                        }
-                    }
-                }
-                None
-            })
-            .with_on_neighbor_select(move |_original_item: &BreadcrumbItem, selected_neighbor: &BreadcrumbItem| {
-                // Navigate to selected neighbor directory
-                if let Some(id) = &selected_neighbor.id {
-                    let path = PathBuf::from(id);
-                    if path.exists() {
-                        let _ = nav_tx_clone2.send(crate::toolbar::NavigationAction::NavigateTo(path));
-                        return Update::LAYOUT | Update::DRAW;
-                    }
-                }
-                Update::empty()
-            })
-            .with_layout_style(LayoutStyle {
-                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
-                ..Default::default()
-            });
-        
-        let text_input = TextInput::new()
-            .with_text_signal(text_input_value.clone())
-            .with_placeholder("Path...".to_string())
-            .with_layout_style(LayoutStyle {
-                size: Vector2::new(Dimension::auto(), Dimension::length(30.0)),
-                flex_grow: 1.0, // Take remaining space in row
-                min_size: Vector2::new(Dimension::length(200.0), Dimension::auto()), // Minimum width
-                ..Default::default()
-            });
-        
-        let container = Container::new(vec![
-            Box::new(breadcrumbs),
-            Box::new(text_input),
-        ]).with_layout_style(LayoutStyle {
-            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
-            flex_direction: FlexDirection::Row,
-            gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)), // Add gap between breadcrumbs and input
-            align_items: Some(AlignItems::Center),
-            ..Default::default()
-        });
-        
-        Self {
-            inner: container,
-            navigation,
-            navigation_tx,
-            navigation_path_signal,
-            breadcrumb_items_signal,
-            text_input_value,
-            last_synced_nav_path: initial_path,
-            signals_hooked: false,
-        }
-    }
-}
-
-#[async_trait(?Send)]
-impl Widget for LocationBarWrapper {
-
-    fn layout_style(&self, _context: &nptk::core::layout::LayoutContext) -> nptk::core::layout::StyleNode {
-        self.inner.layout_style(_context)
-    }
-
-    async fn update(
-        &mut self,
-        layout: &nptk::core::layout::LayoutNode,
-        context: nptk::core::app::context::AppContext,
-        info: &mut nptk::core::app::info::AppInfo,
-    ) -> nptk::core::app::update::Update {
-        let mut update = Update::empty();
-
-        // Hook signals on first update
-        if !self.signals_hooked {
-            context.hook_signal(&mut self.navigation_path_signal);
-            context.hook_signal(&mut self.breadcrumb_items_signal);
-            context.hook_signal(&mut self.text_input_value);
-            self.signals_hooked = true;
-        }
-
-        // Reactively update breadcrumb items when navigation path changes
-        let nav_path = (*self.navigation_path_signal.get()).clone();
-        let current_items = (*self.breadcrumb_items_signal.get()).clone();
-        let new_items = path_to_breadcrumb_items(&nav_path);
-        
-        // Only update if items changed (compare by path IDs to avoid unnecessary updates)
-        if current_items.len() != new_items.len() 
-            || current_items.iter().zip(new_items.iter()).any(|(a, b)| a.id != b.id) {
-            self.breadcrumb_items_signal.set(new_items);
-            update |= Update::LAYOUT | Update::DRAW;
-        }
-
-        // Sync text input value from navigation path signal (only when navigation path changes)
-        // Don't overwrite user input - only sync when the navigation path itself changes
-        if nav_path != self.last_synced_nav_path {
-            let path_str = nav_path.to_string_lossy().to_string();
-            self.text_input_value.set(path_str);
-            self.last_synced_nav_path = nav_path;
-            update |= Update::LAYOUT | Update::DRAW;
-        }
-
-        // Update inner Container (which updates both breadcrumbs and text_input)
-        // Note: TextInput handles its own keyboard input internally via its signal binding
-        update |= self.inner.update(layout, context, info).await;
-        
-        update
-    }
-
-    fn render(
-        &mut self,
-        graphics: &mut dyn nptk::core::vgi::Graphics,
-        layout: &nptk::core::layout::LayoutNode,
-        info: &mut nptk::core::app::info::AppInfo,
-        context: nptk::core::app::context::AppContext,
-    ) {
-        self.inner.render(graphics, layout, info, context)
-    }
-}
-
-impl nptk::core::widget::WidgetLayoutExt for LocationBarWrapper {
-    fn set_layout_style(&mut self, layout_style: impl Into<nptk::core::signal::MaybeSignal<nptk::core::layout::LayoutStyle>>) {
-        self.inner.set_layout_style(layout_style)
-    }
-}
+// LocationBarWrapper removed (replaced by FileLocationBar)
 
 /// Status update information
 #[derive(Clone, Debug)]
@@ -637,164 +460,7 @@ pub struct StatusUpdate {
     pub selection_count: Option<usize>, // Selected file count
 }
 
-/// Wrapper widget for status bar with dynamic content
-struct StatusBarWrapper {
-    inner: Container,
-    navigation: Arc<Mutex<crate::navigation::NavigationState>>,
-    navigation_path_signal: StateSignal<PathBuf>,
-    selected_paths_signal: StateSignal<Vec<PathBuf>>,
-    status_rx: Option<mpsc::UnboundedReceiver<String>>, // Temporary operation messages
-    status_text: StateSignal<String>,
-    status_message_timeout: Option<std::time::Instant>,
-    signals_hooked: bool,
-}
-
-impl StatusBarWrapper {
-    fn new(
-        navigation: Arc<Mutex<crate::navigation::NavigationState>>,
-        navigation_path_signal: StateSignal<PathBuf>,
-        selected_paths_signal: StateSignal<Vec<PathBuf>>,
-        status_rx: mpsc::UnboundedReceiver<String>,
-    ) -> Self {
-        let status_text = StateSignal::new("".to_string());
-        
-        let status_text_clone = status_text.clone();
-        let container = Container::new(vec![
-            Box::new(Text::new(status_text_clone.maybe()).with_font_size(16.0)),
-        ]);
-
-        Self {
-            inner: container,
-            navigation,
-            navigation_path_signal,
-            selected_paths_signal,
-            status_rx: Some(status_rx),
-            status_text,
-            status_message_timeout: None,
-            signals_hooked: false,
-        }
-    }
-
-    fn update_status_from_navigation(&mut self) {
-        // Check if timeout expired for status messages
-        if let Some(timeout) = self.status_message_timeout {
-            if timeout.elapsed() > std::time::Duration::from_secs(3) {
-                self.status_message_timeout = None;
-                // Update to show current path after message timeout
-                let nav_path = (*self.navigation_path_signal.get()).clone();
-                let path_str = nav_path.to_string_lossy().to_string();
-                let selection_count = (*self.selected_paths_signal.get()).len();
-                let status_msg = if selection_count > 0 {
-                    format!("{} - {} item(s) selected", path_str, selection_count)
-                } else {
-                    path_str
-                };
-                self.status_text.set(status_msg);
-            }
-        } else {
-            // No temporary message - show current path (with selection count if applicable)
-            let nav_path = (*self.navigation_path_signal.get()).clone();
-            let path_str = nav_path.to_string_lossy().to_string();
-            let selection_count = (*self.selected_paths_signal.get()).len();
-            let status_msg = if selection_count > 0 {
-                format!("{} - {} item(s) selected", path_str, selection_count)
-            } else {
-                path_str
-            };
-            // Only update if status actually changed to avoid unnecessary updates
-            let current_status = (*self.status_text.get()).clone();
-            let should_update = current_status != status_msg 
-                && !current_status.starts_with("Error:") 
-                && !current_status.contains("Created") 
-                && !current_status.contains("Deleted");
-            if should_update {
-                self.status_text.set(status_msg);
-            }
-        }
-    }
-}
-
-#[async_trait(?Send)]
-impl Widget for StatusBarWrapper {
-
-    fn layout_style(&self, _context: &nptk::core::layout::LayoutContext) -> nptk::core::layout::StyleNode {
-        self.inner.layout_style(_context)
-    }
-
-    async fn update(
-        &mut self,
-        layout: &nptk::core::layout::LayoutNode,
-        context: nptk::core::app::context::AppContext,
-        info: &mut nptk::core::app::info::AppInfo,
-    ) -> nptk::core::app::update::Update {
-        let mut update = Update::empty();
-
-        // Hook signals on first update
-        if !self.signals_hooked {
-            context.hook_signal(&mut self.status_text);
-            context.hook_signal(&mut self.navigation_path_signal);
-            context.hook_signal(&mut self.selected_paths_signal);
-            self.signals_hooked = true;
-        }
-
-        // Poll status messages from operations (these are temporary messages)
-        let mut has_active_temporary_message = false;
-        if let Some(ref mut rx) = self.status_rx {
-            while let Ok(msg) = rx.try_recv() {
-                self.status_text.set(msg.clone());
-                self.status_message_timeout = Some(std::time::Instant::now());
-                update.insert(Update::DRAW);
-            }
-        }
-        
-        // Check if we have an active temporary message (within timeout)
-        if let Some(timeout) = self.status_message_timeout {
-            if timeout.elapsed() <= std::time::Duration::from_secs(3) {
-                has_active_temporary_message = true;
-            }
-        }
-
-        // Priority: 1) Temporary messages, 2) Framework status bar text (button status tips), 3) Default navigation info
-        if !has_active_temporary_message {
-            // Get framework status bar text (from button status tips)
-            let framework_status_text = context.status_bar.get_text();
-            if !framework_status_text.is_empty() {
-                // Framework status bar has text (e.g., from button hover) - use it
-                self.status_text.set(framework_status_text);
-                update.insert(Update::DRAW);
-            } else {
-                // No framework status text - update status from navigation
-                self.update_status_from_navigation();
-            }
-        }
-        // If has_active_temporary_message is true, status_text was already set when the message was received
-        
-        // If status changed, trigger redraw
-        if !update.is_empty() {
-            update.insert(Update::DRAW);
-        }
-
-        // Update inner container
-        update |= self.inner.update(layout, context, info).await;
-        update
-    }
-
-    fn render(
-        &mut self,
-        graphics: &mut dyn nptk::core::vgi::Graphics,
-        layout: &nptk::core::layout::LayoutNode,
-        info: &mut nptk::core::app::info::AppInfo,
-        context: nptk::core::app::context::AppContext,
-    ) {
-        self.inner.render(graphics, layout, info, context)
-    }
-}
-
-impl nptk::core::widget::WidgetLayoutExt for StatusBarWrapper {
-    fn set_layout_style(&mut self, layout_style: impl Into<nptk::core::signal::MaybeSignal<nptk::core::layout::LayoutStyle>>) {
-        self.inner.set_layout_style(layout_style)
-    }
-}
+// StatusBarWrapper removed (replaced by FileStatusBar)
 
 pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     let navigation = state.navigation.lock().unwrap();
@@ -856,22 +522,26 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         operation_tx.clone(),
         navigation_path_signal.clone(),
         selected_paths_signal.clone(),
+        file_list_wrapper.view_mode_signal().clone(),
     );
 
-    // Create LocationBarWrapper
-    let location_bar = LocationBarWrapper::new(
-        nav_clone.clone(),
-        toolbar_nav_tx.clone(),
-        navigation_path_signal.clone(),
-    );
+    // Create FileLocationBar
+    use nptk_fileman_widgets::location_bar::FileLocationBar;
+    
+    let nav_tx_clone = toolbar_nav_tx.clone();
+    let location_bar = FileLocationBar::new(navigation_path_signal.clone())
+        .with_on_navigate(move |path| {
+             let _ = nav_tx_clone.send(crate::toolbar::NavigationAction::NavigateTo(path));
+             Update::DRAW
+        });
 
-    // Create StatusBarWrapper
-    let statusbar = StatusBarWrapper::new(
-        nav_clone.clone(),
+    // Create FileStatusBar
+    use nptk_fileman_widgets::status_bar::FileStatusBar;
+    
+    let statusbar = FileStatusBar::new(
         navigation_path_signal.clone(),
         selected_paths_signal.clone(),
-        status_rx,
-    );
+    ).with_message_receiver(status_rx);
 
     // Build main layout
     Container::new(vec![

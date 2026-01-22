@@ -58,6 +58,8 @@ pub enum FileListViewMode {
     Icon,
     /// Compact view (Tiles view: Icon left, Text right, grid layout)
     Compact,
+    /// Table view (Details view with columns)
+    Table,
 }
 
 /// A widget that displays a list of files.
@@ -87,6 +89,12 @@ pub struct FileList {
     
     // Cache invalidation channel sender
     cache_invalidate_tx: Arc<tokio::sync::mpsc::UnboundedSender<PathBuf>>,
+    
+    // Generic ItemView for Table mode
+    item_view: Option<BoxedWidget>,
+    
+    // Selection signal for ItemView (Table mode)
+    item_view_selection: Option<StateSignal<Vec<usize>>>,
 }
 
 impl FileList {
@@ -205,6 +213,58 @@ impl FileList {
             signals_hooked: false,
             selection_change_tx: selection_change_tx_arc,
             cache_invalidate_tx: cache_invalidate_tx_arc,
+            item_view: None,
+            item_view_selection: None,
+        }
+    }
+
+    /// Initialize ItemView if needed
+    fn ensure_item_view(&mut self) {
+        if self.item_view.is_none() {
+            use crate::file_list::model_adapter::FileSystemItemModel;
+            use nptk::widgets::item_view::{ItemView, ViewMode};
+            
+            let model = Arc::new(FileSystemItemModel::new(self.entries.clone()));
+             
+             // Setup ItemView with selection sync
+            let selected_paths = self.selected_paths.clone();
+            let entries = self.entries.clone();
+            let selection_change_tx = self.selection_change_tx.clone();
+            
+            let mut view = ItemView::new(model)
+                .with_view_mode(ViewMode::Table)
+                .with_on_selection_change(move |indices| {
+                    // Update FileList selection from ItemView selection
+                    let current_entries = entries.get();
+                    let mut new_paths = Vec::new();
+                    for idx in indices {
+                        if idx < current_entries.len() {
+                            new_paths.push(current_entries[idx].path.clone());
+                        }
+                    }
+                    
+                    selected_paths.set(new_paths.clone());
+                    
+                    if let Some(ref tx) = selection_change_tx {
+                        let _ = tx.send(new_paths);
+                    }
+                    
+                    Update::DRAW
+                });
+                
+            // Hook up selection signal (path -> index)
+            // This is tricky because we need to map paths to indices reactively.
+            // ideally we would use a mapped signal, but we can also just rely on update()
+            // to push the correct indices to the view if they mismatch.
+            // For now, let's just create a detached signal and sync manually in update().
+            
+            // Create selection signal
+            let selection_signal = StateSignal::new(Vec::new());
+            self.item_view_selection = Some(selection_signal.clone());
+            
+            view = view.with_selected_rows(MaybeSignal::signal(Box::new(selection_signal)));
+            
+            self.item_view = Some(Box::new(view));
         }
     }
 
@@ -279,6 +339,16 @@ impl FileList {
     pub fn with_icon_size(self, size: u32) -> Self {
         self.apply_with(|this| this.icon_size.set(size))
     }
+    
+    /// Get the view mode signal
+    pub fn view_mode_signal(&self) -> &StateSignal<FileListViewMode> {
+        &self.view_mode
+    }
+    
+    /// Get the icon size signal
+    pub fn icon_size_signal(&self) -> &StateSignal<u32> {
+        &self.icon_size
+    }
 }
 
 #[async_trait(?Send)]
@@ -299,7 +369,49 @@ impl Widget for FileList {
             context.hook_signal(&mut self.selected_paths);
             context.hook_signal(&mut self.view_mode);
             context.hook_signal(&mut self.icon_size);
+            context.hook_signal(&mut self.icon_size);
             self.signals_hooked = true;
+        }
+        
+        // Ensure ItemView exists if mode is Table
+        if *self.view_mode.get() == FileListViewMode::Table {
+            self.ensure_item_view();
+            if let Some(ref mut view) = self.item_view {
+                 // Sync FileList selection (paths) -> ItemView selection (indices)
+                 let current_selected_paths = self.selected_paths.get();
+                 let entries = self.entries.get();
+                 let mut indices = Vec::new();
+                 
+                 for path in current_selected_paths.iter() {
+                     if let Some(idx) = entries.iter().position(|e| e.path == *path) {
+                         indices.push(idx);
+                     }
+                 }
+                 
+                 // Access view internal signal if possible, or we need to expose it on ItemView trait?
+                 // ItemView is concrete struct here? No, it's ItemView struct.
+                 // But wait, self.item_view is Option<Box<ItemView>>? 
+                 // nptk-fileman-widgets/src/file_list.rs:213: item_view: None
+                 // struct field is `item_view: Option<Box<ItemView>>` (I need to check definition)
+                 
+                 // If item_view field is concrete ItemView, we have access to set_selected_rows if exposed.
+                 // But I passed it via with_selected_rows which takes a signal.
+                 // I need to hold a reference to that signal in FileList to update it easily,
+                 // OR ItemView needs a method to set it.
+                 
+                 // For now, I'll rely on the signal I created in ensure_item_view... 
+                 // Wait, I created `StateSignal::new(Vec::new())` inside ensure_item_view and gave it to view.
+                 // I lost the reference to it!
+                 // I should store it in FileList struct or assume ItemView has a public getter for the signal.
+                 // ItemView struct has `selected_rows: MaybeSignal`. I can get it.
+                 
+                 // view.selected_rows_signal().set(indices);
+                 if let Some(signal) = &self.item_view_selection {
+                     signal.set(indices);
+                 }
+                 
+                 return view.update(layout, context, info).await;
+            }
         }
 
         let mut update = Update::empty();
@@ -311,6 +423,10 @@ impl Widget for FileList {
                     FileSystemEvent::DirectoryLoaded { path, entries } => {
                         if path == *self.current_path.get() {
                             self.entries.set(entries);
+                            
+                            // Re-sync selection indices if using ItemView
+                            // This ensures that if the file list changes (e.g. reload), selection indices are valid
+                            // Logic is handled below in the view update block, so just trigger Update
                             update.insert(Update::LAYOUT | Update::DRAW);
                         }
                     },
@@ -350,6 +466,13 @@ impl Widget for FileList {
         info: &mut AppInfo,
         context: AppContext,
     ) {
+        if *self.view_mode.get() == FileListViewMode::Table {
+            if let Some(ref mut view) = self.item_view {
+                view.render(graphics, layout, info, context);
+                return;
+            }
+        }
+        
         // Render ScrollContainer
         if !layout.children.is_empty() {
             self.scroll_container
@@ -1757,3 +1880,4 @@ impl Widget for FileListContent {
     }
 }
 
+pub mod model_adapter;
