@@ -231,8 +231,33 @@ impl FileList {
             let entries = self.entries.clone();
             let selection_change_tx = self.selection_change_tx.clone();
             
+            // Reactive ViewMode mapping
+            let view_mode_signal = self.view_mode.map(|mode| match *mode {
+                FileListViewMode::List => nptk::core::reference::Ref::Owned(ViewMode::List),
+                FileListViewMode::Icon => nptk::core::reference::Ref::Owned(ViewMode::Icon),
+                FileListViewMode::Compact => nptk::core::reference::Ref::Owned(ViewMode::Compact),
+                FileListViewMode::Table => nptk::core::reference::Ref::Owned(ViewMode::Table),
+            });
+            
+            // Activation handling
+            let entries_act = self.entries.clone();
+            let current_path = self.current_path.clone();
+            let fs_model = self.fs_model.clone();
+
             let mut view = ItemView::new(model)
-                .with_view_mode(ViewMode::Table)
+                .with_view_mode(MaybeSignal::signal(Box::new(view_mode_signal)))
+                .with_on_activate(move |index| {
+                    let current_entries = entries_act.get();
+                    if index < current_entries.len() {
+                        let entry = &current_entries[index];
+                        if entry.is_dir() {
+                             current_path.set(entry.path.clone());
+                             let _ = fs_model.refresh(&entry.path);
+                             return Update::LAYOUT | Update::DRAW;
+                        }
+                    }
+                    Update::empty()
+                })
                 .with_on_selection_change(move |indices| {
                     // Update FileList selection from ItemView selection
                     let current_entries = entries.get();
@@ -373,8 +398,9 @@ impl Widget for FileList {
             self.signals_hooked = true;
         }
         
-        // Ensure ItemView exists if mode is Table
-        if *self.view_mode.get() == FileListViewMode::Table {
+        // Ensure ItemView exists if mode is Table or List
+        let mode = *self.view_mode.get();
+        if mode == FileListViewMode::Table || mode == FileListViewMode::List {
             self.ensure_item_view();
             if let Some(ref mut view) = self.item_view {
                  // Sync FileList selection (paths) -> ItemView selection (indices)

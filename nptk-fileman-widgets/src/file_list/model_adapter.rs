@@ -1,4 +1,4 @@
-use nptk::core::model::{ItemModel, ItemRole, ModelData, Orientation};
+use nptk::core::model::{ItemModel, ItemRole, ModelData, Orientation, SortOrder};
 use nptk::core::signal::state::StateSignal;
 use nptk::core::signal::Signal;
 use nptk::services::filesystem::entry::FileEntry;
@@ -80,5 +80,31 @@ impl ItemModel for FileSystemItemModel {
         } else {
             ModelData::None
         }
+    }
+
+    fn sort(&self, column: usize, order: SortOrder) {
+        self.entries.mutate(|entries| {
+            entries.sort_by(|a, b| {
+                let ord = match column {
+                    0 => {
+                        // Sort directories first
+                        match (a.is_dir(), b.is_dir()) {
+                            (true, false) => std::cmp::Ordering::Less,
+                            (false, true) => std::cmp::Ordering::Greater,
+                            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                        }
+                    },
+                    1 => a.metadata.size.cmp(&b.metadata.size),
+                    2 => format!("{:?}", a.file_type).cmp(&format!("{:?}", b.file_type)),
+                    3 => a.metadata.modified.cmp(&b.metadata.modified),
+                    _ => std::cmp::Ordering::Equal,
+                };
+                
+                match order {
+                    SortOrder::Ascending => ord,
+                    SortOrder::Descending => ord.reverse(),
+                }
+            });
+        });
     }
 }
