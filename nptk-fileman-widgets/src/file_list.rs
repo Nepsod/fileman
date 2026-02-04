@@ -95,6 +95,9 @@ pub struct FileList {
     
     // Selection signal for ItemView (Table mode)
     item_view_selection: Option<StateSignal<Vec<usize>>>,
+    
+    // Track last path to detect changes
+    last_path: Option<PathBuf>,
 }
 
 impl FileList {
@@ -215,6 +218,7 @@ impl FileList {
             cache_invalidate_tx: cache_invalidate_tx_arc,
             item_view: None,
             item_view_selection: None,
+            last_path: None,
         }
     }
 
@@ -243,6 +247,11 @@ impl FileList {
             let entries_act = self.entries.clone();
             let current_path = self.current_path.clone();
             let fs_model = self.fs_model.clone();
+            
+            // For selection callback, we need to avoid calling entries.get() during update
+            // Store current entries in an Arc<RwLock> that can be safely accessed
+            let entries_for_selection = Arc::new(std::sync::RwLock::new(self.entries.get().clone()));
+            let entries_for_selection_clone = entries_for_selection.clone();
 
             let mut view = ItemView::new(model)
                 .with_view_mode(MaybeSignal::signal(Box::new(view_mode_signal)))
@@ -251,8 +260,8 @@ impl FileList {
                     if index < current_entries.len() {
                         let entry = &current_entries[index];
                         if entry.is_dir() {
+                             // Just set the path - the signal change will trigger refresh elsewhere
                              current_path.set(entry.path.clone());
-                             let _ = fs_model.refresh(&entry.path);
                              return Update::LAYOUT | Update::DRAW;
                         }
                     }
@@ -260,7 +269,15 @@ impl FileList {
                 })
                 .with_on_selection_change(move |indices| {
                     // Update FileList selection from ItemView selection
-                    let current_entries = entries.get();
+                    // IMPORTANT: Do NOT call signal.set() here - it causes deadlock!
+                    // Instead, send via channel and let FileList::update handle it
+                    
+                    let current_entries = if let Ok(entries) = entries_for_selection_clone.read() {
+                        entries.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    
                     let mut new_paths = Vec::new();
                     for idx in indices {
                         if idx < current_entries.len() {
@@ -268,8 +285,7 @@ impl FileList {
                         }
                     }
                     
-                    selected_paths.set(new_paths.clone());
-                    
+                    // Send selection change via channel (non-blocking)
                     if let Some(ref tx) = selection_change_tx {
                         let _ = tx.send(new_paths);
                     }
@@ -288,6 +304,12 @@ impl FileList {
             self.item_view_selection = Some(selection_signal.clone());
             
             view = view.with_selected_rows(MaybeSignal::signal(Box::new(selection_signal)));
+            
+            // Set layout style to fill parent
+            view.set_layout_style(LayoutStyle {
+                size: Vector2::new(Dimension::percent(1.0), Dimension::percent(1.0)),
+                ..Default::default()
+            });
             
             self.item_view = Some(Box::new(view));
         }
@@ -379,6 +401,20 @@ impl FileList {
 #[async_trait(?Send)]
 impl Widget for FileList {
     fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
+        let mode = *self.view_mode.get();
+        
+        // For Table/List modes with ItemView, use ItemView's layout
+        if (mode == FileListViewMode::Table || mode == FileListViewMode::List) && self.item_view.is_some() {
+            if let Some(ref view) = self.item_view {
+                return StyleNode {
+                    style: self.layout_style.get().clone(),
+                    children: vec![view.layout_style(_context)],
+                    measure_func: None,
+                };
+            }
+        }
+        
+        // Otherwise use scroll_container
         StyleNode {
             style: self.layout_style.get().clone(),
             children: vec![self.scroll_container.layout_style(_context)],
@@ -398,8 +434,45 @@ impl Widget for FileList {
             self.signals_hooked = true;
         }
         
+        let mut update = Update::empty();
+        
+        // Poll filesystem events FIRST - this must happen before ItemView handling
+        // so that entries get updated even when using ItemView
+        if let Ok(mut rx) = self._event_rx.try_lock() {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    FileSystemEvent::DirectoryLoaded { path, entries } => {
+                        if path == *self.current_path.get() {
+                            self.entries.set(entries);
+                            update.insert(Update::LAYOUT | Update::DRAW);
+                        }
+                    },
+                    FileSystemEvent::EntryAdded { path, .. } | FileSystemEvent::EntryRemoved { path } | FileSystemEvent::EntryModified { path, .. } => {
+                        if let Some(parent) = path.parent() {
+                            if parent == *self.current_path.get() {
+                                let _ = self.fs_model.refresh(parent);
+                                if let Err(e) = self.cache_invalidate_tx.send(path.clone()) {
+                                    log::warn!("Failed to send cache invalidation request: {}", e);
+                                }
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            }
+        }
+        
+        // Check if path changed and trigger refresh if needed
+        let current_path_value = self.current_path.get().clone();
+        if self.last_path.as_ref() != Some(&current_path_value) {
+            self.last_path = Some(current_path_value.clone());
+            let _ = self.fs_model.refresh(&current_path_value);
+            update.insert(Update::LAYOUT | Update::DRAW);
+        }
+        
         // Ensure ItemView exists if mode is Table or List
         let mode = *self.view_mode.get();
+        
         if mode == FileListViewMode::Table || mode == FileListViewMode::List {
             self.ensure_item_view();
             if let Some(ref mut view) = self.item_view {
@@ -414,66 +487,17 @@ impl Widget for FileList {
                      }
                  }
                  
-                 // Access view internal signal if possible, or we need to expose it on ItemView trait?
-                 // ItemView is concrete struct here? No, it's ItemView struct.
-                 // But wait, self.item_view is Option<Box<ItemView>>? 
-                 // nptk-fileman-widgets/src/file_list.rs:213: item_view: None
-                 // struct field is `item_view: Option<Box<ItemView>>` (I need to check definition)
-                 
-                 // If item_view field is concrete ItemView, we have access to set_selected_rows if exposed.
-                 // But I passed it via with_selected_rows which takes a signal.
-                 // I need to hold a reference to that signal in FileList to update it easily,
-                 // OR ItemView needs a method to set it.
-                 
-                 // For now, I'll rely on the signal I created in ensure_item_view... 
-                 // Wait, I created `StateSignal::new(Vec::new())` inside ensure_item_view and gave it to view.
-                 // I lost the reference to it!
-                 // I should store it in FileList struct or assume ItemView has a public getter for the signal.
-                 // ItemView struct has `selected_rows: MaybeSignal`. I can get it.
-                 
-                 // view.selected_rows_signal().set(indices);
                  if let Some(signal) = &self.item_view_selection {
                      signal.set(indices);
                  }
                  
-                 return view.update(layout, context, info).await;
+                 // ItemView is a child in layout tree, use layout.children[0]
+                 if !layout.children.is_empty() {
+                     return view.update(&layout.children[0], context, info).await;
+                 }
             }
         }
 
-        let mut update = Update::empty();
-
-        // Poll filesystem events
-        if let Ok(mut rx) = self._event_rx.try_lock() {
-            while let Ok(event) = rx.try_recv() {
-                match event {
-                    FileSystemEvent::DirectoryLoaded { path, entries } => {
-                        if path == *self.current_path.get() {
-                            self.entries.set(entries);
-                            
-                            // Re-sync selection indices if using ItemView
-                            // This ensures that if the file list changes (e.g. reload), selection indices are valid
-                            // Logic is handled below in the view update block, so just trigger Update
-                            update.insert(Update::LAYOUT | Update::DRAW);
-                        }
-                    },
-                    FileSystemEvent::EntryAdded { path, .. } | FileSystemEvent::EntryRemoved { path } | FileSystemEvent::EntryModified { path, .. } => {
-                        if let Some(parent) = path.parent() {
-                            if parent == *self.current_path.get() {
-                                let _ = self.fs_model.refresh(parent);
-                                // Invalidate caches for the affected path
-                                if let Err(e) = self.cache_invalidate_tx.send(path.clone()) {
-                                    log::warn!("Failed to send cache invalidation request: {}", e);
-                                }
-                            }
-                        }
-                    },
-                    _ => {
-                        // For other events, we might want to refresh if they affect current path
-                        // But for now, let's just rely on DirectoryLoaded
-                    },
-                }
-            }
-        }
 
         // Update child (ScrollContainer)
         if !layout.children.is_empty() {
@@ -492,10 +516,14 @@ impl Widget for FileList {
         info: &mut AppInfo,
         context: AppContext,
     ) {
-        if *self.view_mode.get() == FileListViewMode::Table {
+        let mode = *self.view_mode.get();
+        if mode == FileListViewMode::Table || mode == FileListViewMode::List {
             if let Some(ref mut view) = self.item_view {
-                view.render(graphics, layout, info, context);
-                return;
+                // ItemView is a child in the layout tree, so use layout.children[0]
+                if !layout.children.is_empty() {
+                    view.render(graphics, &layout.children[0], info, context);
+                    return;
+                }
             }
         }
         
