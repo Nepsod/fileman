@@ -96,6 +96,12 @@ pub struct FileList {
     // Selection signal for ItemView (Table mode)
     item_view_selection: Option<StateSignal<Vec<usize>>>,
     
+    // Receiver for selection changes from ItemView callback
+    selection_change_rx: Option<Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<PathBuf>>>>>,
+    
+    // Sender for internal selection changes (used by ItemView callback)
+    internal_selection_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
+    
     // Track last path to detect changes
     last_path: Option<PathBuf>,
 }
@@ -171,6 +177,11 @@ impl FileList {
 
         // Wrap selection_change_tx in Arc for sharing with FileListContent
         let selection_change_tx_arc = selection_change_tx.map(|tx| Arc::new(tx));
+        
+        // Create internal channel for selection changes from ItemView
+        let (internal_selection_tx, internal_selection_rx) = tokio::sync::mpsc::unbounded_channel();
+        let internal_selection_tx_arc = Arc::new(internal_selection_tx);
+        let internal_selection_rx_arc = Arc::new(Mutex::new(internal_selection_rx));
 
         // Create content widget
         let content = FileListContent::new(
@@ -218,6 +229,8 @@ impl FileList {
             cache_invalidate_tx: cache_invalidate_tx_arc,
             item_view: None,
             item_view_selection: None,
+            selection_change_rx: Some(internal_selection_rx_arc),
+            internal_selection_tx: Some(internal_selection_tx_arc),
             last_path: None,
         }
     }
@@ -234,6 +247,7 @@ impl FileList {
             let selected_paths = self.selected_paths.clone();
             let entries = self.entries.clone();
             let selection_change_tx = self.selection_change_tx.clone();
+            let internal_selection_tx = self.internal_selection_tx.clone();
             
             // Reactive ViewMode mapping
             let view_mode_signal = self.view_mode.map(|mode| match *mode {
@@ -285,7 +299,12 @@ impl FileList {
                         }
                     }
                     
-                    // Send selection change via channel (non-blocking)
+                    // Send selection change via INTERNAL channel (non-blocking)
+                    if let Some(ref tx) = internal_selection_tx {
+                        let _ = tx.send(new_paths.clone());
+                    }
+                    
+                    // Also send to external channel if provided
                     if let Some(ref tx) = selection_change_tx {
                         let _ = tx.send(new_paths);
                     }
@@ -458,6 +477,16 @@ impl Widget for FileList {
                         }
                     },
                     _ => {},
+                }
+            }
+        }
+        
+        // Poll selection changes from ItemView callback
+        if let Some(ref rx) = self.selection_change_rx {
+            if let Ok(mut receiver) = rx.try_lock() {
+                while let Ok(new_paths) = receiver.try_recv() {
+                    self.selected_paths.set(new_paths);
+                    update.insert(Update::DRAW);
                 }
             }
         }
