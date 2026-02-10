@@ -22,6 +22,43 @@ pub enum NavigationAction {
     NavigateTo(PathBuf),
 }
 
+/// A signal that executes a function every time get() is called.
+/// This is needed for button handlers that perform side effects, as EvalSignal memoizes the result.
+#[derive(Clone)]
+struct FuncSignal<F, T> {
+    f: F,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<F, T> FuncSignal<F, T> {
+    pub fn new(f: F) -> Self {
+        Self {
+            f,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<F, T> nptk::core::signal::Signal<T> for FuncSignal<F, T>
+where
+    F: Fn() -> T + Send + Sync + Clone + 'static,
+    T: Send + Sync + 'static + Clone,
+{
+    fn get(&self) -> nptk::core::reference::Ref<'_, T> {
+        nptk::core::reference::Ref::Owned((self.f)())
+    }
+
+    fn set_value(&self, _value: T) {}
+
+    fn listen(&self, _listener: nptk::core::signal::Listener<T>) {}
+
+    fn notify(&self) {}
+
+    fn dyn_clone(&self) -> nptk::core::signal::BoxedSignal<T> {
+        Box::new((*self).clone())
+    }
+}
+
 /// Wrapper widget for toolbar with navigation and file operation buttons
 pub struct ToolbarWrapper {
     inner: Toolbar,
@@ -165,7 +202,8 @@ impl ToolbarWrapper {
             ])
             .with_on_pressed({
                 let delete_flag = delete_requested_clone.clone();
-                nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                // Use FuncSignal because we need side effects every time
+                nptk::core::signal::MaybeSignal::signal(Box::new(FuncSignal::new(move || {
                     if let Ok(mut f) = delete_flag.lock() {
                         *f = true;
                     }
@@ -180,7 +218,8 @@ impl ToolbarWrapper {
             Box::new(Icon::new("view-list-details", 24, None)), // Fallback icon name, hopefully exists or falls back text
             Box::new(Text::new("View".to_string()).with_font_size(14.0))
         ])
-         .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+         // Use FuncSignal because we need side effects every time
+         .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(FuncSignal::new(move || {
                 let current = *view_mode_signal_clone.get();
                 let next = match current {
                     FileListViewMode::List => FileListViewMode::Icon,

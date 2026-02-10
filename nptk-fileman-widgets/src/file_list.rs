@@ -506,24 +506,26 @@ impl Widget for FileList {
             self.ensure_item_view();
             if let Some(ref mut view) = self.item_view {
                  // Sync FileList selection (paths) -> ItemView selection (indices)
-                 let current_selected_paths = self.selected_paths.get();
-                 let entries = self.entries.get();
-                 let mut indices = Vec::new();
-                 
-                 for path in current_selected_paths.iter() {
-                     if let Some(idx) = entries.iter().position(|e| e.path == *path) {
-                         indices.push(idx);
+                 {
+                     let current_selected_paths = self.selected_paths.get();
+                     let entries = self.entries.get();
+                     let mut indices = Vec::new();
+                     
+                     for path in current_selected_paths.iter() {
+                         if let Some(idx) = entries.iter().position(|e| e.path == *path) {
+                             indices.push(idx);
+                         }
                      }
-                 }
-                 
-                 if let Some(signal) = &self.item_view_selection {
-                     signal.set(indices);
-                 }
+                     
+                     if let Some(signal) = &self.item_view_selection {
+                         signal.set(indices);
+                     }
+                 } // entries dropped here!
                  
                  // ItemView is a child in layout tree, use layout.children[0]
-                 if !layout.children.is_empty() {
-                     return view.update(&layout.children[0], context, info).await;
-                 }
+                if !layout.children.is_empty() {
+                    return view.update(&layout.children[0], context, info).await;
+                }
             }
         }
 
