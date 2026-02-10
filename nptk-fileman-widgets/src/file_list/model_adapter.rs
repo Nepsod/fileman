@@ -48,10 +48,12 @@ impl ItemModel for FileSystemItemModel {
             },
             ItemRole::Icon => {
                 if col == 0 {
-                    // Logic to retrieve/return icon would go here.
-                    // For now, we return None, as the View handles async icon loading separately.
-                    // In a full implementation, ModelData::Icon could hold a handle.
-                    ModelData::None 
+                    if entry.is_dir() {
+                        ModelData::String("directory".to_string())
+                    } else {
+                        // TODO: Map mime types to icon names
+                        ModelData::String("file".to_string())
+                    }
                 } else {
                     ModelData::None
                 }
