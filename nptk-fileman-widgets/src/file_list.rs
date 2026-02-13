@@ -36,6 +36,7 @@ mod view_list;
 /// This is converted to the full FileOperationRequest in FileListWrapper
 pub enum FileListOperation {
     Delete(Vec<PathBuf>),
+    Properties(Vec<PathBuf>),
 }
 
 use nptk::widgets::scroll_container::{ScrollContainer, ScrollDirection};
@@ -104,6 +105,15 @@ pub struct FileList {
     
     // Track last path to detect changes
     last_path: Option<PathBuf>,
+    
+    // Context menu callback
+    on_context_menu: Option<Arc<dyn Fn(PathBuf, Vector2<f64>, AppContext) -> Update + Send + Sync>>,
+
+    // Services needed for properties dialog
+    icon_registry: Arc<IconRegistry>,
+    thumbnail_service: Arc<ThumbnailService>,
+    icon_cache: Arc<Mutex<std::collections::HashMap<(PathBuf, u32), Option<npio::service::icon::CachedIcon>>>>,
+    mime_registry: MimeRegistry,
 }
 
 impl FileList {
@@ -160,6 +170,11 @@ impl FileList {
         let icon_registry =
             Arc::new(IconRegistry::new().unwrap_or_else(|_| IconRegistry::default()));
 
+        let icon_registry =
+            Arc::new(IconRegistry::new().unwrap_or_else(|_| IconRegistry::default()));
+
+        let mime_registry = MimeRegistry::load_default();
+        
         // Register npio backend if not already registered
         // Note: This is idempotent - registering multiple times is safe
         let backend = Arc::new(LocalBackend::new());
@@ -183,6 +198,9 @@ impl FileList {
         let internal_selection_tx_arc = Arc::new(internal_selection_tx);
         let internal_selection_rx_arc = Arc::new(Mutex::new(internal_selection_rx));
 
+        // Create icon cache to be shared between FileList and properties dialog
+        let icon_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
+
         // Create content widget
         let content = FileListContent::new(
             entries.clone(),
@@ -193,6 +211,7 @@ impl FileList {
             fs_model.clone(),
             icon_registry.clone(),
             thumbnail_service.clone(),
+            icon_cache.clone(),
             thumbnail_event_rx,
             cache_update_tx,
             cache_update_rx,
@@ -232,7 +251,135 @@ impl FileList {
             selection_change_rx: Some(internal_selection_rx_arc),
             internal_selection_tx: Some(internal_selection_tx_arc),
             last_path: None,
+            on_context_menu: None,
+            icon_registry,
+            thumbnail_service,
+            icon_cache,
+            mime_registry,
         }
+    }
+
+    pub fn show_properties_popup(&self, paths: &[PathBuf], context: AppContext) {
+        use crate::file_list::properties::PropertiesData;
+        use std::fs;
+        use humansize::{format_size, BINARY};
+        use npio::service::filesystem::mime_detector::MimeDetector;
+
+        if paths.is_empty() {
+             return;
+        }
+
+        let mut rows: Vec<(String, String)> = Vec::new();
+
+        let (title, icon_label) = if paths.len() == 1 {
+            let path = &paths[0];
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unnamed>");
+            let icon_label = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_uppercase())
+                .unwrap_or_else(|| "FILE".to_string());
+
+            let mime_type = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(MimeDetector::detect_mime_type(path))
+            })
+                .or_else(|| FileListContent::xdg_mime_filetype(path))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let lookup_mime_description = |mime_type: &str| -> Option<String> {
+                for variant in FileListContent::mime_description_variants(mime_type) {
+                    if let Some(desc) = self.mime_registry.description(&variant) {
+                        return Some(desc);
+                    }
+                }
+                FileListContent::get_mime_description(mime_type)
+            };
+
+            let kind_display = if let Some(description) = lookup_mime_description(&mime_type) {
+                format!("{} ({})", description, mime_type)
+            } else {
+                mime_type.clone()
+            };
+            rows.push(("Kind".to_string(), kind_display));
+            rows.push(("Name".to_string(), name.to_string()));
+
+            if let Ok(meta) = fs::metadata(path) {
+                let size = if meta.is_dir() {
+                    FileListContent::calculate_directory_size(path)
+                } else {
+                    meta.len()
+                };
+                rows.push((
+                    "Size".to_string(),
+                    format_size(size, BINARY) + " (" + size.to_string().as_str() + " bytes)",
+                ));
+                if let Ok(modified) = meta.modified() {
+                    rows.push(("Modified".to_string(), FileListContent::format_system_time(modified)));
+                }
+                if let Ok(created) = meta.created() {
+                    rows.push(("Created".to_string(), FileListContent::format_system_time(created)));
+                }
+            }
+
+            rows.push((
+                "Location".to_string(),
+                path.parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "".to_string()),
+            ));
+            rows.push(("Path".to_string(), path.display().to_string()));
+            (name.to_string(), icon_label)
+        } else {
+            let count = paths.len();
+            let mut total_size: u64 = 0;
+            for p in paths {
+                if let Ok(meta) = fs::metadata(p) {
+                    let size = if meta.is_dir() {
+                        FileListContent::calculate_directory_size(p)
+                    } else {
+                        meta.len()
+                    };
+                    total_size = total_size.saturating_add(size);
+                }
+            }
+            rows.push(("Items".to_string(), count.to_string()));
+            rows.push(("Total size".to_string(), format_size(total_size, BINARY)));
+            (format!("{} items", count), "MULTI".to_string())
+        };
+
+        let data = PropertiesData {
+            title,
+            icon_label,
+            rows,
+            paths: paths.to_vec(),
+        };
+
+        let svg_scene_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        
+        // Create Properties Widget using FileListContent's static builder
+        let props_widget = FileListContent::build_properties_widget(
+            data,
+            self.icon_registry.clone(),
+            self.thumbnail_service.clone(),
+            self.icon_cache.clone(),
+            svg_scene_cache,
+        );
+        
+        let pos = (100, 100);
+            
+        context
+            .popup_manager
+            .create_popup_at(props_widget, "Properties", (360, 260), pos);
+    }
+
+    pub fn with_on_context_menu<F>(mut self, callback: F) -> Self 
+    where F: Fn(PathBuf, Vector2<f64>, AppContext) -> Update + Send + Sync + 'static 
+    {
+        self.on_context_menu = Some(Arc::new(callback));
+        self
     }
 
     /// Initialize ItemView if needed
@@ -266,6 +413,10 @@ impl FileList {
             // Store current entries in an Arc<RwLock> that can be safely accessed
             let entries_for_selection = Arc::new(std::sync::RwLock::new(self.entries.get().clone()));
             let entries_for_selection_clone = entries_for_selection.clone();
+            
+            // Context menu handling
+            let entries_for_menu = entries_for_selection.clone();
+            let on_context_menu = self.on_context_menu.clone();
 
             let mut view = ItemView::new(model)
                 .with_view_mode(MaybeSignal::signal(Box::new(view_mode_signal)))
@@ -311,6 +462,18 @@ impl FileList {
                     
                     Update::DRAW
                 });
+                
+            if let Some(cb) = on_context_menu {
+                view = view.with_on_context_menu(move |index, pos, context| {
+                    if let Ok(entries) = entries_for_menu.read() {
+                        if index < entries.len() {
+                            let path = entries[index].path.clone();
+                            return cb(path, pos, context);
+                        }
+                    }
+                    Update::empty()
+                });
+            }
                 
             // Hook up selection signal (path -> index)
             // This is tricky because we need to map paths to indices reactively.
@@ -684,6 +847,7 @@ impl FileListContent {
         fs_model: Arc<FileSystemModel>,
         icon_registry: Arc<IconRegistry>,
         thumbnail_service: Arc<ThumbnailService>,
+        icon_cache: Arc<Mutex<std::collections::HashMap<(PathBuf, u32), Option<npio::service::icon::CachedIcon>>>>,
         thumbnail_event_rx: tokio::sync::broadcast::Receiver<ThumbnailEvent>,
         cache_update_tx: tokio::sync::mpsc::Sender<()>,
         cache_update_rx: tokio::sync::mpsc::Receiver<()>,
@@ -706,7 +870,7 @@ impl FileListContent {
             last_click_time: None,
             last_click_index: None,
             anchor_index: None,
-            icon_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            icon_cache,
             pending_thumbnails: Arc::new(Mutex::new(HashSet::new())),
             thumbnail_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             thumbnail_event_rx: Arc::new(Mutex::new(thumbnail_event_rx)),

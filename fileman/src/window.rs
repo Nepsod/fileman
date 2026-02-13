@@ -12,6 +12,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
+use nalgebra::Vector2;
+use nptk::core::vg::peniko::Color;
+use nptk::core::layout::Rect as LayoutRect;
+use nptk::core::menu::unified::{MenuTemplate, MenuItem};
+use nptk::core::menu::MenuCommand;
+use nptk::core::vg::kurbo::Point;
 
 /// File operation requests that can be sent from UI to be processed
 #[derive(Debug, Clone)]
@@ -55,10 +61,64 @@ impl FileListWrapper {
         let (file_list_op_tx, file_list_op_rx) = mpsc::unbounded_channel::<FileListOperation>();
         
         // Create FileList (selection_change_tx is optional for backward compatibility)
-        let file_list = FileList::new_with_operations(initial_path.clone(), Some(file_list_op_tx), None);
+        let file_list = FileList::new_with_operations(initial_path.clone(), Some(file_list_op_tx.clone()), None);
         
         // Clone signals from FileList for reactive subscription
         let file_list_path_signal = file_list.current_path_signal().clone();
+        
+        let file_list = file_list.with_on_context_menu({
+            let nav_tx = navigation.clone();
+            let op_tx = file_list_op_tx.clone();
+            move |path: PathBuf, pos: Vector2<f64>, context: AppContext| {
+                // Create native context menu using NPTK's MenuManager
+                let mut template = MenuTemplate::new("context-menu");
+                
+                // Open action
+                if path.is_dir() || path.is_file() {
+                    let nav_tx_clone = nav_tx.clone();
+                    let path_clone = path.clone();
+                    template = template.add_item(
+                        MenuItem::new(MenuCommand::Custom(1), "Open")
+                            .with_action(move || {
+                                if let Ok(mut n) = nav_tx_clone.lock() {
+                                    n.navigate_to(path_clone.clone()); 
+                                }
+                                Update::DRAW
+                            })
+                    );
+                }
+                
+                // Separator
+                template = template.add_item(MenuItem::separator());
+                
+                // Properties action
+                let op_tx_clone = op_tx.clone();
+                let path_clone = path.clone();
+                template = template.add_item(
+                    MenuItem::new(MenuCommand::Custom(2), "Properties")
+                        .with_action(move || {
+                             let _ = op_tx_clone.send(FileListOperation::Properties(vec![path_clone.clone()]));
+                             Update::DRAW
+                        })
+                );
+                
+                // Delete action
+                let op_tx_clone = op_tx.clone();
+                let path_clone = path.clone();
+                template = template.add_item(
+                    MenuItem::new(MenuCommand::Custom(3), "Delete")
+                        .with_action(move || {
+                            let _ = op_tx_clone.send(FileListOperation::Delete(vec![path_clone.clone()]));
+                            Update::DRAW
+                        })
+                );
+
+                // Show the menu at cursor position
+                context.menu_manager.show(template, Point::new(pos.x, pos.y));
+                
+                Update::DRAW
+            }
+        });
         
         Self {
             file_list,
@@ -85,10 +145,9 @@ impl FileListWrapper {
     }
 
     /// Show properties popup for the given paths
+    /// Show properties popup for the given paths
     pub fn show_properties_for_paths(&mut self, paths: &[PathBuf], context: nptk::core::app::context::AppContext) {
-        // Properties functionality is handled internally by FileListContent
-        // This is a placeholder for the public API
-        log::info!("Properties requested for: {:?}", paths);
+        self.file_list.show_properties_popup(paths, context);
     }
 
     /// Show delete confirmation dialog
@@ -243,9 +302,15 @@ impl Widget for FileListWrapper {
         }
 
         // Process file operations from FileList widget (context menu, etc.)
+        // Collect operations to avoid borrow conflicts
+        let mut pending_properties_internal = Vec::new();
+        
         if let Some(ref mut rx) = self.file_list_operation_rx {
             while let Ok(op) = rx.try_recv() {
                 match op {
+                    FileListOperation::Properties(paths) => {
+                        pending_properties_internal.push(paths);
+                    }
                     FileListOperation::Delete(paths) => {
                         // Convert to FileOperationRequest and process
                         let paths_clone = paths.clone();
@@ -284,11 +349,19 @@ impl Widget for FileListWrapper {
                 }
             }
         }
+        
+        // Process pending properties requests from internal ops
+        for paths in pending_properties_internal {
+             self.show_properties_for_paths(&paths, context.clone());
+             update.insert(Update::DRAW);
+        }
 
         // Process file operations from toolbar/other UI
-        // Note: Delete operations need confirmation, so show dialog first
+        // Note: Delete operations need confirm, Properties need dialog
         // Collect operations first to avoid borrow conflicts
         let mut pending_deletes = Vec::new();
+        let mut pending_properties = Vec::new();
+        
         if let Some(ref mut rx) = self.operation_rx {
             while let Ok(op) = rx.try_recv() {
                 match op {
@@ -339,18 +412,17 @@ impl Widget for FileListWrapper {
                         }
                     }
                     FileOperationRequest::Properties(paths) => {
-                        // Show properties using the same mechanism as context menu
-                        // We need to trigger the properties action through the FileList's operation channel
-                        // For now, log the request - the actual implementation would need to be done
-                        // through the FileList's internal operation system
-                        log::info!("Properties requested for paths: {:?}", paths);
-                        if let Some(ref tx) = self.status_tx {
-                            let _ = tx.send("Properties functionality available via right-click".to_string());
-                        }
-                        update.insert(Update::DRAW);
+                        // Collect properties requests
+                        pending_properties.push(paths);
                     }
                 }
             }
+        }
+        
+        // Process pending properties requests (after releasing borrow)
+        for paths in pending_properties {
+             self.show_properties_for_paths(&paths, context.clone());
+             update.insert(Update::DRAW);
         }
         
         // Show confirmation dialogs for pending delete operations (after releasing borrow)

@@ -159,7 +159,7 @@ impl FileListContent {
             .create_popup_at(props_widget, "Properties", (360, 260), pos);
     }
 
-    fn format_system_time(time: std::time::SystemTime) -> String {
+    pub(super) fn format_system_time(time: std::time::SystemTime) -> String {
         let dt: DateTime<Local> = time.into();
         dt.format("%Y-%m-%d %H:%M:%S").to_string()
     }
@@ -173,7 +173,7 @@ impl FileListContent {
         Self::get_mime_description(mime_type)
     }
 
-    fn get_mime_description(mime_type: &str) -> Option<String> {
+    pub(super) fn get_mime_description(mime_type: &str) -> Option<String> {
         for variant in Self::mime_description_variants(mime_type) {
             if let Some(desc) = Self::get_mime_description_single(&variant) {
                 return Some(desc);
@@ -294,7 +294,7 @@ impl FileListContent {
         best.or(fallback)
     }
 
-    fn mime_description_variants(mime_type: &str) -> Vec<String> {
+    pub(super) fn mime_description_variants(mime_type: &str) -> Vec<String> {
         let mut variants = Vec::new();
         variants.push(mime_type.to_string());
         if let Some((major, rest)) = mime_type.split_once('/') {
@@ -320,7 +320,7 @@ impl FileListContent {
         variants
     }
 
-    fn calculate_directory_size(path: &Path) -> u64 {
+    pub(super) fn calculate_directory_size(path: &Path) -> u64 {
         let metadata = match fs::metadata(path) {
             Ok(m) => m,
             Err(_) => return 0,
@@ -360,13 +360,13 @@ impl FileListContent {
 }
 
 pub(super) struct PropertiesData {
-    title: String,
-    icon_label: String,
-    rows: Vec<(String, String)>,
-    paths: Vec<PathBuf>,
+    pub(super) title: String,
+    pub(super) icon_label: String,
+    pub(super) rows: Vec<(String, String)>,
+    pub(super) paths: Vec<PathBuf>,
 }
 
-struct PropertiesContent {
+pub(super) struct PropertiesContent {
     data: PropertiesData,
     text_ctx: TextRenderContext,
     icon_registry: Arc<IconRegistry>,
@@ -381,7 +381,7 @@ struct PropertiesContent {
 }
 
 impl PropertiesContent {
-    fn new(
+    pub(super) fn new(
         data: PropertiesData,
         icon_registry: Arc<IconRegistry>,
         thumbnail_service: Arc<ThumbnailService>,

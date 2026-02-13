@@ -91,70 +91,50 @@ impl ToolbarWrapper {
         
         // Create buttons using EvalSignal to perform side effects when pressed
         // EvalSignal evaluates the closure every time get() is called (when button is pressed)
-        let nav_clone1 = navigation.clone();
-        let nav_clone2 = navigation.clone();
-        let nav_clone3 = navigation.clone();
-        let nav_clone4 = navigation.clone();
         
+        let nav_tx_back = nav_tx.clone();
         let back_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-left", 24, None)),
             Box::new(Text::new("Back".to_string()).with_font_size(14.0))
         ])
-            .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
-                if let Ok(mut nav) = nav_clone1.lock() {
-                    if nav.go_back().is_some() {
-                        return Update::LAYOUT | Update::DRAW;
-                    }
-                }
-                Update::empty()
+            .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(FuncSignal::new(move || {
+                let _ = nav_tx_back.send(NavigationAction::Back);
+                Update::DRAW // UI update handled by receiver
             }))))
             .with_tooltip("Go back")
             .with_status_tip("Navigate to the previous directory in history");
 
+        let nav_tx_fwd = nav_tx.clone();
         let forward_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-right", 24, None)),
             Box::new(Text::new("Forward".to_string()).with_font_size(14.0))
         ])
-            .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
-                if let Ok(mut nav) = nav_clone2.lock() {
-                    if nav.go_forward().is_some() {
-                        return Update::LAYOUT | Update::DRAW;
-                    }
-                }
-                Update::empty()
+            .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(FuncSignal::new(move || {
+                let _ = nav_tx_fwd.send(NavigationAction::Forward);
+                Update::DRAW
             }))))
             .with_tooltip("Go forward")
             .with_status_tip("Navigate to the next directory in history");
 
+        let nav_tx_up = nav_tx.clone();
         let up_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("arrow-up", 24, None)),
             Box::new(Text::new("Up".to_string()).with_font_size(14.0))
         ])
-            .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
-                if let Ok(mut nav) = nav_clone3.lock() {
-                    if let Some(parent) = nav.parent_path() {
-                        nav.navigate_to(parent);
-                        return Update::LAYOUT | Update::DRAW;
-                    }
-                }
-                Update::empty()
+            .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(FuncSignal::new(move || {
+                let _ = nav_tx_up.send(NavigationAction::Up);
+                Update::DRAW
             }))))
             .with_status_tip("Navigate to the parent directory");
 
+        let nav_tx_home = nav_tx.clone();
         let home_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("folder-home", 24, None)),
             Box::new(Text::new("Home".to_string()).with_font_size(14.0))
         ])
-            .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
-                if let Ok(mut nav) = nav_clone4.lock() {
-                    let home = std::env::var("HOME")
-                        .ok()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| PathBuf::from("/home"));
-                    nav.navigate_to(home);
-                    return Update::LAYOUT | Update::DRAW;
-                }
-                Update::empty()
+            .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(FuncSignal::new(move || {
+                let _ = nav_tx_home.send(NavigationAction::Home);
+                Update::DRAW
             }))))
             .with_tooltip("Go home")
             .with_status_tip("Navigate to the home directory");
