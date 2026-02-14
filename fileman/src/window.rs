@@ -25,6 +25,8 @@ pub enum FileOperationRequest {
     Delete(Vec<PathBuf>),
     CreateDirectory { parent: PathBuf, name: String },
     Rename { from: PathBuf, to: PathBuf },
+    PromptRename(PathBuf), // Prompt for new name for single file
+    PromptCreateDirectory(PathBuf), // Prompt for new directory name in parent
     Properties(Vec<PathBuf>),
     // Future: Copy, Move, etc.
 }
@@ -46,6 +48,10 @@ struct FileListWrapper {
     status_tx: Option<mpsc::UnboundedSender<String>>,
     // Pending delete operations waiting for confirmation (from toolbar)
     pending_delete_confirmation: Arc<Mutex<Option<Vec<PathBuf>>>>,
+    // Pending rename operations (from dialog)
+    pending_rename: Arc<Mutex<Option<(PathBuf, String)>>>,
+    // Pending create directory operations (from dialog)
+    pending_create_dir: Arc<Mutex<Option<(PathBuf, String)>>>,
 }
 
 impl FileListWrapper {
@@ -102,6 +108,17 @@ impl FileListWrapper {
                         })
                 );
                 
+                // Rename action
+                let op_tx_clone = op_tx.clone();
+                let path_clone = path.clone();
+                template = template.add_item(
+                    MenuItem::new(MenuCommand::Custom(4), "Rename")
+                        .with_action(move || {
+                             let _ = op_tx_clone.send(FileListOperation::PromptRename(path_clone.clone()));
+                             Update::DRAW
+                        })
+                );
+                
                 // Delete action
                 let op_tx_clone = op_tx.clone();
                 let path_clone = path.clone();
@@ -131,6 +148,8 @@ impl FileListWrapper {
             operation_rx: Some(operation_rx),
             status_tx: Some(status_tx),
             pending_delete_confirmation: Arc::new(Mutex::new(None)),
+            pending_rename: Arc::new(Mutex::new(None)),
+            pending_create_dir: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -223,6 +242,135 @@ impl FileListWrapper {
             .popup_manager
             .create_popup_at(Box::new(dialog_content), "Confirm Delete", (400, 150), (300, 200));
     }
+
+    /// Show rename dialog
+    fn show_rename_dialog(&self, path: PathBuf, context: AppContext) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let input_signal = StateSignal::new(name.clone());
+        let pending_rename = self.pending_rename.clone();
+        let path_clone = path.clone();
+
+        let message_text = Text::new(format!("Rename \"{}\" to:", name).to_string());
+        
+        let input_field = TextInput::new()
+            .with_text_signal(input_signal.clone())
+            .with_placeholder("Enter new name".to_string());
+            
+        let input_signal_clone = input_signal.clone();
+        
+        // Cancel button
+        let cancel_btn = Button::new(Text::new("Cancel".to_string()))
+            .with_on_pressed(MaybeSignal::value(Update::DRAW));
+
+        // OK button
+        let ok_btn = Button::new(Text::new("Rename".to_string()))
+            .with_on_pressed({
+                let pending = pending_rename.clone();
+                let p = path_clone.clone();
+                let s = input_signal_clone.clone();
+                MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                    let new_name = (*s.get()).clone();
+                    if !new_name.is_empty() {
+                         if let Ok(mut lock) = pending.lock() {
+                             *lock = Some((p.clone(), new_name));
+                         }
+                    }
+                    Update::DRAW
+                })))
+            });
+
+        let dialog_content = Container::new(vec![
+            Box::new(message_text),
+            Box::new(input_field),
+            Box::new(Container::new(vec![
+                Box::new(cancel_btn),
+                Box::new(ok_btn),
+            ]).with_layout_style(LayoutStyle {
+                flex_direction: FlexDirection::Row,
+                gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
+                justify_content: Some(JustifyContent::FlexEnd),
+                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+                ..Default::default()
+            })),
+        ]).with_layout_style(LayoutStyle {
+            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+            flex_direction: FlexDirection::Column,
+            padding: Rect {
+                left: LengthPercentage::length(16.0),
+                right: LengthPercentage::length(16.0),
+                top: LengthPercentage::length(16.0),
+                bottom: LengthPercentage::length(16.0),
+            },
+            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(16.0)),
+            ..Default::default()
+        });
+
+        context.popup_manager.create_popup_at(Box::new(dialog_content), "Rename File", (400, 200), (300, 250));
+    }
+
+    /// Show new folder dialog
+    fn show_new_folder_dialog(&self, parent: PathBuf, context: AppContext) {
+        let input_signal = StateSignal::new("New Folder".to_string());
+        let pending_create = self.pending_create_dir.clone();
+        let parent_clone = parent.clone();
+
+        let message_text = Text::new("Create new folder named:".to_string());
+        
+        let input_field = TextInput::new()
+            .with_text_signal(input_signal.clone())
+            .with_placeholder("Folder name".to_string());
+            
+        let input_signal_clone = input_signal.clone();
+        
+        // Cancel button
+        let cancel_btn = Button::new(Text::new("Cancel".to_string()))
+            .with_on_pressed(MaybeSignal::value(Update::DRAW));
+
+        // OK button
+        let ok_btn = Button::new(Text::new("Create".to_string()))
+            .with_on_pressed({
+                let pending = pending_create.clone();
+                let p = parent_clone.clone();
+                let s = input_signal_clone.clone();
+                MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                    let new_name = (*s.get()).clone();
+                    if !new_name.is_empty() {
+                         if let Ok(mut lock) = pending.lock() {
+                             *lock = Some((p.clone(), new_name));
+                         }
+                    }
+                    Update::DRAW
+                })))
+            });
+
+        let dialog_content = Container::new(vec![
+            Box::new(message_text),
+            Box::new(input_field),
+            Box::new(Container::new(vec![
+                Box::new(cancel_btn),
+                Box::new(ok_btn),
+            ]).with_layout_style(LayoutStyle {
+                flex_direction: FlexDirection::Row,
+                gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
+                justify_content: Some(JustifyContent::FlexEnd),
+                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+                ..Default::default()
+            })),
+        ]).with_layout_style(LayoutStyle {
+            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+            flex_direction: FlexDirection::Column,
+            padding: Rect {
+                left: LengthPercentage::length(16.0),
+                right: LengthPercentage::length(16.0),
+                top: LengthPercentage::length(16.0),
+                bottom: LengthPercentage::length(16.0),
+            },
+            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(16.0)),
+            ..Default::default()
+        });
+
+        context.popup_manager.create_popup_at(Box::new(dialog_content), "New Folder", (400, 200), (300, 250));
+    }
 }
 
 #[async_trait(?Send)]
@@ -304,12 +452,16 @@ impl Widget for FileListWrapper {
         // Process file operations from FileList widget (context menu, etc.)
         // Collect operations to avoid borrow conflicts
         let mut pending_properties_internal = Vec::new();
+        let mut pending_renames_internal = Vec::new();
         
         if let Some(ref mut rx) = self.file_list_operation_rx {
             while let Ok(op) = rx.try_recv() {
                 match op {
                     FileListOperation::Properties(paths) => {
                         pending_properties_internal.push(paths);
+                    }
+                    FileListOperation::PromptRename(path) => {
+                        pending_renames_internal.push(path);
                     }
                     FileListOperation::Delete(paths) => {
                         // Convert to FileOperationRequest and process
@@ -356,11 +508,19 @@ impl Widget for FileListWrapper {
              update.insert(Update::DRAW);
         }
 
+        // Process pending renames from internal ops
+        for path in pending_renames_internal {
+             self.show_rename_dialog(path, context.clone());
+             update.insert(Update::DRAW);
+        }
+
         // Process file operations from toolbar/other UI
         // Note: Delete operations need confirm, Properties need dialog
         // Collect operations first to avoid borrow conflicts
         let mut pending_deletes = Vec::new();
         let mut pending_properties = Vec::new();
+        let mut pending_renames = Vec::new();
+        let mut pending_creates = Vec::new();
         
         if let Some(ref mut rx) = self.operation_rx {
             while let Ok(op) = rx.try_recv() {
@@ -392,7 +552,7 @@ impl Widget for FileListWrapper {
                         }
                     }
                     FileOperationRequest::Rename { from, to } => {
-                        match operations::rename_path(from.clone(), to.clone()) {
+                         match operations::rename_path(from.clone(), to.clone()) {
                             Ok(_) => {
                                 log::info!("Renamed: {:?} -> {:?}", from, to);
                                 if let Some(ref tx) = self.status_tx {
@@ -415,6 +575,12 @@ impl Widget for FileListWrapper {
                         // Collect properties requests
                         pending_properties.push(paths);
                     }
+                    FileOperationRequest::PromptRename(path) => {
+                        pending_renames.push(path);
+                    }
+                    FileOperationRequest::PromptCreateDirectory(parent) => {
+                        pending_creates.push(parent);
+                    }
                 }
             }
         }
@@ -422,6 +588,18 @@ impl Widget for FileListWrapper {
         // Process pending properties requests (after releasing borrow)
         for paths in pending_properties {
              self.show_properties_for_paths(&paths, context.clone());
+             update.insert(Update::DRAW);
+        }
+
+        // Process pending renames
+        for path in pending_renames {
+             self.show_rename_dialog(path, context.clone());
+             update.insert(Update::DRAW);
+        }
+
+        // Process pending creates
+        for parent in pending_creates {
+             self.show_new_folder_dialog(parent, context.clone());
              update.insert(Update::DRAW);
         }
         
@@ -469,6 +647,59 @@ impl Widget for FileListWrapper {
                 let current_path = self.file_list.get_current_path();
                 self.file_list.set_path(current_path.clone());
                 update.insert(Update::LAYOUT | Update::DRAW);
+            }
+        }
+
+        // Process confirmed rename operations (from dialog)
+        if let Ok(mut pending) = self.pending_rename.lock() {
+            if let Some((path, new_name)) = pending.take() {
+                // Construct new path
+                if let Some(parent) = path.parent() {
+                    let new_path = parent.join(new_name);
+                    match operations::rename_path(path.clone(), new_path.clone()) {
+                        Ok(_) => {
+                            log::info!("Renamed: {:?} -> {:?}", path, new_path);
+                            if let Some(ref tx) = self.status_tx {
+                                let _ = tx.send("Renamed successfully".to_string());
+                            }
+                            // Refresh file list
+                            let current_path = self.file_list.get_current_path();
+                            self.file_list.set_path(current_path.clone());
+                            update.insert(Update::LAYOUT | Update::DRAW);
+                        }
+                        Err(e) => {
+                            log::error!("Failed to rename {:?} to {:?}: {}", path, new_path, e);
+                            if let Some(ref tx) = self.status_tx {
+                                let _ = tx.send(format!("Error: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process confirmed create directory operations (from dialog)
+        if let Ok(mut pending) = self.pending_create_dir.lock() {
+            if let Some((parent, name)) = pending.take() {
+                let new_dir = parent.join(name);
+                match operations::create_directory(new_dir.clone()) {
+                    Ok(_) => {
+                        log::info!("Created directory: {:?}", new_dir);
+                        if let Some(ref tx) = self.status_tx {
+                            let _ = tx.send("Directory created".to_string());
+                        }
+                        // Refresh file list
+                        let current_path = self.file_list.get_current_path();
+                        self.file_list.set_path(current_path.clone());
+                        update.insert(Update::LAYOUT | Update::DRAW);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to create directory {:?}: {}", new_dir, e);
+                        if let Some(ref tx) = self.status_tx {
+                            let _ = tx.send(format!("Error: {}", e));
+                        }
+                    }
+                }
             }
         }
         

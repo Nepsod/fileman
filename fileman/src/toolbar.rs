@@ -77,6 +77,7 @@ pub struct ToolbarWrapper {
     new_folder_requested: Arc<Mutex<bool>>,
     properties_requested: Arc<Mutex<bool>>,
     delete_requested: Arc<Mutex<bool>>,
+    rename_requested: Arc<Mutex<bool>>,
     view_mode_signal: nptk::core::signal::state::StateSignal<FileListViewMode>,
 }
 
@@ -154,8 +155,8 @@ impl ToolbarWrapper {
                     Update::DRAW
                 })))
             })
-            .with_tooltip("New folder")
-            .with_status_tip("Create a new folder in the current directory");
+            .with_tooltip("New Folder")
+            .with_status_tip("Create a new folder");
 
         let properties_requested = Arc::new(Mutex::new(false));
         let properties_btn = ToolbarButton::with_children(vec![
@@ -173,6 +174,24 @@ impl ToolbarWrapper {
             })
             .with_tooltip("Properties")
             .with_status_tip("Show properties of the selected items");
+
+        // Rename button
+        let rename_requested = Arc::new(Mutex::new(false));
+        let rename_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("edit-rename", 24, None)),
+            Box::new(Text::new("Rename".to_string()).with_font_size(14.0))
+        ])
+            .with_on_pressed({
+                let rename_flag = rename_requested.clone();
+                nptk::core::signal::MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                    if let Ok(mut flag) = rename_flag.lock() {
+                        *flag = true;
+                    }
+                    Update::DRAW
+                })))
+            })
+            .with_tooltip("Rename")
+            .with_status_tip("Rename selected item");
 
         // Delete button - read selected paths from signal directly
         let delete_requested = Arc::new(Mutex::new(false));
@@ -223,6 +242,7 @@ impl ToolbarWrapper {
             .with_child(new_folder_btn)
             .with_child(delete_btn)
             .with_separator()
+            .with_child(rename_btn)
             .with_child(properties_btn)
             .with_separator()
             .with_child(view_btn);
@@ -242,6 +262,7 @@ impl ToolbarWrapper {
             new_folder_requested,
             properties_requested,
             delete_requested,
+            rename_requested,
             view_mode_signal,
         };
 
@@ -339,11 +360,8 @@ impl Widget for ToolbarWrapper {
             if *flag {
                 *flag = false;
                 let current = (*self.navigation_path_signal.get()).clone();
-                let name = format!("New Folder {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-                let _ = self.operation_tx.send(FileOperationRequest::CreateDirectory {
-                    parent: current,
-                    name,
-                });
+                // Use PromptCreateDirectory instead of hardcoded logic
+                let _ = self.operation_tx.send(FileOperationRequest::PromptCreateDirectory(current));
                 update.insert(Update::LAYOUT | Update::DRAW);
             }
         }
@@ -355,6 +373,18 @@ impl Widget for ToolbarWrapper {
                 let selected_paths = (*self.selected_paths_signal.get()).clone();
                 if !selected_paths.is_empty() {
                     let _ = self.operation_tx.send(FileOperationRequest::Properties(selected_paths));
+                    update.insert(Update::LAYOUT | Update::DRAW);
+                }
+            }
+        }
+
+        // Handle rename button press
+        if let Ok(mut flag) = self.rename_requested.lock() {
+            if *flag {
+                *flag = false;
+                let selected_paths = (*self.selected_paths_signal.get()).clone();
+                if selected_paths.len() == 1 {
+                    let _ = self.operation_tx.send(FileOperationRequest::PromptRename(selected_paths[0].clone()));
                     update.insert(Update::LAYOUT | Update::DRAW);
                 }
             }

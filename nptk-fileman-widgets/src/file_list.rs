@@ -37,6 +37,7 @@ mod view_list;
 pub enum FileListOperation {
     Delete(Vec<PathBuf>),
     Properties(Vec<PathBuf>),
+    PromptRename(PathBuf),
 }
 
 use nptk::widgets::scroll_container::{ScrollContainer, ScrollDirection};

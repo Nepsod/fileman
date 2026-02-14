@@ -10,7 +10,7 @@ use nptk::services::{
     get_user_special_dir_path, UserDirectory,
     get_home_icon_name, get_directory_icon_name,
 };
-use nptk::services::bookmarks::BookmarksService;
+use nptk::services::bookmarks::{BookmarksService, Bookmark};
 use nptk::services::thumbnail::npio_adapter::uri_to_path;
 use nptk::core::app::info::AppInfo;
 use nptk::core::vgi::Graphics;
@@ -28,6 +28,7 @@ pub struct FilemanSidebarConfig {
     custom_sections: Vec<SidebarSection>,
     width: f32,
     use_symbolic_icons: bool,
+    bookmarks: Vec<Bookmark>,
 }
 
 impl Default for FilemanSidebarConfig {
@@ -47,6 +48,7 @@ impl Default for FilemanSidebarConfig {
             custom_sections: Vec::new(),
             width: 200.0,
             use_symbolic_icons: false,
+            bookmarks: Vec::new(),
         }
     }
 }
@@ -61,6 +63,7 @@ pub struct FilemanSidebar {
     navigation_tx: mpsc::UnboundedSender<PathBuf>,
     navigation_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
     bookmarks_service: Option<BookmarksService>,
+    bookmarks_rx: Option<mpsc::UnboundedReceiver<Vec<Bookmark>>>, // Channel for loaded bookmarks
     layout_style: MaybeSignal<LayoutStyle>,
 }
 
@@ -98,6 +101,7 @@ impl FilemanSidebar {
             navigation_tx: tx,
             navigation_rx: Some(rx),
             bookmarks_service: None,
+            bookmarks_rx: None,
             layout_style: LayoutStyle {
                 size: Vector2::new(Dimension::length(200.0), Dimension::percent(1.0)),
                 flex_shrink: 0.0, // Prevent sidebar from shrinking below its width
@@ -122,8 +126,36 @@ impl FilemanSidebar {
     /// Enable or disable the Bookmarks section.
     pub fn with_bookmarks(mut self, enabled: bool) -> Self {
         self.config.show_bookmarks = enabled;
-        if enabled && self.bookmarks_service.is_none() {
-            self.bookmarks_service = Some(BookmarksService::new());
+        if enabled {
+            // Initialize service if needed
+            if self.bookmarks_service.is_none() {
+                self.bookmarks_service = Some(BookmarksService::new());
+            }
+
+            // Create channel for loading results
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.bookmarks_rx = Some(rx);
+
+            // Spawn async loading task
+            // Clone service to load in background (creates new instance with same path)
+            // Note: BookmarksService::new() uses standard path. If custom path was set in original service,
+            // we should ideally clone that path. But BookmarksService fields are private.
+            // However, standard usage uses default path.
+            let tx_clone = tx.clone();
+            
+            // We use a fresh service instance for loading to avoid sharing mutable state across threads
+            // (Service isn't Clone/Send/Sync easily if it holds state, but BookmarksService is simple)
+            // Actually BookmarksService struct fields are private.
+            // Let's just create a new one with default path.
+            // If custom path is needed, we'd need to expose it or make service cloneable.
+            // Assuming default path for now.
+            tokio::spawn(async move {
+                let mut service = BookmarksService::new();
+                if let Ok(_) = service.load().await {
+                    let bookmarks = service.get_bookmarks();
+                    let _ = tx_clone.send(bookmarks);
+                }
+            });
         }
         self.rebuild_sidebar();
         self
@@ -336,19 +368,47 @@ impl FilemanSidebar {
     /// Returns None if bookmarks cannot be loaded or are empty.
     /// Note: Bookmark loading may be deferred to avoid blocking during widget construction.
     fn build_bookmarks_section(config: &FilemanSidebarConfig) -> Option<SidebarSection> {
-        // Skip synchronous bookmark loading during construction to avoid deadlocks.
-        // The issue is that when FilemanSidebar::new() is called, it happens during
-        // widget tree construction which may be in a tokio runtime context. Using
-        // smol::block_on() or tokio::block_on() here can cause deadlocks.
-        //
-        // Solution: Bookmarks should be loaded asynchronously after widget creation.
-        // For now, return None - the bookmarks section will be empty initially.
-        // TODO: Implement proper async bookmark loading that:
-        //   1. Creates sidebar with empty bookmarks section initially
-        //   2. Spawns async task to load bookmarks
-        //   3. Updates sidebar sections when bookmarks are loaded
-        log::debug!("Bookmarks section loading deferred to avoid blocking during construction");
-        None
+        if config.bookmarks.is_empty() {
+             return None;
+        }
+
+        let mut items = Vec::new();
+        for bookmark in &config.bookmarks {
+            let uri = &bookmark.uri;
+            let label = bookmark.name.clone().unwrap_or_else(|| {
+                // If no name, use last component of path
+                if let Some(path) = uri_to_path(uri) {
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Unknown".to_string())
+                } else {
+                    "Unknown".to_string()
+                }
+            });
+            
+            // Determine icon
+            // Use bookmark icon if available, else default folder icon
+            let icon = bookmark.icon.clone().unwrap_or_else(|| {
+                 get_directory_icon_name(UserDirectory::Documents, config.use_symbolic_icons).to_string()
+            });
+            
+            // Use folder-symbolic/folder as fallback if icon invalid?
+            // Actually get_directory_icon_name returns "folder-documents" etc.
+            // We'll just use "user-bookmarks-symbolic" or "folder" generic.
+            let display_icon = if config.use_symbolic_icons {
+                "user-bookmarks-symbolic"
+            } else {
+                "user-bookmarks"
+            };
+
+            items.push(
+                SidebarItem::new(label.clone().to_lowercase(), label)
+                    .with_icon(display_icon)
+                    .with_uri(uri.clone())
+            );
+        }
+
+        Some(SidebarSection::new("Bookmarks").with_items(items))
     }
 }
 
@@ -378,6 +438,16 @@ impl Widget for FilemanSidebar {
         // Note: The receiver should be taken and polled externally, but we can check here too
         // For now, just delegate to inner sidebar
         
+        // Poll for loaded bookmarks
+        if let Some(ref mut rx) = self.bookmarks_rx {
+             while let Ok(bookmarks) = rx.try_recv() {
+                self.config.bookmarks = bookmarks;
+                self.rebuild_sidebar();
+                // Ensure layout/draw after rebuild
+                return Update::LAYOUT | Update::DRAW;
+             }
+        }
+
         if !layout.children.is_empty() {
             self.inner.update(&layout.children[0], context, info).await
         } else {
