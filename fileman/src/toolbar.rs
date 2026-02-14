@@ -64,6 +64,7 @@ pub struct ToolbarWrapper {
     inner: Toolbar,
     navigation: Arc<Mutex<NavigationState>>,
     operation_tx: mpsc::UnboundedSender<FileOperationRequest>,
+    #[allow(dead_code)]
     navigation_tx: mpsc::UnboundedSender<NavigationAction>,
     navigation_rx: Option<mpsc::UnboundedReceiver<NavigationAction>>,
     // Reactive signals
@@ -248,15 +249,18 @@ impl ToolbarWrapper {
     }
 
     /// Get the navigation action sender for external use (e.g., from location bar)
+    #[allow(dead_code)]
     pub fn navigation_tx(&self) -> &mpsc::UnboundedSender<NavigationAction> {
         &self.navigation_tx
     }
 
     /// Get the operation sender for external use
+    #[allow(dead_code)]
     pub fn operation_tx(&self) -> &mpsc::UnboundedSender<FileOperationRequest> {
         &self.operation_tx
     }
 
+    #[allow(dead_code)]
     pub fn take_navigation_receiver(&mut self) -> Option<mpsc::UnboundedReceiver<NavigationAction>> {
         self.navigation_rx.take()
     }

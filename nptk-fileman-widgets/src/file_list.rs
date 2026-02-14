@@ -114,6 +114,10 @@ pub struct FileList {
     thumbnail_service: Arc<ThumbnailService>,
     icon_cache: Arc<Mutex<std::collections::HashMap<(PathBuf, u32), Option<npio::service::icon::CachedIcon>>>>,
     mime_registry: MimeRegistry,
+    pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
+    cache_update_tx: tokio::sync::mpsc::Sender<()>,
+    cache_update_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
+    svg_scene_cache: Arc<Mutex<std::collections::HashMap<String, (nptk::core::vg::Scene, f64, f64)>>>,
 }
 
 impl FileList {
@@ -186,6 +190,10 @@ impl FileList {
         
         // Create channel for cache update notifications (bounded to prevent unbounded growth)
         let (cache_update_tx, cache_update_rx) = tokio::sync::mpsc::channel(100);
+        let cache_update_rx = Arc::new(Mutex::new(cache_update_rx));
+
+        // Create pending thumbnails set
+        let pending_thumbnails = Arc::new(Mutex::new(HashSet::new()));
         
         // Create channel for cache invalidation requests
         let (cache_invalidate_tx, cache_invalidate_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -200,7 +208,10 @@ impl FileList {
 
         // Create icon cache to be shared between FileList and properties dialog
         let icon_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
-
+        
+        // Create SVG scene cache
+        let svg_scene_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        
         // Create content widget
         let content = FileListContent::new(
             entries.clone(),
@@ -213,8 +224,9 @@ impl FileList {
             thumbnail_service.clone(),
             icon_cache.clone(),
             thumbnail_event_rx,
-            cache_update_tx,
-            cache_update_rx,
+            cache_update_tx.clone(),
+            cache_update_rx.clone(),
+            pending_thumbnails.clone(),
             cache_invalidate_rx,
             operation_tx,
             selection_change_tx_arc.clone(),
@@ -256,6 +268,10 @@ impl FileList {
             thumbnail_service,
             icon_cache,
             mime_registry,
+            pending_thumbnails,
+            cache_update_tx,
+            cache_update_rx,
+            svg_scene_cache,
         }
     }
 
@@ -388,11 +404,24 @@ impl FileList {
             use crate::file_list::model_adapter::FileSystemItemModel;
             use nptk::widgets::item_view::{ItemView, ViewMode};
             
-            let model = Arc::new(FileSystemItemModel::new(self.entries.clone()));
+            let model = Arc::new(FileSystemItemModel::new(
+                self.entries.clone(),
+                self.icon_registry.clone(),
+                self.thumbnail_service.clone(),
+                self.icon_cache.clone(),
+                self.svg_scene_cache.clone(),
+                self.pending_thumbnails.clone(),
+                self.cache_update_tx.clone(),
+            ).with_icon_size(match *self.view_mode.get() {
+                FileListViewMode::List => 16,
+                FileListViewMode::Table => 16,
+                // For Icon/Compact mode we might need larger icons, but ItemView handles scaling or we need to update model size
+                FileListViewMode::Icon | FileListViewMode::Compact => *self.icon_size.get(),
+            }));
              
              // Setup ItemView with selection sync
             let selected_paths = self.selected_paths.clone();
-            let entries = self.entries.clone();
+            let _entries = self.entries.clone();
             let selection_change_tx = self.selection_change_tx.clone();
             let internal_selection_tx = self.internal_selection_tx.clone();
             
@@ -407,7 +436,7 @@ impl FileList {
             // Activation handling
             let entries_act = self.entries.clone();
             let current_path = self.current_path.clone();
-            let fs_model = self.fs_model.clone();
+            let _fs_model = self.fs_model.clone();
             
             // For selection callback, we need to avoid calling entries.get() during update
             // Store current entries in an Arc<RwLock> that can be safely accessed
@@ -418,7 +447,13 @@ impl FileList {
             let entries_for_menu = entries_for_selection.clone();
             let on_context_menu = self.on_context_menu.clone();
 
+            let effective_icon_size = self.view_mode.map(move |mode| match *mode {
+                FileListViewMode::List | FileListViewMode::Table => nptk::core::reference::Ref::Owned(16.0),
+                _ => nptk::core::reference::Ref::Owned(48.0), 
+            });
+
             let mut view = ItemView::new(model)
+                .with_icon_size(effective_icon_size)
                 .with_view_mode(MaybeSignal::signal(Box::new(view_mode_signal)))
                 .with_on_activate(move |index| {
                     let current_entries = entries_act.get();
@@ -850,7 +885,8 @@ impl FileListContent {
         icon_cache: Arc<Mutex<std::collections::HashMap<(PathBuf, u32), Option<npio::service::icon::CachedIcon>>>>,
         thumbnail_event_rx: tokio::sync::broadcast::Receiver<ThumbnailEvent>,
         cache_update_tx: tokio::sync::mpsc::Sender<()>,
-        cache_update_rx: tokio::sync::mpsc::Receiver<()>,
+        cache_update_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
+        pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
         cache_invalidate_rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
         operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
         selection_change_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
@@ -871,12 +907,12 @@ impl FileListContent {
             last_click_index: None,
             anchor_index: None,
             icon_cache,
-            pending_thumbnails: Arc::new(Mutex::new(HashSet::new())),
+            pending_thumbnails,
             thumbnail_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             thumbnail_event_rx: Arc::new(Mutex::new(thumbnail_event_rx)),
             update_manager: Arc::new(Mutex::new(None)),
             cache_update_tx,
-            cache_update_rx: Arc::new(Mutex::new(cache_update_rx)),
+            cache_update_rx,
             cache_invalidate_rx: Arc::new(Mutex::new(cache_invalidate_rx)),
             drag_start: None,
             current_drag_pos: None,
@@ -1288,7 +1324,7 @@ impl FileListContent {
 
 #[async_trait(?Send)]
 impl Widget for FileListContent {
-    fn layout_style(&self, context: &LayoutContext) -> StyleNode {
+    fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
         let view_mode = *self.view_mode.get();
         let entries = self.entries.get();
         let count = entries.len();
@@ -1328,6 +1364,21 @@ impl Widget for FileListContent {
     }
 
     async fn update(&mut self, layout: &LayoutNode, context: AppContext, info: &mut AppInfo) -> Update {
+        let mut update = Update::empty();
+        
+        // Poll for cache updates to trigger redraw when icons/thumbnails are loaded
+        // This is shared with FileListContent, but FileList needs to know to redraw ItemView
+        {
+            if let Ok(mut rx) = self.cache_update_rx.try_lock() {
+                let mut received = false;
+                while let Ok(_) = rx.try_recv() {
+                    received = true;
+                }
+                if received {
+                    update.insert(Update::DRAW);
+                }
+            }
+        }
         // Store update manager for async tasks to trigger redraws
         {
             let mut update_mgr = self.update_manager.lock().expect("Failed to lock update_manager");
@@ -1472,7 +1523,7 @@ impl Widget for FileListContent {
                                         cache.insert((path_clone, size_u32), thumbnail_image);
                                         
                                         // Trigger redraw when thumbnail is cached
-                                        if let Ok(mut update_mgr) = update_mgr_clone.lock() {
+                                        if let Ok(update_mgr) = update_mgr_clone.lock() {
                                             if let Some(ref update_manager) = *update_mgr {
                                                 update_manager.insert(Update::DRAW);
                                             }

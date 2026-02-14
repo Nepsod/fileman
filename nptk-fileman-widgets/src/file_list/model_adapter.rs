@@ -1,6 +1,11 @@
-use nptk::core::model::{ItemModel, ItemRole, ModelData, Orientation, SortOrder};
-use nptk::core::signal::state::StateSignal;
-use nptk::core::signal::Signal;
+use npio::service::icon::{IconRegistry, CachedIcon};
+use npio::service::thumbnail::ThumbnailService;
+use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use nptk::widgets::item_view::IconData;
+use nptk::core::model::{ModelData, ItemRole, Orientation, SortOrder, ItemModel};
+use nptk::prelude::{StateSignal, Signal};
 use nptk::services::filesystem::entry::FileEntry;
 use humansize::{format_size, BINARY};
 
@@ -8,11 +13,40 @@ use humansize::{format_size, BINARY};
 #[derive(Clone)]
 pub struct FileSystemItemModel {
     entries: StateSignal<Vec<FileEntry>>,
+    icon_registry: Arc<IconRegistry>,
+    thumbnail_service: Arc<ThumbnailService>,
+    icon_cache: Arc<Mutex<HashMap<(PathBuf, u32), Option<CachedIcon>>>>,
+    svg_scene_cache: Arc<Mutex<HashMap<String, (nptk::core::vg::Scene, f64, f64)>>>,
+    icon_size: u32,
+    pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
+    cache_update_tx: tokio::sync::mpsc::Sender<()>,
 }
 
 impl FileSystemItemModel {
-    pub fn new(entries: StateSignal<Vec<FileEntry>>) -> Self {
-        Self { entries }
+    pub fn new(
+        entries: StateSignal<Vec<FileEntry>>,
+        icon_registry: Arc<IconRegistry>,
+        thumbnail_service: Arc<ThumbnailService>,
+        icon_cache: Arc<Mutex<HashMap<(PathBuf, u32), Option<CachedIcon>>>>,
+        svg_scene_cache: Arc<Mutex<HashMap<String, (nptk::core::vg::Scene, f64, f64)>>>,
+        pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
+        cache_update_tx: tokio::sync::mpsc::Sender<()>,
+    ) -> Self {
+        Self { 
+            entries,
+            icon_registry,
+            thumbnail_service,
+            icon_cache,
+            svg_scene_cache,
+            icon_size: 16, // Default for list view
+            pending_thumbnails,
+            cache_update_tx,
+        }
+    }
+
+    pub fn with_icon_size(mut self, size: u32) -> Self {
+        self.icon_size = size;
+        self
     }
 }
 
@@ -48,11 +82,121 @@ impl ItemModel for FileSystemItemModel {
             },
             ItemRole::Icon => {
                 if col == 0 {
-                    if entry.is_dir() {
-                        ModelData::String("directory".to_string())
+                    // Check cache for icon
+                    let path = &entry.path;
+                    let size = self.icon_size;
+                    
+                    let cached = {
+                        let cache = self.icon_cache.lock().unwrap();
+                        cache.get(&(path.clone(), size)).cloned().flatten()
+                    };
+
+                    if let Some(icon) = cached {
+                        match icon {
+                            CachedIcon::Image { data, width, height } => {
+                                use nptk::core::vg::peniko::{Blob, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
+                                let image_data = ImageData {
+                                    data: Blob::from(data.to_vec()),
+                                    format: ImageFormat::Rgba8,
+                                    alpha_type: ImageAlphaType::Alpha,
+                                    width: width,
+                                    height: height,
+                                };
+                                let brush = ImageBrush::new(image_data);
+                                ModelData::Custom(Arc::new(IconData::Image(brush, width, height)))
+                            },
+                            CachedIcon::Svg(svg_source) => {
+                                let mut cache = self.svg_scene_cache.lock().unwrap();
+                                let (scene, width, height) = if let Some((s, w, h)) = cache.get(svg_source.as_str()) {
+                                    (s.clone(), *w, *h)
+                                } else {
+                                    use vello_svg::usvg::{
+                                        ImageRendering, Options, ShapeRendering, TextRendering, Tree,
+                                    };
+                                    if let Ok(tree) = Tree::from_str(
+                                        &svg_source,
+                                        &Options {
+                                            shape_rendering: ShapeRendering::GeometricPrecision,
+                                            text_rendering: TextRendering::OptimizeLegibility,
+                                            image_rendering: ImageRendering::OptimizeSpeed,
+                                            ..Default::default()
+                                        },
+                                    ) {
+                                        let scene = vello_svg::render_tree(&tree);
+                                        let size = tree.size();
+                                        let w = size.width() as f64;
+                                        let h = size.height() as f64;
+                                        cache.insert(svg_source.to_string(), (scene.clone(), w, h));
+                                        (scene, w, h)
+                                    } else {
+                                        // Invalid SVG
+                                        return ModelData::None;
+                                    }
+                                };
+                                ModelData::Custom(Arc::new(IconData::Scene(scene, width, height)))
+                            },
+                            CachedIcon::Path(_) => {
+                                // Should be handled by pending logic or ignored
+                                ModelData::None
+                            }
+                        }
                     } else {
-                        // TODO: Map mime types to icon names
-                        ModelData::String("file".to_string())
+                        // Not cached, check if pending
+                        let is_pending = {
+                            let pending = self.pending_thumbnails.lock().unwrap();
+                            pending.contains(path)
+                        };
+
+                        if !is_pending {
+                            // Mark as pending
+                            {
+                                let mut pending = self.pending_thumbnails.lock().unwrap();
+                                pending.insert(path.clone());
+                            }
+
+                            // Spawn load task
+                            let registry = self.icon_registry.clone();
+                            let _thumbnail_service = self.thumbnail_service.clone();
+                            let icon_cache = self.icon_cache.clone();
+                            let pending_thumbnails = self.pending_thumbnails.clone();
+                            let cache_update_tx = self.cache_update_tx.clone();
+                            let path_clone = path.clone();
+                            let size = self.icon_size;
+                            let is_dir = entry.is_dir();
+
+                            tokio::spawn(async move {
+                                let icon = if is_dir {
+                                    // Use directory icon
+                                    registry.get_icon("folder", size)
+                                } else {
+                                     // For now, assume generic file or use fallback
+                                     // Real implementation would use mime provider or similar
+                                     registry.get_icon("text-x-generic", size)
+                                };
+                                
+                                // Mock load for now - real impl needs proper async icon loading
+                                // Just remove from pending to allow retry or "loaded" state
+                                {
+                                    let mut pending = pending_thumbnails.lock().unwrap();
+                                    pending.remove(&path_clone);
+                                }
+                                
+                                // Update cache
+                                {
+                                    let mut cache = icon_cache.lock().unwrap();
+                                    cache.insert((path_clone.clone(), size), icon);
+                                }
+
+                                // Trigger redraw
+                                let _ = cache_update_tx.send(()).await;
+                            });
+                        }
+
+                         if entry.is_dir() {
+                            ModelData::String("directory".to_string())
+                        } else {
+                            ModelData::String("file".to_string())
+                        }
                     }
                 } else {
                     ModelData::None

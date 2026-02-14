@@ -8,6 +8,7 @@ pub fn create_directory(path: PathBuf) -> Result<(), String> {
 }
 
 /// Create a new file
+#[allow(dead_code)]
 pub fn create_file(path: PathBuf) -> Result<(), String> {
     fs::File::create(&path)
         .map_err(|e| format!("Failed to create file: {}", e))?;
@@ -35,6 +36,7 @@ pub fn rename_path(from: PathBuf, to: PathBuf) -> Result<(), String> {
 }
 
 /// Copy a file
+#[allow(dead_code)]
 pub fn copy_file(from: PathBuf, to: PathBuf) -> Result<(), String> {
     fs::copy(&from, &to)
         .map_err(|e| format!("Failed to copy file: {}", e))?;
