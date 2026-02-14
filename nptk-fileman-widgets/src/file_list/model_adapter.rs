@@ -19,7 +19,7 @@ pub struct FileSystemItemModel {
     thumbnail_service: Arc<ThumbnailService>,
     icon_cache: Arc<Mutex<HashMap<(PathBuf, u32), Option<CachedIcon>>>>,
     svg_scene_cache: Arc<Mutex<HashMap<String, (nptk::core::vg::Scene, f64, f64)>>>,
-    icon_size: u32,
+    icon_size: nptk::core::signal::MaybeSignal<f32>,
     pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
     cache_update_tx: tokio::sync::mpsc::Sender<()>,
 }
@@ -40,14 +40,14 @@ impl FileSystemItemModel {
             thumbnail_service,
             icon_cache,
             svg_scene_cache,
-            icon_size: 16, // Default for list view
+            icon_size: nptk::core::signal::MaybeSignal::value(16.0), // Default for list view
             pending_thumbnails,
             cache_update_tx,
         }
     }
 
-    pub fn with_icon_size(mut self, size: u32) -> Self {
-        self.icon_size = size;
+    pub fn with_icon_size(mut self, size: impl Into<nptk::core::signal::MaybeSignal<f32>>) -> Self {
+        self.icon_size = size.into();
         self
     }
 }
@@ -86,7 +86,7 @@ impl ItemModel for FileSystemItemModel {
                 if col == 0 {
                     // Check cache for icon
                     let path = &entry.path;
-                    let size = self.icon_size;
+                    let size = *self.icon_size.get() as u32;
                     
                     let cached = {
                         let cache = self.icon_cache.lock().unwrap();
@@ -163,19 +163,21 @@ impl ItemModel for FileSystemItemModel {
                             let pending_thumbnails = self.pending_thumbnails.clone();
                             let cache_update_tx = self.cache_update_tx.clone();
                             let path_clone = path.clone();
-                            let size = self.icon_size;
+                            let size = self.icon_size.clone();
                             let is_dir = entry.is_dir();
+                            // Get current size from signal
+                            let size_val = *size.get() as u32;
 
                             tokio::spawn(async move {
                                 let icon = if is_dir {
                                     // Use directory icon
-                                    registry.get_icon("folder", size)
+                                    registry.get_icon("folder", size_val)
                                 } else {
                                     // Try to load thumbnail
                                     let file = LocalFile::new(path_clone.clone());
                                     
                                     // Determine thumbnail size
-                                    let thumb_size = if size > 128 {
+                                    let thumb_size = if size_val > 128 {
                                         NpioThumbnailSize::Large
                                     } else {
                                         NpioThumbnailSize::Normal
@@ -198,9 +200,8 @@ impl ItemModel for FileSystemItemModel {
                                     if let Some(i) = loaded_icon {
                                         Some(i)
                                     } else {
-                                        // Fallback to generic icon
-                                        // Real implementation would use mime provider or similar
-                                        registry.get_icon("text-x-generic", size)
+                                        // Fallback to generic icon via registry (uses MIME detection)
+                                        registry.get_file_icon(&file, size_val).await
                                     }
                                 };
                                 
@@ -213,7 +214,7 @@ impl ItemModel for FileSystemItemModel {
                                 // Update cache
                                 {
                                     let mut cache = icon_cache.lock().unwrap();
-                                    cache.insert((path_clone.clone(), size), icon);
+                                    cache.insert((path_clone.clone(), size_val), icon);
                                 }
 
                                 // Trigger redraw

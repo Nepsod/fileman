@@ -404,6 +404,17 @@ impl FileList {
             use crate::file_list::model_adapter::FileSystemItemModel;
             use nptk::widgets::item_view::{ItemView, ViewMode};
             
+            let icon_size_clone = self.icon_size.clone();
+            let entries_act_clone = self.entries.clone();
+            let effective_icon_size = self.view_mode.map(move |mode| match *mode {
+                FileListViewMode::List | FileListViewMode::Table => nptk::core::reference::Ref::Owned(16.0),
+                FileListViewMode::Icon | FileListViewMode::Compact => nptk::core::reference::Ref::Owned(*icon_size_clone.get() as f32),
+            });
+
+            // We need a signal for the model too that matches effective_icon_size
+            // Since effective_icon_size is a MapSignal, we can clone it.
+            let model_icon_size = effective_icon_size.clone();
+
             let model = Arc::new(FileSystemItemModel::new(
                 self.entries.clone(),
                 self.icon_registry.clone(),
@@ -412,12 +423,7 @@ impl FileList {
                 self.svg_scene_cache.clone(),
                 self.pending_thumbnails.clone(),
                 self.cache_update_tx.clone(),
-            ).with_icon_size(match *self.view_mode.get() {
-                FileListViewMode::List => 16,
-                FileListViewMode::Table => 16,
-                // For Icon/Compact mode we might need larger icons, but ItemView handles scaling or we need to update model size
-                FileListViewMode::Icon | FileListViewMode::Compact => *self.icon_size.get(),
-            }));
+            ).with_icon_size(model_icon_size));
              
              // Setup ItemView with selection sync
             let selected_paths = self.selected_paths.clone();
@@ -446,11 +452,6 @@ impl FileList {
             // Context menu handling
             let entries_for_menu = entries_for_selection.clone();
             let on_context_menu = self.on_context_menu.clone();
-
-            let effective_icon_size = self.view_mode.map(move |mode| match *mode {
-                FileListViewMode::List | FileListViewMode::Table => nptk::core::reference::Ref::Owned(16.0),
-                _ => nptk::core::reference::Ref::Owned(48.0), 
-            });
 
             let mut view = ItemView::new(model)
                 .with_icon_size(effective_icon_size)
