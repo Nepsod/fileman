@@ -1,11 +1,11 @@
 use nptk::prelude::*;
 use async_trait::async_trait;
 use nptk::core::signal::eval::EvalSignal;
-use nptk::core::shortcut::{Shortcut, ShortcutRegistry};
+use nptk::core::shortcut::Shortcut;
 use nptk::core::window::KeyCode;
 use nptk_fileman_widgets::file_list::{FileList, FileListOperation};
 use nptk_fileman_widgets::FilemanSidebar;
-use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem};
+// use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem}; // Unused
 use crate::app::AppState;
 use crate::operations;
 use std::path::PathBuf;
@@ -13,8 +13,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 use nalgebra::Vector2;
-use nptk::core::vg::peniko::Color;
-use nptk::core::layout::Rect as LayoutRect;
 use nptk::core::menu::unified::{MenuTemplate, MenuItem};
 use nptk::core::menu::MenuCommand;
 use nptk::core::vg::kurbo::Point;
@@ -23,8 +21,8 @@ use nptk::core::vg::kurbo::Point;
 #[derive(Debug, Clone)]
 pub enum FileOperationRequest {
     Delete(Vec<PathBuf>),
-    CreateDirectory { parent: PathBuf, name: String },
-    Rename { from: PathBuf, to: PathBuf },
+    // CreateDirectory { parent: PathBuf, name: String }, // Unused
+    // Rename { from: PathBuf, to: PathBuf }, // Unused
     PromptRename(PathBuf), // Prompt for new name for single file
     PromptCreateDirectory(PathBuf), // Prompt for new directory name in parent
     Properties(Vec<PathBuf>),
@@ -526,10 +524,10 @@ impl Widget for FileListWrapper {
             while let Ok(op) = rx.try_recv() {
                 match op {
                     FileOperationRequest::Delete(paths) => {
-                        // Collect delete requests to show confirmation dialog
                         log::warn!("RECEIVED DELETE REQUEST for {} path(s)", paths.len());
                         pending_deletes.push(paths);
                     }
+                    /*
                     FileOperationRequest::CreateDirectory { parent, name } => {
                         let new_dir = parent.join(&name);
                         match operations::create_directory(new_dir.clone()) {
@@ -571,6 +569,7 @@ impl Widget for FileListWrapper {
                             }
                         }
                     }
+                    */
                     FileOperationRequest::Properties(paths) => {
                         // Collect properties requests
                         pending_properties.push(paths);
@@ -723,45 +722,11 @@ impl WidgetLayoutExt for FileListWrapper {
     }
 }
 
-/// Helper function to convert PathBuf to breadcrumb items
-fn path_to_breadcrumb_items(path: &PathBuf) -> Vec<BreadcrumbItem> {
-    let mut items = Vec::new();
-    let mut current_path = PathBuf::new();
-    
-    // Handle root path
-    if path.has_root() {
-        items.push(BreadcrumbItem::new("/").with_id("/".to_string()));
-        current_path.push("/");
-    }
-    
-    // Add each component
-    for component in path.components() {
-        if let std::path::Component::Normal(name) = component {
-            current_path.push(name);
-            let label = name.to_string_lossy().to_string();
-            let id = current_path.to_string_lossy().to_string();
-            items.push(BreadcrumbItem::new(label).with_id(id));
-        }
-    }
-    
-    // Last item is not clickable (current location)
-    if let Some(last) = items.last_mut() {
-        last.clickable = false;
-    }
-    
-    items
-}
+
 
 // LocationBarWrapper removed (replaced by FileLocationBar)
 
-/// Status update information
-#[derive(Clone, Debug)]
-pub struct StatusUpdate {
-    pub message: Option<String>, // Temporary message (operation result, error, etc.)
-    pub path: Option<PathBuf>,   // Current path
-    pub file_count: Option<usize>, // Total file count
-    pub selection_count: Option<usize>, // Selected file count
-}
+
 
 // StatusBarWrapper removed (replaced by FileStatusBar)
 
@@ -820,7 +785,7 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     let selected_paths_signal = file_list_wrapper.selected_paths_signal().clone();
 
     // Create ToolbarWrapper
-    let (mut toolbar_wrapper, toolbar_nav_tx) = crate::toolbar::ToolbarWrapper::new(
+    let (toolbar_wrapper, toolbar_nav_tx) = crate::toolbar::ToolbarWrapper::new(
         nav_clone.clone(),
         operation_tx.clone(),
         navigation_path_signal.clone(),

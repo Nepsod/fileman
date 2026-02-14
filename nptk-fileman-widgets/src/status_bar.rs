@@ -58,14 +58,14 @@ impl FileStatusBar {
         self
     }
     
-    fn update_status_from_navigation(&mut self) {
+    fn update_status_from_navigation(&mut self) -> bool {
          // Check if timeout expired for status messages
         if let Some(timeout) = self.status_message_timeout {
             if timeout.elapsed() > std::time::Duration::from_secs(3) {
                 self.status_message_timeout = None;
                 // Timeout expired, fall through to show normal status
             } else {
-                return; // Timeout active, keep showing message
+                return false; // Timeout active, keep showing message (no change from nav)
             }
         }
         
@@ -84,7 +84,9 @@ impl FileStatusBar {
         let current_status = (*self.status_text.get()).clone();
         if current_status != status_msg {
             self.status_text.set(status_msg);
+            return true;
         }
+        false
     }
 }
 
@@ -139,11 +141,9 @@ impl Widget for FileStatusBar {
                 update.insert(Update::DRAW);
             } else {
                 // No framework status text - update status from navigation
-                self.update_status_from_navigation();
-                // Check if status text actually changed to trigger draw? 
-                // update_status_from_navigation sets signal, which triggers global update loop if hooked, 
-                // but we might want to be explicit.
-                 update.insert(Update::DRAW); // TODO: Optimize this
+                if self.update_status_from_navigation() {
+                    update.insert(Update::DRAW);
+                }
             }
         }
         

@@ -4,7 +4,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use async_trait::async_trait;
 use nptk::core::signal::state::StateSignal;
-use nptk::core::signal::MaybeSignal;
 use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem};
 use nptk::widgets::text_input::TextInput;
 

@@ -10,7 +10,7 @@ use nptk::core::menu::{MenuTemplate, MenuItem, MenuCommand};
 use nptk::core::signal::{state::StateSignal, MaybeSignal, Signal};
 use nptk::core::text_render::TextRenderContext;
 use nptk::core::vg::kurbo::{Affine, Point, Rect, Shape, Stroke, Vec2};
-use nptk::core::vg::peniko::{Brush, Color, Fill};
+use nptk::core::vg::peniko::{Brush, Fill};
 use nptk::core::vgi::Graphics;
 use nptk::core::widget::{BoxedWidget, Widget, WidgetLayoutExt};
 use nptk::core::window::{ElementState, MouseButton};
@@ -21,7 +21,7 @@ use npio::service::icon::IconRegistry;
 use npio::{ThumbnailService, ThumbnailEvent, ThumbnailImage, get_file_for_uri, register_backend};
 use npio::backend::local::LocalBackend;
 use nptk::services::thumbnail::npio_adapter::{uri_to_path, thumbnail_size_to_u32};
-use nptk::core::theme::{ColorRole, Palette};
+use nptk::core::theme::ColorRole;
 use std::collections::HashSet;
 use tokio::{sync::broadcast, time::{Duration, Instant}};
 
@@ -117,7 +117,7 @@ pub struct FileList {
     mime_registry: MimeRegistry,
     pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
     cache_update_tx: tokio::sync::mpsc::Sender<()>,
-    cache_update_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
+    // cache_update_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
     svg_scene_cache: Arc<Mutex<std::collections::HashMap<String, (nptk::core::vg::Scene, f64, f64)>>>,
 }
 
@@ -172,9 +172,6 @@ impl FileList {
         let icon_size = StateSignal::new(48);
 
         // Create icon registry
-        let icon_registry =
-            Arc::new(IconRegistry::new().unwrap_or_else(|_| IconRegistry::default()));
-
         let icon_registry =
             Arc::new(IconRegistry::new().unwrap_or_else(|_| IconRegistry::default()));
 
@@ -271,7 +268,7 @@ impl FileList {
             mime_registry,
             pending_thumbnails,
             cache_update_tx,
-            cache_update_rx,
+            // cache_update_rx,
             svg_scene_cache,
         }
     }
@@ -406,7 +403,7 @@ impl FileList {
             use nptk::widgets::item_view::{ItemView, ViewMode};
             
             let icon_size_clone = self.icon_size.clone();
-            let entries_act_clone = self.entries.clone();
+            let _entries_act_clone = self.entries.clone();
             let effective_icon_size = self.view_mode.map(move |mode| match *mode {
                 FileListViewMode::List | FileListViewMode::Table => nptk::core::reference::Ref::Owned(16.0),
                 FileListViewMode::Icon | FileListViewMode::Compact => nptk::core::reference::Ref::Owned(*icon_size_clone.get() as f32),
@@ -427,7 +424,7 @@ impl FileList {
             ).with_icon_size(model_icon_size));
              
              // Setup ItemView with selection sync
-            let selected_paths = self.selected_paths.clone();
+            let _selected_paths = self.selected_paths.clone();
             let _entries = self.entries.clone();
             let selection_change_tx = self.selection_change_tx.clone();
             let internal_selection_tx = self.internal_selection_tx.clone();
@@ -1569,6 +1566,7 @@ impl Widget for FileListContent {
                 && local_y >= 0.0
                 && local_y < layout.layout.size.height;
 
+            #[allow(unused_assignments)]
             let mut index: Option<usize> = None;
             let mut target_path: Option<PathBuf> = None;
             let mut range_paths: Option<Vec<PathBuf>> = None;

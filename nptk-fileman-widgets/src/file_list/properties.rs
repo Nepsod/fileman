@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use super::FileListContent;
-use nptk::prelude::{LayoutContext, LengthPercentage};
+use nptk::prelude::LayoutContext;
 use nptk::widgets::file_icon::renderer::{render_image_icon, render_svg_icon_with_arc_cache};
 use nptk::widgets::tabs_container::{TabItem, TabsContainer};
 use chrono::{DateTime, Local};
@@ -12,8 +12,7 @@ use nptk::core::app::update::Update;
 use nptk::core::layout::{Dimension, LayoutNode, LayoutStyle, StyleNode};
 use nptk::core::text_render::TextRenderContext;
 use nptk::core::vg::kurbo::{Affine, Rect, Vec2, Shape};
-use nptk::core::vg::peniko::{Blob, Brush, Color, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
-use nptk::core::vg::Scene;
+use nptk::core::vg::peniko::{Blob, Brush, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
 use nptk::core::vgi::Graphics;
 use nptk::core::widget::{BoxedWidget, Widget, WidgetLayoutExt};
 use nptk::services::filesystem::entry::{FileEntry, FileMetadata, FileType};
@@ -21,7 +20,7 @@ use npio::service::filesystem::mime_detector::MimeDetector;
 use npio::service::icon::IconRegistry;
 use nptk::services::thumbnail::npio_adapter::{file_entry_to_uri, u32_to_thumbnail_size};
 use npio::{ThumbnailService, get_file_for_uri};
-use nptk::core::theme::{ColorRole, Palette};
+use nptk::core::theme::ColorRole;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -134,8 +133,8 @@ impl FileListContent {
             (format!("{} items", count), "MULTI".to_string())
         };
 
-        let title_clone = title.clone();
-        let rows_clone = rows.clone();
+        let _title_clone = title.clone();
+        let _rows_clone = rows.clone();
         let data = PropertiesData {
             title,
             icon_label,
@@ -464,9 +463,9 @@ impl Widget for PropertiesContent {
             let icon_names = ["document-multiple", "folder-multiple", "document", "folder"];
             for icon_name in &icon_names {
                 if let Some(icon) = self.icon_registry.get_icon(icon_name, icon_size as u32) {
-                    let icon_x = icon_rect.x0;
-                    let icon_y = icon_rect.y0;
-                    let icon_size_f64 = icon_rect.width().min(icon_rect.height());
+                    let _icon_x = icon_rect.x0;
+                    let _icon_y = icon_rect.y0;
+                    let _icon_size_f64 = icon_rect.width().min(icon_rect.height());
 
                     match icon {
                         npio::service::icon::CachedIcon::Image {

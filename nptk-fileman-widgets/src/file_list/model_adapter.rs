@@ -1,7 +1,6 @@
 use npio::service::icon::{IconRegistry, CachedIcon};
 use npio::{ThumbnailService, ThumbnailSize as NpioThumbnailSize};
 use npio::file::local::LocalFile;
-use npio::file::File;
 use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

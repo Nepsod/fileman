@@ -14,7 +14,6 @@ use nptk::services::bookmarks::{BookmarksService, Bookmark};
 use nptk::services::thumbnail::npio_adapter::uri_to_path;
 use nptk::core::app::info::AppInfo;
 use nptk::core::vgi::Graphics;
-use nptk::core::theme::{ColorRole, Palette};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
@@ -183,7 +182,7 @@ impl FilemanSidebar {
     }
 
     /// Set the width of the sidebar.
-    pub fn with_width(mut self, width: f32) -> Self {
+    pub fn with_width(self, width: f32) -> Self {
         self.apply_with(|s| {
             s.config.width = width;
             s.layout_style = LayoutStyle {
@@ -196,7 +195,7 @@ impl FilemanSidebar {
     }
 
     /// Use symbolic icons instead of regular icons.
-    pub fn with_symbolic_icons(mut self, symbolic: bool) -> Self {
+    pub fn with_symbolic_icons(self, symbolic: bool) -> Self {
         self.apply_with(|s| s.config.use_symbolic_icons = symbolic)
     }
 
@@ -388,7 +387,7 @@ impl FilemanSidebar {
             
             // Determine icon
             // Use bookmark icon if available, else default folder icon
-            let icon = bookmark.icon.clone().unwrap_or_else(|| {
+            let _icon = bookmark.icon.clone().unwrap_or_else(|| {
                  get_directory_icon_name(UserDirectory::Documents, config.use_symbolic_icons).to_string()
             });
             
