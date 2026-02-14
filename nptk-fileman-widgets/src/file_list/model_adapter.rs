@@ -1,5 +1,7 @@
 use npio::service::icon::{IconRegistry, CachedIcon};
-use npio::service::thumbnail::ThumbnailService;
+use npio::{ThumbnailService, ThumbnailSize as NpioThumbnailSize};
+use npio::file::local::LocalFile;
+use npio::file::File;
 use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -156,7 +158,7 @@ impl ItemModel for FileSystemItemModel {
 
                             // Spawn load task
                             let registry = self.icon_registry.clone();
-                            let _thumbnail_service = self.thumbnail_service.clone();
+                            let thumbnail_service = self.thumbnail_service.clone();
                             let icon_cache = self.icon_cache.clone();
                             let pending_thumbnails = self.pending_thumbnails.clone();
                             let cache_update_tx = self.cache_update_tx.clone();
@@ -169,13 +171,40 @@ impl ItemModel for FileSystemItemModel {
                                     // Use directory icon
                                     registry.get_icon("folder", size)
                                 } else {
-                                     // For now, assume generic file or use fallback
-                                     // Real implementation would use mime provider or similar
-                                     registry.get_icon("text-x-generic", size)
+                                    // Try to load thumbnail
+                                    let file = LocalFile::new(path_clone.clone());
+                                    
+                                    // Determine thumbnail size
+                                    let thumb_size = if size > 128 {
+                                        NpioThumbnailSize::Large
+                                    } else {
+                                        NpioThumbnailSize::Normal
+                                    };
+
+                                    let mut loaded_icon = None;
+
+                                    if let Ok(supported) = thumbnail_service.is_supported(&file, None).await {
+                                        if supported {
+                                            if let Ok(image) = thumbnail_service.get_thumbnail_image(&file, thumb_size, None).await {
+                                                loaded_icon = Some(CachedIcon::Image {
+                                                    width: image.width,
+                                                    height: image.height,
+                                                    data: Arc::new(image.data),
+                                                });
+                                            }
+                                        }
+                                    }
+                                    
+                                    if let Some(i) = loaded_icon {
+                                        Some(i)
+                                    } else {
+                                        // Fallback to generic icon
+                                        // Real implementation would use mime provider or similar
+                                        registry.get_icon("text-x-generic", size)
+                                    }
                                 };
                                 
-                                // Mock load for now - real impl needs proper async icon loading
-                                // Just remove from pending to allow retry or "loaded" state
+                                // Remove from pending
                                 {
                                     let mut pending = pending_thumbnails.lock().unwrap();
                                     pending.remove(&path_clone);
