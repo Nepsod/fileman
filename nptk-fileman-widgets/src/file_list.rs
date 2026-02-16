@@ -468,13 +468,11 @@ impl FileList {
             let current_path = self.current_path.clone();
             let _fs_model = self.fs_model.clone();
             
-            // For selection callback, we need to avoid calling entries.get() during update
-            // Store current entries in an Arc<RwLock> that can be safely accessed
-            let entries_for_selection = Arc::new(std::sync::RwLock::new(self.entries.get().clone()));
-            let entries_for_selection_clone = entries_for_selection.clone();
+            // Clone entries signal for callbacks
+            let entries_selection = self.entries.clone();
+            let entries_menu = self.entries.clone();
             
             // Context menu handling
-            let entries_for_menu = entries_for_selection.clone();
             let on_context_menu = self.on_context_menu.clone();
 
             let mut view = ItemView::new(model)
@@ -497,11 +495,7 @@ impl FileList {
                     // IMPORTANT: Do NOT call signal.set() here - it causes deadlock!
                     // Instead, send via channel and let FileList::update handle it
                     
-                    let current_entries = if let Ok(entries) = entries_for_selection_clone.read() {
-                        entries.clone()
-                    } else {
-                        Vec::new()
-                    };
+                    let current_entries = entries_selection.get();
                     
                     let mut new_paths = Vec::new();
                     for idx in indices {
@@ -525,11 +519,10 @@ impl FileList {
                 
             if let Some(cb) = on_context_menu {
                 view = view.with_on_context_menu(move |index, pos, context| {
-                    if let Ok(entries) = entries_for_menu.read() {
-                        if index < entries.len() {
-                            let path = entries[index].path.clone();
-                            return cb(path, pos, context);
-                        }
+                    let entries = entries_menu.get();
+                     if index < entries.len() {
+                        let path = entries[index].path.clone();
+                        return cb(path, pos, context);
                     }
                     Update::empty()
                 });
@@ -549,11 +542,21 @@ impl FileList {
             
             // Set layout style to fill parent
             view.set_layout_style(LayoutStyle {
+                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+                ..Default::default()
+            });
+
+            let mut scroll_container = ScrollContainer::new()
+                .with_child(view)
+                .with_scroll_direction(ScrollDirection::Vertical);
+            
+             // Set ScrollContainer style to fill parent
+             scroll_container.set_layout_style(LayoutStyle {
                 size: Vector2::new(Dimension::percent(1.0), Dimension::percent(1.0)),
                 ..Default::default()
             });
             
-            self.item_view = Some(Box::new(view));
+            self.item_view = Some(Box::new(scroll_container));
         }
     }
 
@@ -672,8 +675,8 @@ impl Widget for FileList {
     fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
         let mode = *self.view_mode.get();
         
-        // For Table/List modes with ItemView, use ItemView's layout
-        if (mode == FileListViewMode::Table || mode == FileListViewMode::List) && self.item_view.is_some() {
+        // Always use ItemView if available
+        if self.item_view.is_some() {
             if let Some(ref view) = self.item_view {
                 return StyleNode {
                     style: self.layout_style.get().clone(),
@@ -692,6 +695,12 @@ impl Widget for FileList {
     }
 
     async fn update(&mut self, layout: &LayoutNode, context: AppContext, info: &mut AppInfo) -> Update {
+        let mode = *self.view_mode.get();
+        println!("FileList::update: mode={:?}, layout_children={}", mode, layout.children.len());
+        
+        // Ensure ItemView is initialized for all view modes
+        self.ensure_item_view();
+
         // Hook signals on first update to make them reactive
         if !self.signals_hooked {
             context.hook_signal(&mut self.entries);
@@ -906,10 +915,13 @@ impl Widget for FileList {
 
 
         // Update child (ScrollContainer)
+        // Update active child
         if !layout.children.is_empty() {
-            update |= self
-                .scroll_container
-                .update(&layout.children[0], context.clone(), info).await;
+            if let Some(ref mut view) = self.item_view {
+                 update |= view.update(&layout.children[0], context.clone(), info).await;
+            } else {
+                 update |= self.scroll_container.update(&layout.children[0], context.clone(), info).await;
+            }
         }
 
         update
@@ -922,18 +934,37 @@ impl Widget for FileList {
         info: &mut AppInfo,
         context: AppContext,
     ) {
+        // Draw background for the file list
+        let rect = Rect::new(
+            layout.layout.location.x as f64,
+            layout.layout.location.y as f64,
+            (layout.layout.location.x + layout.layout.size.width) as f64,
+            (layout.layout.location.y + layout.layout.size.height) as f64,
+        );
+
+        let palette = context.palette();
+        let bg_color = palette.color(ColorRole::Base); // Use Base color for file list background
+
+        graphics.fill(
+             nptk::core::vg::peniko::Fill::NonZero,
+             Affine::IDENTITY,
+             &Brush::Solid(bg_color),
+             None,
+             &rect.to_path(0.1)
+        );
+
         let mode = *self.view_mode.get();
         if mode == FileListViewMode::Table || mode == FileListViewMode::List {
-            if let Some(ref mut view) = self.item_view {
+             if let Some(ref mut view) = self.item_view {
                 // ItemView is a child in the layout tree, so use layout.children[0]
                 if !layout.children.is_empty() {
-                    view.render(graphics, &layout.children[0], info, context);
+                    view.render(graphics, &layout.children[0], info, context.clone());
                     return;
                 }
             }
         }
         
-        // Render ScrollContainer
+        // Render ScrollContainer (fallback or for other modes if ItemView not used)
         if !layout.children.is_empty() {
             self.scroll_container
                 .render(graphics, &layout.children[0], info, context);
