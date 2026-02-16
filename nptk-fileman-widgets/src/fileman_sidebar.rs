@@ -16,6 +16,10 @@ use nptk::core::app::info::AppInfo;
 use nptk::core::vgi::Graphics;
 use std::path::PathBuf;
 use tokio::sync::mpsc;
+use std::sync::Arc;
+use npio::service::volumemonitor::VolumeMonitor;
+// use npio::mount::Mount; // Unused
+// use npio::volume::Volume; // Unused
 
 /// Configuration for FilemanSidebar
 #[derive(Debug, Clone)]
@@ -28,6 +32,7 @@ pub struct FilemanSidebarConfig {
     width: f32,
     use_symbolic_icons: bool,
     bookmarks: Vec<Bookmark>,
+    devices: Vec<SidebarItem>,
 }
 
 impl Default for FilemanSidebarConfig {
@@ -48,6 +53,7 @@ impl Default for FilemanSidebarConfig {
             width: 200.0,
             use_symbolic_icons: false,
             bookmarks: Vec::new(),
+            devices: Vec::new(),
         }
     }
 }
@@ -63,7 +69,10 @@ pub struct FilemanSidebar {
     navigation_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
     bookmarks_service: Option<BookmarksService>,
     bookmarks_rx: Option<mpsc::UnboundedReceiver<Vec<Bookmark>>>, // Channel for loaded bookmarks
+    devices_rx: Option<mpsc::UnboundedReceiver<Vec<SidebarItem>>>, // Channel for loaded devices
     layout_style: MaybeSignal<LayoutStyle>,
+    current_path: StateSignal<PathBuf>,
+    last_path: Option<PathBuf>,
 }
 
 impl FilemanSidebar {
@@ -101,12 +110,15 @@ impl FilemanSidebar {
             navigation_rx: Some(rx),
             bookmarks_service: None,
             bookmarks_rx: None,
+            devices_rx: None,
             layout_style: LayoutStyle {
                 size: Vector2::new(Dimension::length(200.0), Dimension::percent(1.0)),
                 flex_shrink: 0.0, // Prevent sidebar from shrinking below its width
                 ..Default::default()
             }
             .into(),
+            current_path: StateSignal::new(PathBuf::new()),
+            last_path: None,
         }
     }
 
@@ -163,7 +175,135 @@ impl FilemanSidebar {
     /// Enable or disable the Devices section.
     pub fn with_devices(mut self, enabled: bool) -> Self {
         self.config.show_devices = enabled;
+        if enabled {
+            self.start_device_monitoring();
+        }
         self.rebuild_sidebar();
+        self
+    }
+    
+    fn start_device_monitoring(&mut self) {
+        if self.devices_rx.is_some() {
+            return;
+        }
+        
+        // Create channel for loading results
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.devices_rx = Some(rx);
+        
+        let use_symbolic = self.config.use_symbolic_icons;
+        
+        tokio::spawn(async move {
+            let volume_monitor = Arc::new(VolumeMonitor::new());
+             // Start monitoring (ignore errors for now)
+            let _ = volume_monitor.start(None).await;
+            
+            // Helper to update list
+            async fn refresh_devices(monitor: &VolumeMonitor, tx: &mpsc::UnboundedSender<Vec<SidebarItem>>, use_symbolic: bool) {
+                 let mut items = Vec::new();
+                 let mut added_uris = std::collections::HashSet::new();
+                 
+                 // Add volumes
+                 let volumes = monitor.get_volumes().await;
+                 
+                 for volume in volumes {
+                     let name = volume.get_name();
+                     let mut icon = volume.get_icon();
+                     if icon.is_empty() {
+                         icon = if use_symbolic { "drive-harddisk-symbolic".to_string() } else { "drive-harddisk".to_string() };
+                     }
+                     
+                     // Only show mounted volumes for now, or use mount point if available
+                     if let Some(mount) = volume.get_mount() {
+                         let root = mount.get_root();
+                         let uri = root.uri();
+                         added_uris.insert(uri.clone());
+                         items.push(SidebarItem::new(uri.clone(), name).with_icon(icon).with_uri(uri));
+                     }
+                 }
+                 
+                 // Add standalone mounts that might not be volumes (e.g. network shares, custom mounts)
+                 let mounts = monitor.get_mounts().await;
+                 for mount in mounts {
+                      let root = mount.get_root();
+                      let uri = root.uri();
+                      
+                      // Filter out system mounts and already added volumes
+                      if added_uris.contains(&uri) {
+                          continue;
+                      }
+                      
+                      let path = uri.strip_prefix("file://").unwrap_or(&uri);
+                      
+                      // Deny list - Ignore system paths
+                      if path == "/" 
+                          || path.starts_with("/dev")
+                          || path.starts_with("/sys")
+                          || path.starts_with("/proc")
+                          || path.starts_with("/tmp")
+                          || path.starts_with("/boot")
+                          || path.starts_with("/var")
+                          || path.starts_with("/usr")
+                          || path.starts_with("/etc")
+                          || path.starts_with("/bin")
+                          || path.starts_with("/sbin")
+                          || path.starts_with("/lib")
+                          || path.starts_with("/opt")
+                          || path.starts_with("/snap")
+                          || path.starts_with("/run/credentials")
+                          || path == "/run" 
+                          || path == "/home" 
+                          || path == "/cache"
+                          || path == "/root"
+                      {
+                          continue;
+                      }
+                      
+                      // Special handling for /run/user
+                      if path.starts_with("/run/user/") {
+                          // Ignore the user root itself /run/user/1000
+                          // Path is like /run/user/1000 or /run/user/1000/
+                          let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                          if parts.len() <= 3 { // run, user, 1000
+                               continue;
+                          }
+                          // Allow subdirs
+                      }
+                      
+                      let name = mount.get_name();
+                      let mut icon = mount.get_icon();
+                      if icon.is_empty() {
+                          icon = if use_symbolic { "folder-remote-symbolic".to_string() } else { "folder-remote".to_string() };
+                      }
+                      
+                      added_uris.insert(uri.clone());
+                      items.push(SidebarItem::new(uri.clone(), name).with_icon(icon).with_uri(uri));
+                 }
+                 
+                 let _ = tx.send(items);
+            }
+            
+            // Initial update
+            refresh_devices(&volume_monitor, &tx, use_symbolic).await;
+            
+            let mut event_rx = volume_monitor.subscribe();
+            
+            while let Ok(_event) = event_rx.recv().await {
+                // On any event, refresh the list
+                refresh_devices(&volume_monitor, &tx, use_symbolic).await;
+            }
+        });
+    }
+
+    
+    /// Get the current path signal.
+    pub fn current_path_signal(&self) -> StateSignal<PathBuf> {
+        self.current_path.clone()
+    }
+
+    /// Set the current path signal (for reactive updates).
+    pub fn with_current_path_signal(mut self, signal: StateSignal<PathBuf>) -> Self {
+        self.current_path = signal;
         self
     }
 
@@ -172,6 +312,12 @@ impl FilemanSidebar {
         self.config.user_directories = dirs;
         self.rebuild_sidebar();
         self
+    }
+    
+    /// Set the current path to highlight in the sidebar.
+    pub fn set_current_path(&mut self, path: PathBuf) {
+        let uri = format!("file://{}", path.display());
+        self.inner.set_selected(Some(uri));
     }
 
     /// Add a custom section to the sidebar.
@@ -223,8 +369,7 @@ impl FilemanSidebar {
             .await
             .map_err(|e| format!("Failed to load bookmarks: {}", e))?;
 
-        // TODO: Rebuild sidebar sections to include updated bookmarks
-        // This requires a way to update the inner Sidebar's sections
+        self.rebuild_sidebar();
         Ok(())
     }
 
@@ -281,9 +426,14 @@ impl FilemanSidebar {
         // Custom sections
         sections.extend(config.custom_sections.clone());
 
-        // Devices section (placeholder for now)
+        // Devices section
         if config.show_devices {
-            sections.push(SidebarSection::new("Devices"));
+            if !config.devices.is_empty() {
+                sections.push(SidebarSection::new("Devices").with_items(config.devices.clone()));
+            } else {
+                // Keep empty section or hide?
+                // Hide if empty to avoid clutter
+            }
         }
 
         sections
@@ -304,7 +454,7 @@ impl FilemanSidebar {
         let home_icon = get_home_icon_name(config.use_symbolic_icons);
         log::debug!("Home icon name: '{}'", home_icon);
         items.push(
-            SidebarItem::new("home", "Home")
+            SidebarItem::new(format!("file://{}", home_path.display()), "Home")
                 .with_icon(home_icon)
                 .with_uri(format!("file://{}", home_path.display())),
         );
@@ -347,7 +497,7 @@ impl FilemanSidebar {
                 log::debug!("Adding sidebar item: {} with icon '{}' and path {:?}", label, icon, path);
 
                 items.push(
-                    SidebarItem::new(format!("{:?}", dir_type).to_lowercase(), label)
+                    SidebarItem::new(uri.clone(), label)
                         .with_icon(icon)
                         .with_uri(uri),
                 );
@@ -401,7 +551,7 @@ impl FilemanSidebar {
             };
 
             items.push(
-                SidebarItem::new(label.clone().to_lowercase(), label)
+                SidebarItem::new(uri.clone(), label)
                     .with_icon(display_icon)
                     .with_uri(uri.clone())
             );
@@ -433,18 +583,42 @@ impl Widget for FilemanSidebar {
         context: AppContext,
         info: &mut AppInfo,
     ) -> Update {
+        // Hook signals
+        context.hook_signal(&mut self.current_path);
+
         // Handle navigation events from channel
         // Note: The receiver should be taken and polled externally, but we can check here too
         // For now, just delegate to inner sidebar
         
+        let mut needs_rebuild = false;
+
         // Poll for loaded bookmarks
         if let Some(ref mut rx) = self.bookmarks_rx {
              while let Ok(bookmarks) = rx.try_recv() {
                 self.config.bookmarks = bookmarks;
-                self.rebuild_sidebar();
-                // Ensure layout/draw after rebuild
-                return Update::LAYOUT | Update::DRAW;
+                needs_rebuild = true;
              }
+        }
+
+        // Poll for loaded devices
+        if let Some(ref mut rx) = self.devices_rx {
+             while let Ok(devices) = rx.try_recv() {
+                self.config.devices = devices;
+                needs_rebuild = true;
+             }
+        }
+
+        // Sync current path
+        let current_path = (*self.current_path.get()).clone();
+        if self.last_path.as_ref() != Some(&current_path) {
+            self.set_current_path(current_path.clone());
+            self.last_path = Some(current_path);
+            needs_rebuild = true; 
+        }
+
+        if needs_rebuild {
+            self.rebuild_sidebar();
+            return Update::LAYOUT | Update::DRAW;
         }
 
         if !layout.children.is_empty() {

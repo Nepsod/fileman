@@ -38,6 +38,13 @@ pub enum FileListOperation {
     Delete(Vec<PathBuf>),
     Properties(Vec<PathBuf>),
     PromptRename(PathBuf),
+    Copy(Vec<PathBuf>),
+    Cut(Vec<PathBuf>),
+    Paste,
+    /// Sort files by column and order
+    Sort(usize, SortOrder),
+    /// Refresh the file list
+    Refresh,
 }
 
 use nptk::widgets::scroll_container::{ScrollContainer, ScrollDirection};
@@ -64,14 +71,19 @@ pub enum FileListViewMode {
     Table,
 }
 
+use crate::file_list::model_adapter::FileSystemItemModel;
+use nptk::core::model::SortOrder;
+
 /// A widget that displays a list of files.
 pub struct FileList {
     // State
     current_path: StateSignal<PathBuf>,
     entries: StateSignal<Vec<FileEntry>>,
+    all_entries: StateSignal<Vec<FileEntry>>,
     selected_paths: StateSignal<Vec<PathBuf>>,
     view_mode: StateSignal<FileListViewMode>,
     icon_size: StateSignal<u32>,
+    search_query: StateSignal<String>,
 
     // Model
     fs_model: Arc<FileSystemModel>,
@@ -119,6 +131,12 @@ pub struct FileList {
     cache_update_tx: tokio::sync::mpsc::Sender<()>,
     // cache_update_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
     svg_scene_cache: Arc<Mutex<std::collections::HashMap<String, (nptk::core::vg::Scene, f64, f64)>>>,
+    
+    // Operation channel for keyboard shortcuts
+    operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
+    
+    // Model for sorting
+    sort_model: Option<Arc<FileSystemItemModel>>,
 }
 
 impl FileList {
@@ -167,9 +185,11 @@ impl FileList {
 
         let current_path = StateSignal::new(initial_path.clone());
         let entries = StateSignal::new(Vec::new());
+        let all_entries = StateSignal::new(Vec::new());
         let selected_paths = StateSignal::new(Vec::new());
         let view_mode = StateSignal::new(FileListViewMode::List);
         let icon_size = StateSignal::new(48);
+        let search_query = StateSignal::new(String::new());
 
         // Create icon registry
         let icon_registry =
@@ -226,7 +246,7 @@ impl FileList {
             cache_update_rx.clone(),
             pending_thumbnails.clone(),
             cache_invalidate_rx,
-            operation_tx,
+            operation_tx.clone(),
             selection_change_tx_arc.clone(),
         );
         
@@ -242,9 +262,11 @@ impl FileList {
         Self {
             current_path,
             entries,
+            all_entries,
             selected_paths,
             view_mode,
             icon_size,
+            search_query,
             fs_model,
             _event_rx: event_rx,
             layout_style: LayoutStyle {
@@ -270,6 +292,8 @@ impl FileList {
             cache_update_tx,
             // cache_update_rx,
             svg_scene_cache,
+            operation_tx,
+            sort_model: None,
         }
     }
 
@@ -423,6 +447,8 @@ impl FileList {
                 self.cache_update_tx.clone(),
             ).with_icon_size(model_icon_size));
              
+            self.sort_model = Some(model.clone());
+
              // Setup ItemView with selection sync
             let _selected_paths = self.selected_paths.clone();
             let _entries = self.entries.clone();
@@ -563,6 +589,11 @@ impl FileList {
         &self.current_path
     }
 
+    /// Get the entries signal (for reactive subscription)
+    pub fn entries_signal(&self) -> &StateSignal<Vec<FileEntry>> {
+        &self.entries
+    }
+
     /// Clear the selection.
     pub fn clear_selection(&mut self) {
         self.selected_paths.set(Vec::new());
@@ -612,6 +643,28 @@ impl FileList {
     pub fn icon_size_signal(&self) -> &StateSignal<u32> {
         &self.icon_size
     }
+
+    /// Get the search query signal
+    pub fn search_query_signal(&self) -> &StateSignal<String> {
+        &self.search_query
+    }
+    
+    /// Set the search query
+    pub fn set_search_query(&mut self, query: String) {
+        self.search_query.set(query);
+    }
+    
+    /// Sort the file list by the given column and order.
+    /// Columns: 0=Name, 1=Size, 2=Type, 3=Date
+    pub fn sort(&mut self, column: usize, order: SortOrder) {
+        // Ensure model exists (it's created on first render, but we might need it earlier)
+        self.ensure_item_view();
+        
+        if let Some(model) = &self.sort_model {
+            use nptk::core::model::ItemModel;
+            model.sort(column, order);
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -642,15 +695,55 @@ impl Widget for FileList {
         // Hook signals on first update to make them reactive
         if !self.signals_hooked {
             context.hook_signal(&mut self.entries);
+            context.hook_signal(&mut self.all_entries);
             context.hook_signal(&mut self.current_path);
             context.hook_signal(&mut self.selected_paths);
             context.hook_signal(&mut self.view_mode);
             context.hook_signal(&mut self.icon_size);
-            context.hook_signal(&mut self.icon_size);
+            context.hook_signal(&mut self.search_query);
             self.signals_hooked = true;
         }
         
         let mut update = Update::empty();
+
+        // Process keyboard shortcuts (Ctrl+C/X/V, Delete)
+        // We check if the widget or its children are focused effectively by handling keys here.
+        // In NPTK, bubbling/handling isn't strictly hierarchical for keys unless using FocusManager.
+        // But FileList is the main widget here.
+        // We only handle if we have operation_tx.
+        if let Some(ref tx) = self.operation_tx {
+             for (_, key_event) in &info.keys {
+                if key_event.state == nptk::core::window::ElementState::Pressed {
+                    let modifiers = info.modifiers; // AppInfo has modifiers
+                    
+                    if modifiers.control_key() {
+                        match key_event.physical_key {
+                            nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::KeyC) => {
+                                let selection = self.selected_paths.get().clone();
+                                if !selection.is_empty() {
+                                    let _ = tx.send(FileListOperation::Copy(selection));
+                                }
+                            }
+                            nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::KeyX) => {
+                                let selection = self.selected_paths.get().clone();
+                                if !selection.is_empty() {
+                                    let _ = tx.send(FileListOperation::Cut(selection));
+                                }
+                            }
+                            nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::KeyV) => {
+                                let _ = tx.send(FileListOperation::Paste);
+                            }
+                            _ => {}
+                        }
+                    } else if key_event.physical_key == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::Delete) {
+                         let selection = self.selected_paths.get().clone();
+                         if !selection.is_empty() {
+                             let _ = tx.send(FileListOperation::Delete(selection));
+                         }
+                    }
+                }
+             }
+        }
         
         // Poll filesystem events FIRST - this must happen before ItemView handling
         // so that entries get updated even when using ItemView
@@ -659,7 +752,19 @@ impl Widget for FileList {
                 match event {
                     FileSystemEvent::DirectoryLoaded { path, entries } => {
                         if path == *self.current_path.get() {
-                            self.entries.set(entries);
+                            self.all_entries.set(entries.clone());
+                            
+                            // Apply filtering
+                            let query = self.search_query.get().to_lowercase();
+                            if query.is_empty() {
+                                self.entries.set(entries);
+                            } else {
+                                let filtered: Vec<FileEntry> = entries.into_iter()
+                                    .filter(|e| e.name.to_lowercase().contains(&query))
+                                    .collect();
+                                self.entries.set(filtered);
+                            }
+                            
                             update.insert(Update::LAYOUT | Update::DRAW);
                         }
                     },
@@ -694,6 +799,79 @@ impl Widget for FileList {
             self.last_path = Some(current_path_value.clone());
             let _ = self.fs_model.refresh(&current_path_value);
             update.insert(Update::LAYOUT | Update::DRAW);
+        }
+        
+        // Check if search query changed
+        // Note: We rely on signal reactivity, but we need to re-filter when it changes
+        // Since we hook the signal, this update() is called when it changes.
+        // But we need to detect *what* changed or just re-filter if needed.
+        // A simple way is to check against a stored last_query, or just re-filter if we assume efficient updates.
+        // For now, let's just re-filter based on all_entries if search_query changed? 
+        // Actually, since update() is called on signal change, we can just re-apply filter logic
+        // But we want to avoid re-setting entries if nothing changed.
+        // Let's rely on the fact that if search_query changed, *self.search_query.get() is new.
+        // We can just re-run the filter logic every time update is called? No, that's wasteful.
+        // Best practice: Use a stored previous value or just do it.
+        // Given existing pattern, let's just re-filter. It's fast for small lists.
+        // BUT wait, we don't store previous query. 
+        // Let's leave it for now - the directory load triggers the first filter.
+        // We need to handle the case where ONLY search query changes.
+        
+        // Ideally we should track last_query in struct. But for filtered list,
+        // we can just re-derive `entries` from `all_entries` + `search_query`
+        // whenever `search_query` changes.
+        // Since we don't have `last_query`, let's just add it or implement a check.
+        
+        // Actually, let's just re-filter every time for now inside the update loop if we can efficiently check change.
+        // But we can't easily check change without previous value.
+        // Let's add logic:
+        {
+            let all = self.all_entries.get();
+            let query = self.search_query.get().to_lowercase();
+            // let current_entries_len = self.entries.get().len();
+            
+            // This is a bit hacky: we re-filter every frame. 
+            // Better: Check if `all_entries` or `search_query` signal has changed?
+            // NPTK signals don't expose "has_changed" easily in update() without tracking.
+            // Let's assume for now that if we are here, something might have changed.
+            // But rewriting `entries` every frame causes loops if `entries` signal triggers update.
+            // So we MUST check if the result is different.
+            
+            let filtered: Vec<FileEntry> = if query.is_empty() {
+                all.clone()
+            } else {
+                all.iter()
+                    .filter(|e| e.name.to_lowercase().contains(&query))
+                    .cloned()
+                    .collect()
+            };
+            
+            // Only set if different (simple length check + first item check for optimization)
+            // Or just deep comparison since Vec<FileEntry> might not be cheap.
+            // Actually, `entries.set()` likely checks equality if T: PartialEq. FileEntry implements PartialEq.
+            // So we can just set it.
+            
+            // self.entries.set(filtered); 
+            // The problem is `self.entries.set` triggers update() again -> infinite loop!
+            // We need to check against current value before setting.
+            
+            // Perform manual equality check based on paths and essential metadata
+            // since FileEntry doesn't implement PartialEq
+            let current = self.entries.get();
+            let mut changed = current.len() != filtered.len();
+            if !changed {
+                for (a, b) in current.iter().zip(filtered.iter()) {
+                    if a.path != b.path || a.name != b.name {
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            
+            if changed {
+                 self.entries.set(filtered);
+                 update.insert(Update::LAYOUT | Update::DRAW);
+            }
         }
         
         // Ensure ItemView exists if mode is Table or List

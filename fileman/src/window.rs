@@ -4,6 +4,7 @@ use nptk::core::signal::eval::EvalSignal;
 use nptk::core::shortcut::Shortcut;
 use nptk::core::window::KeyCode;
 use nptk_fileman_widgets::file_list::{FileList, FileListOperation};
+use nptk::services::filesystem::entry::FileEntry;
 use nptk_fileman_widgets::FilemanSidebar;
 // use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem}; // Unused
 use crate::app::AppState;
@@ -16,6 +17,8 @@ use nalgebra::Vector2;
 use nptk::core::menu::unified::{MenuTemplate, MenuItem};
 use nptk::core::menu::MenuCommand;
 use nptk::core::vg::kurbo::Point;
+use nptk::services::clipboard::ClipboardService;
+use nptk::core::model::SortOrder;
 
 /// File operation requests that can be sent from UI to be processed
 #[derive(Debug, Clone)]
@@ -50,6 +53,8 @@ struct FileListWrapper {
     pending_rename: Arc<Mutex<Option<(PathBuf, String)>>>,
     // Pending create directory operations (from dialog)
     pending_create_dir: Arc<Mutex<Option<(PathBuf, String)>>>,
+    // Clipboard service
+    clipboard: Arc<Mutex<ClipboardService>>,
 }
 
 impl FileListWrapper {
@@ -69,6 +74,9 @@ impl FileListWrapper {
         
         // Clone signals from FileList for reactive subscription
         let file_list_path_signal = file_list.current_path_signal().clone();
+        
+        // Initialize clipboard
+        let clipboard = Arc::new(Mutex::new(ClipboardService::new()));
         
         let file_list = file_list.with_on_context_menu({
             let nav_tx = navigation.clone();
@@ -95,6 +103,38 @@ impl FileListWrapper {
                 // Separator
                 template = template.add_item(MenuItem::separator());
                 
+                let op_tx_copy = op_tx.clone();
+                let path_clone = path.clone();
+                template = template.add_item(
+                    MenuItem::new(MenuCommand::Custom(2), "Copy")
+                        .with_action(move || {
+                            let _ = op_tx_copy.send(FileListOperation::Copy(vec![path_clone.clone()]));
+                            Update::empty()
+                        })
+                );
+
+                let op_tx_cut = op_tx.clone();
+                let path_clone = path.clone();
+                template = template.add_item(
+                    MenuItem::new(MenuCommand::Custom(3), "Cut")
+                        .with_action(move || {
+                             let _ = op_tx_cut.send(FileListOperation::Cut(vec![path_clone.clone()]));
+                            Update::empty()
+                        })
+                );
+
+                let op_tx_paste = op_tx.clone();
+                template = template.add_item(
+                    MenuItem::new(MenuCommand::Custom(4), "Paste")
+                        .with_action(move || {
+                             let _ = op_tx_paste.send(FileListOperation::Paste);
+                            Update::empty()
+                        })
+                );
+                
+                // Separator
+                template = template.add_item(MenuItem::separator());
+
                 // Properties action
                 let op_tx_clone = op_tx.clone();
                 let path_clone = path.clone();
@@ -128,14 +168,57 @@ impl FileListWrapper {
                         })
                 );
 
+                // View Options
+                template = template.add_item(MenuItem::separator());
+                
+                let mut sort_menu = MenuTemplate::new("sort-menu");
+                let op_tx_sort = op_tx.clone();
+                sort_menu = sort_menu.add_item(
+                    MenuItem::new(MenuCommand::Custom(10), "Name (Asc)")
+                        .with_action(move || {
+                            let _ = op_tx_sort.send(FileListOperation::Sort(0, SortOrder::Ascending));
+                            Update::DRAW
+                        })
+                );
+                
+                let op_tx_sort = op_tx.clone();
+                sort_menu = sort_menu.add_item(
+                    MenuItem::new(MenuCommand::Custom(11), "Name (Desc)")
+                        .with_action(move || {
+                            let _ = op_tx_sort.send(FileListOperation::Sort(0, SortOrder::Descending));
+                            Update::DRAW
+                        })
+                );
+
+                let op_tx_sort = op_tx.clone();
+                sort_menu = sort_menu.add_item(
+                    MenuItem::new(MenuCommand::Custom(12), "Size (Asc)")
+                        .with_action(move || {
+                            let _ = op_tx_sort.send(FileListOperation::Sort(1, SortOrder::Ascending));
+                            Update::DRAW
+                        })
+                );
+                
+                let op_tx_sort = op_tx.clone();
+                sort_menu = sort_menu.add_item(
+                    MenuItem::new(MenuCommand::Custom(13), "Size (Desc)")
+                        .with_action(move || {
+                            let _ = op_tx_sort.send(FileListOperation::Sort(1, SortOrder::Descending));
+                            Update::DRAW
+                        })
+                );
+                
+                template = template.add_item(
+                    MenuItem::new(MenuCommand::Custom(5), "Sort By").with_submenu(sort_menu)
+                );
+
                 // Show the menu at cursor position
                 context.menu_manager.show(template, Point::new(pos.x, pos.y));
                 
                 Update::DRAW
             }
         });
-        
-        Self {
+                Self {
             file_list,
             navigation,
             navigation_rx: Some(navigation_rx),
@@ -148,7 +231,133 @@ impl FileListWrapper {
             pending_delete_confirmation: Arc::new(Mutex::new(None)),
             pending_rename: Arc::new(Mutex::new(None)),
             pending_create_dir: Arc::new(Mutex::new(None)),
+            clipboard,
         }
+    }
+
+    /// Paste files from clipboard to current directory
+    fn paste_files(&mut self) -> Update {
+        let current_path = (*self.file_list_path_signal.get()).clone();
+        
+        let clipboard_content = if let Ok(mut clipboard) = self.clipboard.lock() {
+            match clipboard.get_files() {
+                Ok(Some(content)) => Some(content),
+                Ok(None) => {
+                    if let Some(tx) = &self.status_tx {
+                        let _ = tx.send("Clipboard is empty".to_string());
+                    }
+                    None
+                },
+                Err(e) => {
+                    log::error!("Failed to get clipboard content: {}", e);
+                    if let Some(tx) = &self.status_tx {
+                        let _ = tx.send(format!("Clipboard error: {}", e));
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some((custom_paths, is_cut)) = clipboard_content {
+             // Perform Paste Operation
+             // For now, we'll implement a simple copy/move logic here or delegate to a background task
+             // Since file operations can be slow, ideally we should spawn a task.
+             // But FileListWrapper update is sync.
+             // We can use tokio::spawn if we are in async context, but Widget::update is async, so we can spawn.
+             // Wait, Widget::update is async in our codebase? Yes.
+             
+             let status_tx = self.status_tx.clone();
+             
+             tokio::spawn(async move {
+                 let action = if is_cut { "Moving" } else { "Copying" };
+                 if let Some(tx) = &status_tx {
+                     let _ = tx.send(format!("{} {} files...", action, custom_paths.len()));
+                 }
+                 
+                 for from_path in custom_paths {
+                     if let Some(file_name) = from_path.file_name() {
+                         let mut to_path = current_path.join(file_name);
+                         
+                         // Simple collision avoidance: append _copy if exists
+                         if to_path.exists() {
+                             // Basic logic: stem + _copy + ext
+                             // This is a naive implementation
+                             let file_stem = to_path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
+                             let extension = to_path.extension().map(|s| s.to_string_lossy()).unwrap_or_default();
+                             
+                             let new_name = if extension.is_empty() {
+                                 format!("{}_copy", file_stem)
+                             } else {
+                                 format!("{}_copy.{}", file_stem, extension)
+                             };
+                             to_path = current_path.join(new_name);
+                         }
+                         
+                         let result = if is_cut {
+                             match tokio::fs::rename(&from_path, &to_path).await {
+                                 Ok(_) => Ok(()),
+                                 Err(e) => {
+                                     // Fallback to copy + delete for cross-device moves or other rename failures
+                                     // 18 = EXDEV (Cross-device link)
+                                     if e.raw_os_error() == Some(18) {
+                                         log::info!("Cross-device move detected, falling back to copy+delete");
+                                         if from_path.is_dir() {
+                                             match operations::copy_recursive(from_path.clone(), to_path.clone()).await {
+                                                 Ok(_) => operations::delete_path(from_path.clone()).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+                                                 Err(copy_err) => Err(copy_err),
+                                             }
+                                         } else {
+                                             match tokio::fs::copy(&from_path, &to_path).await {
+                                                 Ok(_) => operations::delete_path(from_path.clone()).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
+                                                 Err(copy_err) => Err(copy_err),
+                                             }
+                                         }
+                                     } else {
+                                         Err(e)
+                                     }
+                                 }
+                             }
+                         } else {
+                             // tokio::fs::copy only copies contents, not recursively for dirs.
+                             // For text entries (files), copy works. For dirs, we need recursive copy.
+                             // For MVP validation, we'll support files only or use a simple recursive copy helper later.
+                             // Let's assume files for now or use `fs_extra` if available.
+                             // Implementing simple file copy:
+                              if from_path.is_dir() {
+                                  operations::copy_recursive(from_path.clone(), to_path.clone()).await
+                              } else {
+                                 tokio::fs::copy(&from_path, &to_path).await.map(|_| ())
+                             }
+                         };
+                         
+                         match result {
+                             Ok(_) => {
+                                 log::info!("{} {:?} to {:?}", action, from_path, to_path);
+                             }
+                             Err(e) => {
+                                 log::error!("Failed to {} {:?}: {}", action.to_lowercase(), from_path, e);
+                             }
+                         }
+                     }
+                 }
+                 
+                 if let Some(tx) = &status_tx {
+                     let _ = tx.send(format!("{} complete", action));
+                 }
+             });
+             
+             // We spawned a task, but we might want to refresh the file list eventually.
+             // The file list watches basic changes via notify (if implemented) or we can manually refresh using FileListOperation::Refresh
+             // We don't have direct access to send Refresh command here easily without self.file_list_operation_rx (which is receiver).
+             // Actually we have `file_list` struct, we can call methods on it if exposed.
+             // For now, let's rely on manual refresh or file system watcher if present.
+             // Wait, `FileList` has `refresh()` method but it's internal logic mostly.
+             // We can trigger a layout update which might not re-read files unless we force it.
+        }
+        
+        Update::empty()
     }
 
     /// Get the selected paths signal (for reactive subscription by other widgets)
@@ -162,9 +371,43 @@ impl FileListWrapper {
     }
 
     /// Show properties popup for the given paths
-    /// Show properties popup for the given paths
     pub fn show_properties_for_paths(&mut self, paths: &[PathBuf], context: nptk::core::app::context::AppContext) {
         self.file_list.show_properties_popup(paths, context);
+    }
+
+    /// Perform delete request
+    fn perform_delete_request(&mut self, paths: Vec<PathBuf>, _context: AppContext) {
+        let paths_clone = paths.clone();
+        // Process delete operation
+        let mut all_success = true;
+        let mut error_msg = String::new();
+        
+        for path in &paths {
+            match operations::delete_path(path.clone()) {
+                Ok(_) => {
+                    log::info!("Deleted: {:?}", path);
+                }
+                Err(e) => {
+                    log::error!("Failed to delete {:?}: {}", path, e);
+                    all_success = false;
+                    error_msg = e;
+                    break;
+                }
+            }
+        }
+        
+        // Update status message
+        if let Some(ref tx) = self.status_tx {
+            if all_success {
+                let _ = tx.send(format!("Deleted {} item(s)", paths_clone.len()));
+            } else {
+                let _ = tx.send(format!("Error: {}", error_msg));
+            }
+        }
+        
+        // Refresh file list by resetting path (triggers reload)
+        let current_path = self.file_list.get_current_path();
+        self.file_list.set_path(current_path);
     }
 
     /// Show delete confirmation dialog
@@ -449,67 +692,68 @@ impl Widget for FileListWrapper {
 
         // Process file operations from FileList widget (context menu, etc.)
         // Collect operations to avoid borrow conflicts
-        let mut pending_properties_internal = Vec::new();
-        let mut pending_renames_internal = Vec::new();
+        let mut operations = Vec::new();
         
         if let Some(ref mut rx) = self.file_list_operation_rx {
             while let Ok(op) = rx.try_recv() {
-                match op {
-                    FileListOperation::Properties(paths) => {
-                        pending_properties_internal.push(paths);
-                    }
-                    FileListOperation::PromptRename(path) => {
-                        pending_renames_internal.push(path);
-                    }
-                    FileListOperation::Delete(paths) => {
-                        // Convert to FileOperationRequest and process
-                        let paths_clone = paths.clone();
-                        // Process delete operation
-                        let mut all_success = true;
-                        let mut error_msg = String::new();
-                        
-                        for path in &paths {
-                            match operations::delete_path(path.clone()) {
-                                Ok(_) => {
-                                    log::info!("Deleted: {:?}", path);
-                                }
-                                Err(e) => {
-                                    log::error!("Failed to delete {:?}: {}", path, e);
-                                    all_success = false;
-                                    error_msg = e;
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        // Update status message
-                        if let Some(ref tx) = self.status_tx {
-                            if all_success {
-                                let _ = tx.send(format!("Deleted {} item(s)", paths_clone.len()));
-                            } else {
-                                let _ = tx.send(format!("Error: {}", error_msg));
-                            }
-                        }
-                        
-                        // Refresh file list
-                        let current_path = self.file_list.get_current_path();
-                        self.file_list.set_path(current_path.clone());
-                        update.insert(Update::LAYOUT | Update::DRAW);
-                    }
-                }
+                operations.push(op);
             }
         }
         
-        // Process pending properties requests from internal ops
-        for paths in pending_properties_internal {
-             self.show_properties_for_paths(&paths, context.clone());
-             update.insert(Update::DRAW);
-        }
-
-        // Process pending renames from internal ops
-        for path in pending_renames_internal {
-             self.show_rename_dialog(path, context.clone());
-             update.insert(Update::DRAW);
+        for op in operations {
+            match op {
+                FileListOperation::Properties(paths) => {
+                     self.show_properties_for_paths(&paths, context.clone());
+                }
+                FileListOperation::PromptRename(path) => {
+                    self.show_rename_dialog(path, context.clone());
+                },
+                FileListOperation::Copy(paths) => {
+                     if let Ok(mut clipboard) = self.clipboard.lock() {
+                        if let Err(e) = clipboard.set_files(&paths, false) {
+                            log::error!("Failed to copy files: {}", e);
+                            if let Some(tx) = &self.status_tx {
+                                let _ = tx.send(format!("Failed to copy: {}", e));
+                            }
+                        } else {
+                            if let Some(tx) = &self.status_tx {
+                                let _ = tx.send(format!("Copied {} files", paths.len()));
+                            }
+                        }
+                    }
+                },
+                FileListOperation::Cut(paths) => {
+                     if let Ok(mut clipboard) = self.clipboard.lock() {
+                        if let Err(e) = clipboard.set_files(&paths, true) {
+                            log::error!("Failed to cut files: {}", e);
+                             if let Some(tx) = &self.status_tx {
+                                let _ = tx.send(format!("Failed to cut: {}", e));
+                            }
+                        } else {
+                            if let Some(tx) = &self.status_tx {
+                                let _ = tx.send(format!("Cut {} files", paths.len()));
+                            }
+                        }
+                    }
+                },
+                FileListOperation::Paste => {
+                    update.insert(self.paste_files());
+                },
+                FileListOperation::Delete(paths) => {
+                     // Convert to FileOperationRequest and process
+                    let paths_clone = paths.clone();
+                    self.perform_delete_request(paths, context.clone());
+                },
+                FileListOperation::Sort(col, order) => {
+                    self.file_list.sort(col, order);
+                    update.insert(Update::DRAW);
+                },
+                FileListOperation::Refresh => {
+                    let path = self.file_list.get_current_path();
+                    self.file_list.set_path(path); // Re-setting path triggers refresh
+                    update.insert(Update::DRAW);
+                }
+            }
         }
 
         // Process file operations from toolbar/other UI
@@ -730,6 +974,17 @@ impl WidgetLayoutExt for FileListWrapper {
 
 // StatusBarWrapper removed (replaced by FileStatusBar)
 
+// Ensure FileListWrapper exposes file_list or search signal
+impl FileListWrapper {
+    pub fn search_query_signal(&self) -> StateSignal<String> {
+        self.file_list.search_query_signal().clone()
+    }
+    
+    pub fn entries_signal(&self) -> StateSignal<Vec<FileEntry>> {
+        self.file_list.entries_signal().clone()
+    }
+}
+
 pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     let navigation = state.navigation.lock().unwrap();
     let initial_path = navigation.get_current_path();
@@ -742,22 +997,39 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     let (operation_tx, operation_rx) = mpsc::unbounded_channel::<FileOperationRequest>();
     let (status_tx, status_rx) = mpsc::unbounded_channel::<String>();
     
+    // Create focus channel for location bar
+    let (focus_tx, focus_rx) = mpsc::unbounded_channel::<()>();
+
     // Register keyboard shortcuts
-    // TODO: Implement focus text input functionality for "Go to Location" shortcuts
+    // Focus location bar
     context.shortcut_registry.register(
         Shortcut::ctrl(KeyCode::KeyL),
-        || Update::DRAW, // Placeholder - will implement focus text input later
+        {
+            let tx = focus_tx.clone();
+            move || {
+                let _ = tx.send(());
+                Update::DRAW
+            }
+        },
     );
     context.shortcut_registry.register(
         Shortcut::new(KeyCode::F6, nptk::core::window::ModifiersState::empty()),
-        || Update::DRAW, // Placeholder - will implement focus text input later
+        {
+            let tx = focus_tx.clone();
+            move || {
+                let _ = tx.send(());
+                Update::DRAW
+            }
+        },
     );
 
     // Create FilemanSidebar
     let mut sidebar = FilemanSidebar::new()
         .with_places(true)
         .with_bookmarks(true)
-        .with_width(200.0);
+        .with_devices(true)
+        .with_width(200.0)
+        .with_current_path_signal(navigation_path_signal.clone());
     
     // Take the navigation receiver for FileListWrapper
     let sidebar_nav_rx = sidebar.take_navigation_receiver()
@@ -796,8 +1068,13 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     // Create FileLocationBar
     use nptk_fileman_widgets::location_bar::FileLocationBar;
     
+    // Get search query signal from FileList wrapper
+    let file_list_search_query = file_list_wrapper.search_query_signal();
+
     let nav_tx_clone = toolbar_nav_tx.clone();
     let location_bar = FileLocationBar::new(navigation_path_signal.clone())
+        .with_focus_receiver(focus_rx)
+        .with_search_query_signal(file_list_search_query) // Pass the shared signal
         .with_on_navigate(move |path| {
              let _ = nav_tx_clone.send(crate::toolbar::NavigationAction::NavigateTo(path));
              Update::DRAW
@@ -809,6 +1086,7 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     let statusbar = FileStatusBar::new(
         navigation_path_signal.clone(),
         selected_paths_signal.clone(),
+        file_list_wrapper.entries_signal().clone(),
     ).with_message_receiver(status_rx);
 
     // Build main layout

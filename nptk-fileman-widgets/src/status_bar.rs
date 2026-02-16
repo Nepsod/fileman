@@ -4,6 +4,8 @@ use tokio::sync::mpsc;
 use async_trait::async_trait;
 use nptk::core::signal::state::StateSignal;
 use nptk::core::vg::kurbo::Shape;
+use nptk::services::filesystem::entry::FileEntry;
+use humansize::{format_size, BINARY};
 
 /// A status bar widget that displays:
 /// 1. Navigation info (path + selection count)
@@ -13,6 +15,7 @@ pub struct FileStatusBar {
     inner: Container,
     current_path: StateSignal<PathBuf>,
     selected_paths: StateSignal<Vec<PathBuf>>,
+    entries: StateSignal<Vec<FileEntry>>,
     status_text: StateSignal<String>,
     status_message_rx: Option<mpsc::UnboundedReceiver<String>>,
     status_message_timeout: Option<std::time::Instant>,
@@ -23,6 +26,7 @@ impl FileStatusBar {
     pub fn new(
         current_path: StateSignal<PathBuf>,
         selected_paths: StateSignal<Vec<PathBuf>>,
+        entries: StateSignal<Vec<FileEntry>>,
     ) -> Self {
         let status_text = StateSignal::new("Ready".to_string());
         let status_text_clone = status_text.clone();
@@ -46,6 +50,7 @@ impl FileStatusBar {
             inner: container,
             current_path,
             selected_paths,
+            entries,
             status_text,
             status_message_rx: None,
             status_message_timeout: None,
@@ -75,7 +80,16 @@ impl FileStatusBar {
         let selection_count = (*self.selected_paths.get()).len();
         
         let status_msg = if selection_count > 0 {
-            format!("{} - {} item(s) selected", path_str, selection_count)
+            // Calculate total size
+            let selected = self.selected_paths.get();
+            let entries = self.entries.get();
+            let total_size: u64 = entries.iter()
+                .filter(|e| selected.contains(&e.path))
+                .map(|e| e.metadata.size)
+                .sum();
+                
+            let size_str = format_size(total_size, BINARY);
+            format!("{} - {} item(s) selected ({})", path_str, selection_count, size_str)
         } else {
             path_str
         };
@@ -102,12 +116,14 @@ impl Widget for FileStatusBar {
         context: nptk::core::app::context::AppContext,
         info: &mut nptk::core::app::info::AppInfo,
     ) -> nptk::core::app::update::Update {
-        let mut update = Update::empty();
-        
+        let mut update = nptk::core::app::update::Update::empty();
+
+        // Hook signals
         if !self.signals_hooked {
-            context.hook_signal(&mut self.status_text);
+            context.hook_signal(&self.status_text);
             context.hook_signal(&mut self.current_path);
             context.hook_signal(&mut self.selected_paths);
+            context.hook_signal(&mut self.entries);
             self.signals_hooked = true;
         }
 

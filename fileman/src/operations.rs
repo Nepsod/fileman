@@ -42,3 +42,35 @@ pub fn copy_file(from: PathBuf, to: PathBuf) -> Result<(), String> {
         .map_err(|e| format!("Failed to copy file: {}", e))?;
     Ok(())
 }
+
+/// Recursively copy a directory or file asynchronously
+pub fn copy_recursive(
+    from: PathBuf,
+    to: PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> {
+    Box::pin(async move {
+        if !from.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Source path does not exist",
+            ));
+        }
+
+        if from.is_dir() {
+            tokio::fs::create_dir_all(&to).await?;
+            let mut entries = tokio::fs::read_dir(&from).await?;
+            
+            while let Some(entry) = entries.next_entry().await? {
+                let entry_path = entry.path();
+                let file_name = entry.file_name();
+                let dest_path = to.join(file_name);
+                
+                copy_recursive(entry_path, dest_path).await?;
+            }
+        } else {
+            tokio::fs::copy(&from, &to).await?;
+        }
+        
+        Ok(())
+    })
+}

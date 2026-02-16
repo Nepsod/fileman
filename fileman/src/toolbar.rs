@@ -305,12 +305,12 @@ impl Widget for ToolbarWrapper {
 
         // Hook signals on first update
         if !self.signals_hooked {
-            context.hook_signal(&mut self.can_go_back);
-            context.hook_signal(&mut self.can_go_forward);
-            context.hook_signal(&mut self.has_selection);
-            context.hook_signal(&mut self.navigation_path_signal);
-            context.hook_signal(&mut self.selected_paths_signal);
-            context.hook_signal(&mut self.view_mode_signal);
+            context.hook_signal(&self.can_go_back);
+            context.hook_signal(&self.can_go_forward);
+            context.hook_signal(&self.has_selection);
+            context.hook_signal(&self.navigation_path_signal);
+            context.hook_signal(&self.selected_paths_signal);
+            context.hook_signal(&self.view_mode_signal);
             self.signals_hooked = true;
         }
 
