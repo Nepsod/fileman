@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use super::FileListContent;
+use super::content::FileListContent;
 use nptk::prelude::LayoutContext;
 use nptk::widgets::file_icon::renderer::{render_image_icon, render_svg_icon_with_arc_cache};
 use nptk::widgets::tabs_container::{TabItem, TabsContainer};

@@ -1,0 +1,1440 @@
+use std::sync::{Arc, Mutex};
+use async_trait::async_trait;
+use nalgebra::Vector2;
+use nptk::core::app::context::AppContext;
+use nptk::core::app::info::AppInfo;
+use nptk::core::app::update::Update;
+use nptk::core::layout::{Dimension, LayoutNode, LayoutStyle, StyleNode, LengthPercentage, LayoutContext};
+use nptk::core::menu::{MenuTemplate, MenuItem, MenuCommand};
+use nptk::core::signal::{state::StateSignal, MaybeSignal, Signal};
+use nptk::core::text_render::TextRenderContext;
+use nptk::core::vg::kurbo::{Affine, Point, Rect, Shape, Stroke, Vec2};
+use nptk::core::vg::peniko::{Brush, Fill};
+use nptk::core::vgi::Graphics;
+use nptk::core::widget::{BoxedWidget, Widget, WidgetLayoutExt};
+use nptk::core::window::{ElementState, MouseButton};
+use nptk::services::filesystem::entry::{FileEntry, FileType};
+use nptk::services::filesystem::model::{FileSystemEvent, FileSystemModel};
+use npio::service::icon::IconRegistry;
+use npio::{ThumbnailService, ThumbnailEvent, ThumbnailImage, get_file_for_uri, register_backend};
+use npio::backend::local::LocalBackend;
+use nptk::services::thumbnail::npio_adapter::{uri_to_path, thumbnail_size_to_u32};
+use nptk::core::theme::ColorRole;
+use std::collections::HashSet;
+use tokio::{sync::broadcast, time::{Duration, Instant}};
+use nptk::widgets::scroll_container::{ScrollContainer, ScrollDirection};
+use nptk::core::signal::eval::EvalSignal;
+use npio::service::filesystem::mime_registry::MimeRegistry;
+use std::path::PathBuf;
+use nptk::widgets::container::Container;
+use nptk::widgets::button::Button;
+use nptk::widgets::text::Text;
+use humansize::{format_size, BINARY};
+use std::fs;
+
+use super::types::*;
+
+pub(super) struct FileListContent {
+    pub(super) entries: StateSignal<Vec<FileEntry>>,
+    pub(super) selected_paths: StateSignal<Vec<PathBuf>>,
+    pub(super) current_path: StateSignal<PathBuf>,
+    pub(super) view_mode: StateSignal<FileListViewMode>,
+    pub(super) icon_size: StateSignal<u32>,
+    pub(super) fs_model: Arc<FileSystemModel>,
+    pub(super) icon_registry: Arc<IconRegistry>,
+    pub(super) thumbnail_service: Arc<ThumbnailService>,
+
+    pub(super) item_height: f32,
+    pub(super) text_render_context: TextRenderContext,
+    pub(super) thumbnail_size: u32,
+
+    // Input state
+    pub(super) last_click_time: Option<Instant>,
+    pub(super) last_click_index: Option<usize>,
+    pub(super) anchor_index: Option<usize>, // For Shift+Click range selection
+
+    // Icon cache per entry (to avoid repeated lookups)
+    pub(super) icon_cache: Arc<
+        Mutex<std::collections::HashMap<(PathBuf, u32), Option<npio::service::icon::CachedIcon>>>,
+    >,
+
+    // Track pending thumbnail requests to avoid duplicate requests
+    pub(super) pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
+
+    // Thumbnail cache: (path, size) -> ThumbnailImage
+    pub(super) thumbnail_cache: Arc<Mutex<std::collections::HashMap<(PathBuf, u32), ThumbnailImage>>>,
+
+    // Thumbnail event receiver
+    pub(super) thumbnail_event_rx: Arc<Mutex<tokio::sync::broadcast::Receiver<ThumbnailEvent>>>,
+
+    // Update manager for triggering redraws from async tasks
+    pub(super) update_manager: Arc<Mutex<Option<nptk::core::app::update::UpdateManager>>>,
+    
+    // Channel to notify when caches are updated (for triggering redraws)
+    pub(super) cache_update_tx: tokio::sync::mpsc::Sender<()>,
+    pub(super) cache_update_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
+    
+    // Channel to receive cache invalidation requests
+    pub(super) cache_invalidate_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<PathBuf>>>,
+
+    // Drag selection state
+    pub(super) drag_start: Option<Point>,
+    pub(super) current_drag_pos: Option<Point>,
+    pub(super) is_dragging: bool,
+
+    // Layout cache to avoid expensive recalculations on every frame
+    // Key: (path, view_mode, cell_width/icon_size)
+    // Value: (icon_rect, label_rect, display_text, max_text_width)
+    pub(super) layout_cache: std::collections::HashMap<
+        (PathBuf, FileListViewMode, u32, bool),
+        (Rect, Rect, String, f32),
+    >,
+    pub(super) last_layout_width: f32,
+
+    // Icon view constants
+    pub(super) icon_view_padding: f32,
+    pub(super) icon_view_spacing: f32,
+
+    // SVG Scene cache to avoid re-parsing SVGs every frame
+    // Key: SVG source string (or hash of it)
+    // Value: (Scene, width, height)
+    pub(super) svg_scene_cache: std::collections::HashMap<String, (nptk::core::vg::Scene, f64, f64)>,
+    pub(super) mime_registry: MimeRegistry,
+    pub(super) pending_action: Arc<Mutex<Option<PendingAction>>>,
+    pub(super) operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
+    pub(super) last_cursor: Option<Point>,
+    pub(super) menu_was_open: bool, // Track if menu was open in previous update to detect when it closes
+    pub(super) pending_delete_confirmation: Arc<Mutex<Option<Vec<PathBuf>>>>, // Paths waiting for delete confirmation
+    pub(super) selection_change_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>, // Channel to notify about selection changes
+    
+    // Tooltip state
+    pub(super) hovered_item_index: Option<usize>, // Index of file item currently hovered
+    pub(super) tooltip_shown: bool, // Track if tooltip popup is currently shown
+
+    // Semaphore to limit concurrent async tasks (icon/thumbnail loading)
+    pub(super) async_task_semaphore: Arc<tokio::sync::Semaphore>,
+    
+    // Track previous path to detect directory changes
+    pub(super) previous_path: Option<PathBuf>,
+}
+
+
+
+impl FileListContent {
+    // Cache size limits to prevent unbounded memory growth
+    const MAX_ICON_CACHE_SIZE: usize = 1000;
+    const MAX_THUMBNAIL_CACHE_SIZE: usize = 500;
+    const MAX_LAYOUT_CACHE_SIZE: usize = 2000;
+    const MAX_SVG_SCENE_CACHE_SIZE: usize = 500;
+
+    // Maximum number of concurrent async tasks (icon/thumbnail loading)
+    const MAX_CONCURRENT_ASYNC_TASKS: usize = 50;
+
+    pub(super) fn new(
+        entries: StateSignal<Vec<FileEntry>>,
+        selected_paths: StateSignal<Vec<PathBuf>>,
+        current_path: StateSignal<PathBuf>,
+        view_mode: StateSignal<FileListViewMode>,
+        icon_size: StateSignal<u32>,
+        fs_model: Arc<FileSystemModel>,
+        icon_registry: Arc<IconRegistry>,
+        thumbnail_service: Arc<ThumbnailService>,
+        icon_cache: Arc<Mutex<std::collections::HashMap<(PathBuf, u32), Option<npio::service::icon::CachedIcon>>>>,
+        thumbnail_event_rx: tokio::sync::broadcast::Receiver<ThumbnailEvent>,
+        cache_update_tx: tokio::sync::mpsc::Sender<()>,
+        cache_update_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
+        pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
+        cache_invalidate_rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
+        operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
+        selection_change_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
+    ) -> Self {
+        Self {
+            entries,
+            selected_paths,
+            current_path,
+            view_mode,
+            icon_size,
+            fs_model,
+            icon_registry,
+            thumbnail_service,
+            item_height: 30.0,
+            text_render_context: TextRenderContext::new(),
+            thumbnail_size: 128,
+            last_click_time: None,
+            last_click_index: None,
+            anchor_index: None,
+            icon_cache,
+            pending_thumbnails,
+            thumbnail_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            thumbnail_event_rx: Arc::new(Mutex::new(thumbnail_event_rx)),
+            update_manager: Arc::new(Mutex::new(None)),
+            cache_update_tx,
+            cache_update_rx,
+            cache_invalidate_rx: Arc::new(Mutex::new(cache_invalidate_rx)),
+            drag_start: None,
+            current_drag_pos: None,
+            is_dragging: false,
+            layout_cache: std::collections::HashMap::new(),
+            last_layout_width: 1000.0,
+            icon_view_padding: 2.0,
+            icon_view_spacing: 22.0,
+            svg_scene_cache: std::collections::HashMap::new(),
+            mime_registry: MimeRegistry::load_default(),
+            pending_action: Arc::new(Mutex::new(None)),
+            operation_tx,
+            last_cursor: None,
+            menu_was_open: false,
+            pending_delete_confirmation: Arc::new(Mutex::new(None)),
+            selection_change_tx,
+            hovered_item_index: None,
+            tooltip_shown: false,
+            async_task_semaphore: Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_ASYNC_TASKS)),
+            previous_path: None,
+        }
+        .with_thumbnail_size(128)
+    }
+
+    pub fn with_thumbnail_size(mut self, size: u32) -> Self {
+        self.thumbnail_size = size;
+        self
+    }
+
+    /// Evict entries from icon cache if it exceeds the limit
+    /// 
+    /// NOTE: This is NOT a true LRU (Least Recently Used) eviction strategy.
+    /// HashMap iteration order is not guaranteed, so this removes arbitrary entries.
+    /// For proper LRU behavior, consider using LinkedHashMap or a custom LRU cache structure.
+    /// This simple eviction prevents unbounded memory growth but may evict frequently-used entries.
+    fn evict_icon_cache_if_needed(&self) {
+        let mut cache = self.icon_cache.lock().expect("Failed to lock icon_cache for eviction");
+        if cache.len() > Self::MAX_ICON_CACHE_SIZE {
+            // Simple eviction: remove oldest entries (first N entries)
+            // NOTE: HashMap iteration order is not guaranteed, so this is not true LRU
+            let to_remove = cache.len() - Self::MAX_ICON_CACHE_SIZE;
+            let keys: Vec<_> = cache.keys().take(to_remove).cloned().collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+            log::debug!("Evicted {} entries from icon cache", to_remove);
+        }
+    }
+
+    /// Evict entries from thumbnail cache if it exceeds the limit
+    /// 
+    /// NOTE: This is NOT a true LRU (Least Recently Used) eviction strategy.
+    /// See evict_icon_cache_if_needed() for details.
+    fn evict_thumbnail_cache_if_needed(&self) {
+        let mut cache = self.thumbnail_cache.lock().expect("Failed to lock thumbnail_cache for eviction");
+        if cache.len() > Self::MAX_THUMBNAIL_CACHE_SIZE {
+            // Simple eviction: remove oldest entries (first N entries)
+            // NOTE: HashMap iteration order is not guaranteed, so this is not true LRU
+            let to_remove = cache.len() - Self::MAX_THUMBNAIL_CACHE_SIZE;
+            let keys: Vec<_> = cache.keys().take(to_remove).cloned().collect();
+            for key in keys {
+                cache.remove(&key);
+            }
+            log::debug!("Evicted {} entries from thumbnail cache", to_remove);
+        }
+    }
+
+    /// Evict entries from layout cache if it exceeds the limit
+    /// 
+    /// NOTE: This is NOT a true LRU (Least Recently Used) eviction strategy.
+    /// See evict_icon_cache_if_needed() for details.
+    /// 
+    /// Additionally, layout_cache is cleared when viewport width changes significantly,
+    /// as layout calculations depend on available width. Icon and thumbnail caches are
+    /// size-independent and are not cleared on viewport changes.
+    fn evict_layout_cache_if_needed(&mut self) {
+        if self.layout_cache.len() > Self::MAX_LAYOUT_CACHE_SIZE {
+            // Simple eviction: remove oldest entries (first N entries)
+            // NOTE: HashMap iteration order is not guaranteed, so this is not true LRU
+            let to_remove = self.layout_cache.len() - Self::MAX_LAYOUT_CACHE_SIZE;
+            let keys: Vec<_> = self.layout_cache.keys().take(to_remove).cloned().collect();
+            for key in keys {
+                self.layout_cache.remove(&key);
+            }
+            log::debug!("Evicted {} entries from layout cache", to_remove);
+        }
+    }
+
+    /// Evict entries from SVG scene cache if it exceeds the limit
+    /// 
+    /// NOTE: This is NOT a true LRU (Least Recently Used) eviction strategy.
+    /// See evict_icon_cache_if_needed() for details.
+    fn evict_svg_scene_cache_if_needed(&mut self) {
+        if self.svg_scene_cache.len() > Self::MAX_SVG_SCENE_CACHE_SIZE {
+            // Simple eviction: remove oldest entries (first N entries)
+            // NOTE: HashMap iteration order is not guaranteed, so this is not true LRU
+            let to_remove = self.svg_scene_cache.len() - Self::MAX_SVG_SCENE_CACHE_SIZE;
+            let keys: Vec<_> = self.svg_scene_cache.keys().take(to_remove).cloned().collect();
+            for key in keys {
+                self.svg_scene_cache.remove(&key);
+            }
+            log::debug!("Evicted {} entries from SVG scene cache", to_remove);
+        }
+    }
+
+    /// Invalidate all caches for a given path (used when files are deleted or moved)
+    /// 
+    /// This method is called automatically when FileSystemEvent::EntryRemoved is received,
+    /// ensuring that cached data for deleted files is removed to prevent memory leaks and
+    /// potential panics from accessing non-existent file paths.
+    /// 
+    /// Cache invalidation strategy:
+    /// - icon_cache: Removed by path (key is (PathBuf, u32))
+    /// - thumbnail_cache: Removed by path (key is (PathBuf, u32))
+    /// - layout_cache: Removed by path (key includes PathBuf)
+    /// - pending_thumbnails: Removed from HashSet
+    /// - svg_scene_cache: Not invalidated (keys are based on icon content, not paths)
+    fn invalidate_caches_for_path(&mut self, path: &PathBuf) {
+        // Remove from icon_cache
+        {
+            let mut cache = self.icon_cache.lock().expect("Failed to lock icon_cache for invalidation");
+            cache.retain(|(key_path, _), _| key_path != path);
+        }
+        
+        // Remove from thumbnail_cache
+        {
+            let mut cache = self.thumbnail_cache.lock().expect("Failed to lock thumbnail_cache for invalidation");
+            cache.retain(|(key_path, _), _| key_path != path);
+        }
+        
+        // Remove from pending_thumbnails
+        {
+            let mut pending = self.pending_thumbnails.lock().expect("Failed to lock pending_thumbnails for invalidation");
+            pending.remove(path);
+        }
+        
+        // Remove from layout_cache
+        self.layout_cache.retain(|(key_path, _, _, _), _| key_path != path);
+        
+        // Note: svg_scene_cache keys are based on icon content (strings), not paths,
+        // so we don't need to invalidate them based on file paths
+        
+        log::debug!("Invalidated caches for path: {:?}", path);
+    }
+
+    /// Clear selection-related state (anchor_index, tooltip state, click indices)
+    /// Called when directory changes or entries are refreshed to prevent stale state
+    fn clear_selection_state(&mut self, context: &AppContext) {
+        self.anchor_index = None;
+        self.last_click_index = None;
+        self.hovered_item_index = None;
+        self.tooltip_shown = false;
+        // Hide tooltip if it was shown
+        context.request_tooltip_hide();
+        log::debug!("Cleared selection state (anchor_index, tooltip, click indices)");
+    }
+
+    /// Notify about selection changes via channel if available
+    fn notify_selection_change(&self, paths: &[PathBuf]) {
+        if let Some(ref tx) = self.selection_change_tx {
+            let _ = tx.send(paths.to_vec());
+        }
+    }
+
+    fn is_selected(&self, path: &PathBuf) -> bool {
+        self.selected_paths.get().contains(path)
+    }
+
+    /// Format file size for tooltip display
+    fn format_file_size_for_tooltip(&self, path: &PathBuf) -> String {
+        if let Ok(metadata) = fs::metadata(path) {
+            if metadata.is_dir() {
+                // For directories, just show "Directory" (not recursive size - too expensive for tooltips)
+                "Directory".to_string()
+            } else {
+                // For files, show human-readable size
+                format_size(metadata.len(), BINARY)
+            }
+        } else {
+            "Unknown size".to_string()
+        }
+    }
+
+    /// Find the file item index under the given cursor position (for tooltip hover detection)
+    fn find_item_under_cursor(&self, local_x: f32, local_y: f32, layout_width: f32, view_mode: FileListViewMode, icon_size: u32, entries_len: usize) -> Option<usize> {
+        // Guard against negative coordinates and division by zero
+        if local_x < 0.0 || local_y < 0.0 {
+            return None;
+        }
+
+        if view_mode == FileListViewMode::List {
+            // List view: simple row calculation
+            if self.item_height <= 0.0 {
+                return None;
+            }
+            let idx = (local_y / self.item_height) as usize;
+            if idx < entries_len {
+                Some(idx)
+            } else {
+                None
+            }
+        } else if view_mode == FileListViewMode::Icon {
+            // Icon view: grid calculation
+            let (columns, cell_width, cell_height) = self.calculate_icon_view_layout(layout_width, icon_size);
+            if cell_width <= 0.0 || cell_height <= 0.0 {
+                return None;
+            }
+            let col = (local_x / cell_width).floor() as usize;
+            let row = (local_y / cell_height).floor() as usize;
+            let idx = row * columns + col;
+            if idx < entries_len {
+                Some(idx)
+            } else {
+                None
+            }
+        } else if view_mode == FileListViewMode::Compact {
+            // Compact view: grid calculation with spacing
+            let (columns, cell_width, cell_height, spacing) = self.calculate_compact_view_layout(layout_width);
+            if cell_width <= 0.0 || cell_height <= 0.0 || (cell_width + spacing) <= 0.0 || (cell_height + spacing) <= 0.0 {
+                return None;
+            }
+            let col = ((local_x - self.icon_view_padding) / (cell_width + spacing)).floor() as usize;
+            let row = ((local_y - self.icon_view_padding) / (cell_height + spacing)).floor() as usize;
+            let idx = row * columns + col;
+            if idx < entries_len {
+                let cell_x = self.icon_view_padding + col as f32 * (cell_width + spacing);
+                let cell_y = self.icon_view_padding + row as f32 * (cell_height + spacing);
+                // Check if cursor is within the cell bounds
+                if local_x >= cell_x && local_x < cell_x + cell_width && local_y >= cell_y && local_y < cell_y + cell_height {
+                    Some(idx)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
+    fn update_drag_selection(&mut self, selection_rect: Rect, toggle: bool, layout_width: f32) {
+        let entries = self.entries.get();
+        let view_mode = *self.view_mode.get();
+        let icon_size = *self.icon_size.get();
+
+        let mut new_selection = if toggle {
+            self.selected_paths.get().clone()
+        } else {
+            Vec::new()
+        };
+
+        // Helper to check intersection
+        let check_intersection = |item_rect: Rect| -> bool {
+            let intersection = selection_rect.intersect(item_rect);
+            intersection.width() > 0.0 && intersection.height() > 0.0
+        };
+
+        if view_mode == FileListViewMode::Icon {
+            let (columns, cell_width, cell_height) =
+                self.calculate_icon_view_layout(layout_width, icon_size);
+
+            for (i, entry) in entries.iter().enumerate() {
+                let (x, y) = self.get_icon_position(i, columns, cell_width, cell_height);
+                // We use the full cell rect for intersection to make it easier to select
+                let cell_rect = Rect::new(
+                    x as f64,
+                    y as f64,
+                    (x + cell_width) as f64,
+                    (y + cell_height) as f64,
+                );
+
+                if check_intersection(cell_rect) {
+                    if !new_selection.contains(&entry.path) {
+                        new_selection.push(entry.path.clone());
+                    }
+                } else if !toggle {
+                    // If not toggling, we strictly set selection to what's in the rect
+                    // So if it was selected but not in rect, it's removed (already handled by init empty Vec)
+                }
+            }
+        } else if view_mode == FileListViewMode::Compact {
+            let (columns, cell_width, cell_height, spacing) =
+                self.calculate_compact_view_layout(layout_width);
+
+            for (i, entry) in entries.iter().enumerate() {
+                let col = i % columns;
+                let row = i / columns;
+                let x = self.icon_view_padding + col as f32 * (cell_width + spacing);
+                let y = self.icon_view_padding + row as f32 * (cell_height + spacing);
+
+                let cell_rect = Rect::new(
+                    x as f64,
+                    y as f64,
+                    (x + cell_width) as f64,
+                    (y + cell_height) as f64,
+                );
+
+                if check_intersection(cell_rect) {
+                    if !new_selection.contains(&entry.path) {
+                        new_selection.push(entry.path.clone());
+                    }
+                }
+            }
+        } else {
+            // List view
+            for (i, entry) in entries.iter().enumerate() {
+                let y = i as f32 * self.item_height;
+                let row_rect = Rect::new(
+                    0.0,
+                    y as f64,
+                    layout_width as f64,
+                    (y + self.item_height) as f64,
+                );
+
+                if check_intersection(row_rect) {
+                    if !new_selection.contains(&entry.path) {
+                        new_selection.push(entry.path.clone());
+                    }
+                }
+            }
+        }
+
+        let new_selection_clone = new_selection.clone();
+        self.selected_paths.set(new_selection);
+        self.notify_selection_change(&new_selection_clone);
+    }
+
+
+    /// Show a confirmation dialog asking if the user is sure they want to delete the selected files
+    pub(super) fn show_delete_confirmation_dialog(&self, paths: &[PathBuf], context: AppContext) {
+        if paths.is_empty() {
+            return;
+        }
+
+        // Build message text
+        let message = if paths.len() == 1 {
+            let path = &paths[0];
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("<unnamed>");
+            format!("Are you sure you want to delete \"{}\"?", name)
+        } else {
+            format!("Are you sure you want to delete {} selected item(s)?", paths.len())
+        };
+
+        // Create the dialog widget with message and buttons
+        let pending_delete = self.pending_delete_confirmation.clone();
+        let paths_to_delete = paths.to_vec();
+
+        // Message text widget
+        let message_text = Text::new(message);
+        
+        // Cancel button - just closes dialog (popup closes automatically on click outside)
+        let cancel_btn = Button::new(Text::new("Cancel".to_string()))
+            .with_on_pressed(MaybeSignal::value(Update::DRAW));
+        
+        // Delete button - confirms deletion
+        let delete_btn = Button::new(Text::new("Delete".to_string()))
+            .with_on_pressed({
+                let pending_delete_btn = pending_delete.clone();
+                let paths_btn = paths_to_delete.clone();
+                MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                    // Set pending delete confirmation - will be processed in update()
+                    if let Ok(mut pending) = pending_delete_btn.lock() {
+                        *pending = Some(paths_btn.clone());
+                    }
+                    Update::DRAW
+                })))
+            });
+
+        // Build dialog content with message and buttons
+        let dialog_content = Container::new(vec![
+            Box::new(message_text),
+            Box::new(Container::new(vec![
+                Box::new(cancel_btn),
+                Box::new(delete_btn),
+            ]).with_layout_style(LayoutStyle {
+                flex_direction: nptk::core::layout::FlexDirection::Row,
+                gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
+                justify_content: Some(nptk::core::layout::JustifyContent::FlexEnd),
+                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+                ..Default::default()
+            })),
+        ]).with_layout_style(LayoutStyle {
+            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+            flex_direction: nptk::core::layout::FlexDirection::Column,
+            padding: nptk::core::layout::Rect {
+                left: LengthPercentage::length(16.0),
+                right: LengthPercentage::length(16.0),
+                top: LengthPercentage::length(16.0),
+                bottom: LengthPercentage::length(16.0),
+            },
+            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(16.0)),
+            ..Default::default()
+        });
+
+        // Show popup at cursor position or center of screen
+        let pos = self
+            .last_cursor
+            .map(|p| (p.x as i32, p.y as i32))
+            .unwrap_or((300, 200));
+        context
+            .popup_manager
+            .create_popup_at(Box::new(dialog_content), "Confirm Delete", (400, 150), pos);
+    }
+}
+
+#[async_trait(?Send)]
+impl Widget for FileListContent {
+    fn layout_style(&self, _context: &LayoutContext) -> StyleNode {
+        let view_mode = *self.view_mode.get();
+        let entries = self.entries.get();
+        let count = entries.len();
+        let width = self.last_layout_width.max(1.0);
+
+        // Calculate total height (needed for scrollbar calculation)
+        // This is always calculated for the full list to ensure correct scrollbar behavior
+        let height = if view_mode == FileListViewMode::Icon {
+            let icon_size = *self.icon_size.get();
+            let (columns, _, cell_height) = self.calculate_icon_view_layout(width, icon_size);
+            let rows = (count as f32 / columns as f32).ceil();
+            (rows * cell_height + self.icon_view_padding * 2.0).max(100.0)
+        } else if view_mode == FileListViewMode::Compact {
+            let (columns, _, cell_height, spacing) = self.calculate_compact_view_layout(width);
+            let rows = (count as f32 / columns as f32).ceil();
+            // Height = rows * cell + (rows - 1) * spacing + padding
+            // Approx: rows * (cell + spacing) - spacing + padding
+            (rows * (cell_height + spacing) - spacing + self.icon_view_padding * 2.0).max(100.0)
+        } else {
+            (count as f32 * self.item_height).max(100.0)
+        };
+
+        // Note: FileListContent doesn't create child widgets currently - it renders manually.
+        // The viewport culling optimization happens at the collect_layout level in AppHandler,
+        // which will skip processing FileListContent if it's outside the viewport.
+        // If viewport info is available, we could potentially create StyleNode children for
+        // visible items only in the future, but that would require architectural changes.
+
+        StyleNode {
+            style: LayoutStyle {
+                size: Vector2::new(Dimension::percent(1.0), Dimension::length(height)),
+                ..Default::default()
+            },
+            children: vec![],
+            measure_func: None,
+        }
+    }
+
+    async fn update(&mut self, layout: &LayoutNode, context: AppContext, info: &mut AppInfo) -> Update {
+        let mut update = Update::empty();
+        
+        // Poll for cache updates to trigger redraw when icons/thumbnails are loaded
+        // This is shared with FileListContent, but FileList needs to know to redraw ItemView
+        {
+            if let Ok(mut rx) = self.cache_update_rx.try_lock() {
+                let mut received = false;
+                while let Ok(_) = rx.try_recv() {
+                    received = true;
+                }
+                if received {
+                    update.insert(Update::DRAW);
+                }
+            }
+        }
+        // Store update manager for async tasks to trigger redraws
+        {
+            let mut update_mgr = self.update_manager.lock().expect("Failed to lock update_manager");
+            *update_mgr = Some(context.update());
+        }
+        
+        let mut update = Update::empty();
+        
+        // Check if directory changed and clear selection state if so
+        let current_path = self.current_path.get().clone();
+        if let Some(ref prev_path) = self.previous_path {
+            if prev_path != &current_path {
+                // Directory changed - clear selection state
+                self.clear_selection_state(&context);
+                update.insert(Update::DRAW);
+            }
+        }
+        self.previous_path = Some(current_path);
+        
+        // Poll cache update notifications (non-blocking)
+        if let Ok(mut rx) = self.cache_update_rx.try_lock() {
+            while rx.try_recv().is_ok() {
+                update.insert(Update::DRAW);
+            }
+        } else {
+            log::warn!("Failed to lock cache_update_rx, skipping cache update poll");
+        }
+        
+        // Poll cache invalidation requests (non-blocking)
+        let mut paths_to_invalidate = Vec::new();
+        if let Ok(mut rx) = self.cache_invalidate_rx.try_lock() {
+            while let Ok(path) = rx.try_recv() {
+                paths_to_invalidate.push(path);
+            }
+        }
+        // Invalidate caches after releasing the lock to avoid borrow checker issues
+        for path in paths_to_invalidate {
+            self.invalidate_caches_for_path(&path);
+            update.insert(Update::DRAW);
+        }
+
+        if let Some(cursor) = info.cursor_pos {
+            self.last_cursor = Some(Point::new(cursor.x, cursor.y));
+        }
+
+        // Tooltip hover detection
+        let view_mode = *self.view_mode.get();
+        let entries_len = self.entries.get().len();
+        let icon_size = *self.icon_size.get();
+        let current_hovered_index = if let Some(cursor) = info.cursor_pos {
+            let local_y = cursor.y as f32 - layout.layout.location.y;
+            let local_x = cursor.x as f32 - layout.layout.location.x;
+            let in_bounds = local_x >= 0.0
+                && local_x < layout.layout.size.width
+                && local_y >= 0.0
+                && local_y < layout.layout.size.height;
+            
+            if in_bounds {
+                self.find_item_under_cursor(local_x, local_y, layout.layout.size.width, view_mode, icon_size, entries_len)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Update hover state and show/hide tooltip
+        if current_hovered_index != self.hovered_item_index {
+            // Hover state changed
+            if let Some(index) = current_hovered_index {
+                if index < entries_len {
+                    let entry_path = {
+                        let entries = self.entries.get();
+                        entries[index].path.clone()
+                    };
+                    let tooltip_text = self.format_file_size_for_tooltip(&entry_path);
+                    // Show tooltip using TooltipManager
+                    if let Some(cursor) = info.cursor_pos {
+                        context.request_tooltip_show(
+                            tooltip_text,
+                            (cursor.x, cursor.y),
+                        );
+                    }
+                    self.hovered_item_index = Some(index);
+                    self.tooltip_shown = true;
+                }
+            } else {
+                // Mouse left the item - hide tooltip
+                context.request_tooltip_hide();
+                self.hovered_item_index = None;
+                self.tooltip_shown = false;
+            }
+            update.insert(Update::DRAW);
+        }
+
+        // Track viewport width changes to keep height estimation accurate and invalidate cached layouts.
+        let current_width = layout.layout.size.width.max(1.0);
+        if (current_width - self.last_layout_width).abs() > f32::EPSILON {
+            self.last_layout_width = current_width;
+            self.layout_cache.clear();
+        }
+
+        // Periodically evict cache entries if they exceed limits (every 60 updates to avoid overhead)
+        static UPDATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let counter = UPDATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if counter % 60 == 0 {
+            self.evict_icon_cache_if_needed();
+            self.evict_thumbnail_cache_if_needed();
+            self.evict_layout_cache_if_needed();
+            self.evict_svg_scene_cache_if_needed();
+        }
+
+        // Poll thumbnail events
+        if let Ok(mut rx) = self.thumbnail_event_rx.try_lock() {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    ThumbnailEvent::ThumbnailReady { uri, size, .. } => {
+                        // Convert URI to path for pending tracking
+                        if let Some(entry_path) = uri_to_path(&uri) {
+                            log::debug!("Thumbnail ready for {:?}", entry_path);
+                            let mut pending = self.pending_thumbnails.lock().expect("Failed to lock pending_thumbnails");
+                            pending.remove(&entry_path);
+                            
+                            // Fetch and cache the thumbnail image (non-blocking spawn)
+                            let service_clone = self.thumbnail_service.clone();
+                            let cache_clone = self.thumbnail_cache.clone();
+                            let path_clone = entry_path.clone();
+                            let size_u32 = thumbnail_size_to_u32(size);
+                            
+                            if let Ok(file) = get_file_for_uri(&uri) {
+                                let update_mgr_clone = self.update_manager.clone();
+                                let cache_update_tx_clone = self.cache_update_tx.clone();
+                                let semaphore_clone = self.async_task_semaphore.clone();
+                                tokio::spawn(async move {
+                                    // Acquire semaphore permit to limit concurrent tasks
+                                    let _permit = semaphore_clone.acquire().await.ok();
+                                    if let Ok(thumbnail_image) = service_clone
+                                        .get_thumbnail_image(&*file, size, None)
+                                        .await
+                                    {
+                                        let mut cache = cache_clone.lock().expect("Failed to lock thumbnail_cache in async task");
+                                        cache.insert((path_clone, size_u32), thumbnail_image);
+                                        
+                                        // Trigger redraw when thumbnail is cached
+                                        if let Ok(update_mgr) = update_mgr_clone.lock() {
+                                            if let Some(ref update_manager) = *update_mgr {
+                                                update_manager.insert(Update::DRAW);
+                                            }
+                                        }
+                                        
+                                        // Also send notification via channel (backup mechanism)
+                                        // Use try_send for non-blocking behavior with bounded channel
+                                        if cache_update_tx_clone.try_send(()).is_err() {
+                                            log::debug!("Cache update channel full, skipping notification");
+                                        }
+                                    }
+                                    // Permit is automatically released when dropped
+                                });
+                            }
+                            
+                            update.insert(Update::DRAW);
+                        }
+                    },
+                    ThumbnailEvent::ThumbnailFailed {
+                        uri, error_message, ..
+                    } => {
+                        if let Some(entry_path) = uri_to_path(&uri) {
+                            log::warn!(
+                                "Thumbnail generation failed for {:?}: {}",
+                                entry_path,
+                                error_message
+                            );
+                            let mut pending = self.pending_thumbnails.lock().expect("Failed to lock pending_thumbnails on failure");
+                            pending.remove(&entry_path);
+                        }
+                    },
+                }
+            }
+        }
+
+        if let Some(cursor) = info.cursor_pos {
+            let local_y = cursor.y as f32 - layout.layout.location.y;
+            let local_x = cursor.x as f32 - layout.layout.location.x;
+            let in_bounds = local_x >= 0.0
+                && local_x < layout.layout.size.width
+                && local_y >= 0.0
+                && local_y < layout.layout.size.height;
+
+            #[allow(unused_assignments)]
+            let mut index: Option<usize> = None;
+            let mut target_path: Option<PathBuf> = None;
+            let mut range_paths: Option<Vec<PathBuf>> = None;
+            let mut file_type: Option<FileType> = None;
+
+            if in_bounds {
+                let view_mode = *self.view_mode.get();
+                index = if view_mode == FileListViewMode::Icon {
+                    let icon_size = *self.icon_size.get();
+                    let (columns, cell_width, cell_height) =
+                        self.calculate_icon_view_layout(layout.layout.size.width, icon_size);
+                    // Guard against negative coordinates and division by zero
+                    if local_x < 0.0 || local_y < 0.0 || cell_width <= 0.0 || cell_height <= 0.0 {
+                        None
+                    } else {
+                        let col = (local_x / cell_width).floor() as usize;
+                        let row = (local_y / cell_height).floor() as usize;
+                        let idx = row * columns + col;
+
+                        let entry_opt = {
+                            let entries = self.entries.get();
+                            if idx < entries.len() {
+                                Some(entries[idx].clone())
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some(entry) = entry_opt {
+                            let cell_x = col as f32 * cell_width;
+                            let cell_y = row as f32 * cell_height;
+                            let cell_rect = Rect::new(
+                                cell_x as f64,
+                                cell_y as f64,
+                                (cell_x + cell_width) as f64,
+                                (cell_y + cell_height) as f64,
+                            );
+                            let is_selected = self.is_selected(&entry.path);
+                            let (icon_rect, label_rect, _, _) = self.get_icon_item_layout(
+                                &mut info.font_context,
+                                &entry,
+                                cell_rect,
+                                cell_width,
+                                icon_size as f32,
+                                is_selected,
+                            );
+
+                            let cursor_x = local_x as f64;
+                            let cursor_y = local_y as f64;
+
+                            if (cursor_x >= icon_rect.x0
+                                && cursor_x < icon_rect.x1
+                                && cursor_y >= icon_rect.y0
+                                && cursor_y < icon_rect.y1)
+                                || (cursor_x >= label_rect.x0
+                                    && cursor_x < label_rect.x1
+                                    && cursor_y >= label_rect.y0
+                                    && cursor_y < label_rect.y1)
+                            {
+                                Some(idx)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                } else if view_mode == FileListViewMode::Compact {
+                    let (columns, cell_width, cell_height, spacing) =
+                        self.calculate_compact_view_layout(layout.layout.size.width);
+                    // Guard against negative coordinates and division by zero
+                    if local_x < 0.0 || local_y < 0.0 || (cell_width + spacing) <= 0.0 || (cell_height + spacing) <= 0.0 {
+                        None
+                    } else {
+                        let col = ((local_x - self.icon_view_padding) / (cell_width + spacing)).floor()
+                            as usize;
+                        let row = ((local_y - self.icon_view_padding) / (cell_height + spacing)).floor()
+                            as usize;
+
+                        let cell_x = self.icon_view_padding + col as f32 * (cell_width + spacing);
+                        let cell_y = self.icon_view_padding + row as f32 * (cell_height + spacing);
+
+                        if local_x >= cell_x
+                            && local_x < cell_x + cell_width
+                            && local_y >= cell_y
+                            && local_y < cell_y + cell_height
+                        {
+                            let idx = row * columns + col;
+
+                            let entry_opt = {
+                                let entries = self.entries.get();
+                                if idx < entries.len() {
+                                    Some(entries[idx].clone())
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(entry) = entry_opt {
+                                let (mut icon_rect, mut label_rect) = self.get_compact_item_layout(
+                                    &mut info.font_context,
+                                    &entry,
+                                    cell_height,
+                                    cell_width,
+                                );
+                                icon_rect = icon_rect + Vec2::new(cell_x as f64, cell_y as f64);
+                                label_rect = label_rect + Vec2::new(cell_x as f64, cell_y as f64);
+
+                                let cursor_x = local_x as f64;
+                                let cursor_y = local_y as f64;
+
+                                if (cursor_x >= icon_rect.x0
+                                    && cursor_x < icon_rect.x1
+                                    && cursor_y >= icon_rect.y0
+                                    && cursor_y < icon_rect.y1)
+                                    || (cursor_x >= label_rect.x0
+                                        && cursor_x < label_rect.x1
+                                        && cursor_y >= label_rect.y0
+                                        && cursor_y < label_rect.y1)
+                                {
+                                    Some(idx)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                } else {
+                    // List view
+                    // Guard against negative coordinates and division by zero
+                    if local_y < 0.0 || self.item_height <= 0.0 {
+                        None
+                    } else {
+                        let idx = (local_y / self.item_height) as usize;
+                        let entries = self.entries.get();
+                        if idx < entries.len() {
+                            Some(idx)
+                        } else {
+                            None
+                        }
+                    }
+                };
+
+                if let Some(index) = index {
+                    let entries = self.entries.get();
+                    if index < entries.len() {
+                        let entry = &entries[index];
+                        target_path = Some(entry.path.clone());
+                        file_type = Some(entry.file_type);
+
+                        if info.modifiers.shift_key() {
+                            if let Some(anchor) = self.anchor_index {
+                                let start = anchor.min(index).min(entries.len().saturating_sub(1));
+                                let end = anchor.max(index).min(entries.len().saturating_sub(1));
+                                if start <= end && end < entries.len() {
+                                    range_paths = Some(
+                                        entries[start..=end]
+                                            .iter()
+                                            .map(|e| e.path.clone())
+                                            .collect::<Vec<_>>(),
+                                    );
+                                }
+                            } else {
+                                // No anchor set yet, set it to current index
+                                self.anchor_index = Some(index);
+                            }
+                        }
+                    }
+                }
+
+                if let Some(target_path) = target_path {
+                    let ctrl_pressed = info.modifiers.control_key();
+
+                    for (_, btn, el) in &info.buttons {
+                        if *btn == MouseButton::Right && *el == ElementState::Pressed {
+                            let mut current_selection = self.selected_paths.get().to_vec();
+                            if !current_selection.contains(&target_path) {
+                                if ctrl_pressed {
+                                    current_selection.push(target_path.clone());
+                                } else {
+                                    current_selection = vec![target_path.clone()];
+                                }
+                                let current_selection_clone = current_selection.clone();
+                                self.selected_paths.set(current_selection_clone.clone());
+                                self.notify_selection_change(&current_selection_clone);
+                                update.insert(Update::DRAW);
+                            }
+
+                            // IMPORTANT: Clear any stale pending_action when opening a new context menu
+                            // This prevents stale actions from previous menu sessions being processed
+                            if let Ok(mut pending_clear) = self.pending_action.lock() {
+                                if pending_clear.is_some() {
+                                    log::warn!("====== RIGHT-CLICK: Clearing stale pending_action when opening new context menu ======");
+                                    *pending_clear = None;
+                                } else {
+                                    log::debug!("Right-click: Opening context menu, no stale pending_action");
+                                }
+                            }
+
+                            let pending = self.pending_action.clone();
+                            let paths_for_action = current_selection.clone();
+                            let paths_for_open = paths_for_action.clone();
+
+                            let open_label = self.open_label_for_path(&target_path);
+
+                            // Build menu items using unified system
+                            let mut core_items = vec![
+                                MenuItem::new(MenuCommand::Custom(0x2001), open_label.clone())
+                                    .with_action({
+                                        let pending = pending.clone();
+                                        let paths_for_open = paths_for_open.clone();
+                                        move || {
+                                            if let Ok(mut pending_lock) = pending.lock() {
+                                                *pending_lock = Some(PendingAction {
+                                                    paths: paths_for_open.clone(),
+                                                    app_id: None,
+                                                    properties: false,
+                                                    delete: false,
+                                                });
+                                            }
+                                            Update::DRAW
+                                        }
+                                    }),
+                            ];
+
+                            // Add "Open With" submenu if needed
+                            let open_with_items = self.build_open_with_items(&target_path, paths_for_action.clone());
+                            if !open_with_items.is_empty() {
+                                let open_with_template = MenuTemplate::from_items(
+                                    "open_with",
+                                    open_with_items,
+                                );
+                                core_items.push(
+                                    MenuItem::new(MenuCommand::Custom(0x2002), "Open With")
+                                        .with_submenu(open_with_template),
+                                );
+                            }
+
+                            // Add Delete item
+                            let pending_delete = self.pending_action.clone();
+                            let delete_paths = paths_for_action.clone();
+                            core_items.push(
+                                MenuItem::new(MenuCommand::FileDelete, "Delete")
+                                    .with_action(move || {
+                                        log::warn!("====== DELETE MENU ITEM CLICKED - setting pending_action for {} paths ======", delete_paths.len());
+                                        if let Ok(mut pending_lock) = pending_delete.lock() {
+                                            *pending_lock = Some(PendingAction {
+                                                paths: delete_paths.clone(),
+                                                app_id: None,
+                                                properties: false,
+                                                delete: true,
+                                            });
+                                            log::warn!("====== pending_action.delete set to true ======");
+                                        }
+                                        Update::DRAW
+                                    }),
+                            );
+
+                            // Add Properties item
+                            let pending_props = self.pending_action.clone();
+                            let props_paths = paths_for_action.clone();
+                            core_items.push(
+                                MenuItem::new(MenuCommand::Custom(0x2006), "Properties")
+                                    .with_action(move || {
+                                        println!("DEBUG: Properties menu item clicked");
+                                        if let Ok(mut pending_lock) = pending_props.lock() {
+                                            *pending_lock = Some(PendingAction {
+                                                paths: props_paths.clone(),
+                                                app_id: None,
+                                                properties: true,
+                                                delete: false,
+                                            });
+                                            println!("DEBUG: Properties action set in pending_action");
+                                        }
+                                        Update::DRAW
+                                    }),
+                            );
+
+                            // Build groups with separators
+                            let mut all_items = core_items;
+                            all_items.push(MenuItem::separator());
+                            all_items.push(
+                                MenuItem::new(MenuCommand::Custom(0x2003), "Share (placeholder)")
+                                    .with_action(|| Update::empty()),
+                            );
+                            all_items.push(MenuItem::separator());
+                            all_items.push(
+                                MenuItem::new(MenuCommand::Custom(0x2004), "Extensions (placeholder)")
+                                    .with_action(|| Update::empty()),
+                            );
+                            all_items.push(MenuItem::separator());
+                            all_items.push(
+                                MenuItem::new(MenuCommand::Custom(0x2005), "View options (placeholder)")
+                                    .with_action(|| Update::empty()),
+                            );
+
+                            let menu_template = MenuTemplate::from_items("file_context_menu", all_items);
+                            
+                            if let Some(cursor_pos) = info.cursor_pos {
+                                let cursor = Point::new(cursor_pos.x, cursor_pos.y);
+                                context.menu_manager.show(menu_template, cursor);
+                                update.insert(Update::DRAW);
+                            }
+                        }
+
+                        if *btn == MouseButton::Left && *el == ElementState::Pressed {
+                            log::debug!("LEFT-CLICK on file: {:?}", target_path.file_name());
+                            let mut selected = self.selected_paths.get().clone();
+                            let is_currently_selected = selected.contains(&target_path);
+
+                            if let Some(range_paths) = &range_paths {
+                                if ctrl_pressed {
+                                    let mut selected_set: HashSet<PathBuf> =
+                                        selected.iter().cloned().collect();
+                                    for path in range_paths {
+                                        selected_set.insert(path.clone());
+                                    }
+                                    selected = selected_set.into_iter().collect();
+                                } else {
+                                    selected = range_paths.clone();
+                                }
+                            } else if ctrl_pressed {
+                                if is_currently_selected {
+                                    selected.retain(|p| p != &target_path);
+                                } else {
+                                    selected.push(target_path.clone());
+                                }
+                                self.anchor_index = index;
+                            } else {
+                                selected = vec![target_path.clone()];
+                                self.anchor_index = index;
+                            }
+
+                            let selected_clone = selected.clone();
+                            self.selected_paths.set(selected);
+                            self.notify_selection_change(&selected_clone);
+                            update.insert(Update::DRAW);
+
+                            let now = Instant::now();
+                            if let Some(last_time) = self.last_click_time {
+                                if let Some(last_index) = self.last_click_index {
+                                    let entries_len = {
+                                        let entries = self.entries.get();
+                                        entries.len()
+                                    };
+                                    if last_index < entries_len
+                                        && Some(last_index) == index
+                                        && now.duration_since(last_time)
+                                            < Duration::from_millis(500)
+                                    {
+                                        if let Some(ftype) = file_type {
+                                            if ftype == FileType::Directory {
+                                                self.current_path.set(target_path.clone());
+                                                let _ = self.fs_model.refresh(&target_path);
+                                                self.selected_paths.set(Vec::new());
+                                                self.notify_selection_change(&Vec::new());
+                                                // Clear selection state when navigating to new directory
+                                                self.clear_selection_state(&context);
+                                                update.insert(Update::LAYOUT);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            self.last_click_time = Some(now);
+                            self.last_click_index = index;
+                        }
+                    }
+                } else {
+                    for (_, btn, el) in &info.buttons {
+                        if *btn == MouseButton::Left && *el == ElementState::Pressed {
+                            self.drag_start = Some(Point::new(local_x as f64, local_y as f64));
+                            self.current_drag_pos =
+                                Some(Point::new(local_x as f64, local_y as f64));
+                            self.is_dragging = false;
+
+                            if !info.modifiers.control_key() {
+                                self.selected_paths.set(Vec::new());
+                                self.notify_selection_change(&Vec::new());
+                                update.insert(Update::DRAW);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Drag handling outside bounds to keep tracking when cursor leaves the window.
+            if let Some(start_pos) = self.drag_start {
+                let mut released = false;
+                for (_, btn, el) in &info.buttons {
+                    if *btn == MouseButton::Left && *el == ElementState::Released {
+                        released = true;
+                        break;
+                    }
+                }
+
+                if released {
+                    self.drag_start = None;
+                    self.current_drag_pos = None;
+                    self.is_dragging = false;
+                    update.insert(Update::DRAW);
+                } else {
+                    let current_pos = Point::new(local_x as f64, local_y as f64);
+                    self.current_drag_pos = Some(current_pos);
+
+                    if !self.is_dragging {
+                        let dx = current_pos.x - start_pos.x;
+                        let dy = current_pos.y - start_pos.y;
+                        if dx.abs() > 5.0 || dy.abs() > 5.0 {
+                            self.is_dragging = true;
+                        }
+                    }
+
+                    if self.is_dragging {
+                        let min_x = start_pos.x.min(current_pos.x);
+                        let min_y = start_pos.y.min(current_pos.y);
+                        let max_x = start_pos.x.max(current_pos.x);
+                        let max_y = start_pos.y.max(current_pos.y);
+
+                        let selection_rect = Rect::new(min_x, min_y, max_x, max_y);
+
+                        self.update_drag_selection(
+                            selection_rect,
+                            info.modifiers.control_key(),
+                            layout.layout.size.width,
+                        );
+                        update.insert(Update::DRAW);
+                    }
+                }
+            }
+        }
+
+        // Check menu state to detect when menu closes
+        let menu_is_open = context.menu_manager.is_open();
+        
+        // Process any pending action set by context menu callbacks.
+        // Menu item actions set pending_action when clicked, and we should process it
+        // immediately (menu item actions return Update::DRAW which triggers this update cycle).
+        // However, we need to prevent stale actions from being processed when clicking elsewhere.
+        // Strategy: Only process pending_action if:
+        // 1. Menu just closed (menu_was_open && !menu_is_open)
+        // 2. There is actually a pending action set
+        // 3. The pending action was set by a menu item click (not stale from a previous session)
+        let menu_just_closed = !menu_is_open && self.menu_was_open;
+        
+        if menu_just_closed {
+            log::debug!("Menu just closed, checking for pending_action");
+            if let Ok(mut pending) = self.pending_action.lock() {
+                if let Some(action) = pending.take() {
+                    // Action was set by a menu item click during this menu session
+                    println!("DEBUG: Processing pending action - properties: {}, delete: {}, paths: {}", 
+                             action.properties, action.delete, action.paths.len());
+                    log::warn!("====== MENU CLOSED - PROCESSING PENDING ACTION: delete={}, properties={}, paths={} ======", 
+                              action.delete, action.properties, action.paths.len());
+                    // Action was set - process it immediately
+                    if action.delete {
+                        // Delete action - show confirmation dialog first
+                        log::warn!("====== SHOWING DELETE CONFIRMATION DIALOG for {} paths ======", action.paths.len());
+                        self.show_delete_confirmation_dialog(&action.paths, context);
+                        update.insert(Update::DRAW);
+                    } else if let Some(app_id) = action.app_id {
+                        for path in action.paths.iter() {
+                            if let Err(err) = self.mime_registry.launch(&app_id, path) {
+                                log::warn!(
+                                    "Failed to launch {} with {}: {}",
+                                    path.display(),
+                                    app_id,
+                                    err
+                                );
+                            }
+                        }
+                    } else if action.properties {
+                        println!("DEBUG: Properties action triggered for {} paths", action.paths.len());
+                        log::info!("Properties action triggered for {} paths", action.paths.len());
+                        self.show_properties_popup(&action.paths, context);
+                    } else {
+                        if action.paths.len() == 1 {
+                            let path = &action.paths[0];
+                            if path.is_dir() {
+                                self.current_path.set(path.clone());
+                                let _ = self.fs_model.refresh(path);
+                                self.selected_paths.set(Vec::new());
+                                self.notify_selection_change(&Vec::new());
+                                update.insert(Update::LAYOUT | Update::DRAW);
+                            } else {
+                                FileListContent::launch_path(self.mime_registry.clone(), path.clone());
+                            }
+                        } else {
+                            // Multi-selection: launch all files, skip directories.
+                            for path in action.paths.iter() {
+                                if path.is_dir() {
+                                    continue;
+                                }
+                                FileListContent::launch_path(self.mime_registry.clone(), path.clone());
+                            }
+                        }
+                    }
+                } else {
+                    // Menu closed but no pending action - this is normal (user clicked outside or pressed Esc)
+                    log::debug!("Menu closed without pending action - user dismissed menu");
+                }
+            }
+        } else if !menu_is_open {
+            // Menu is not open and wasn't open before - clear any stale pending_action
+            // This prevents actions from being processed when clicking elsewhere after menu was closed
+            if let Ok(mut pending) = self.pending_action.lock() {
+                if pending.is_some() {
+                    log::warn!("Clearing stale pending_action - no menu context (should not happen after fixes)");
+                    *pending = None;
+                }
+            }
+        }
+        
+        // Update menu state AFTER processing but BEFORE next cycle
+        // Reset menu_was_open to false once we've processed the action to prevent re-processing
+        if menu_just_closed {
+            self.menu_was_open = false;
+        } else {
+            self.menu_was_open = menu_is_open;
+        }
+
+        // Process confirmed delete operations (user clicked "Delete" in confirmation dialog)
+        if let Ok(mut pending_delete) = self.pending_delete_confirmation.lock() {
+            if let Some(paths) = pending_delete.take() {
+                // User confirmed - proceed with deletion
+                if let Some(ref op_tx) = self.operation_tx {
+                    if let Err(e) = op_tx.send(FileListOperation::Delete(paths.clone())) {
+                        log::error!("Failed to send delete operation: {}", e);
+                    } else {
+                        log::info!("Delete operation confirmed and sent for paths: {:?}", paths);
+                        update.insert(Update::DRAW);
+                    }
+                } else {
+                    log::warn!("Delete confirmed but no operation channel available");
+                }
+            }
+        }
+
+        update
+    }
+
+    fn render(
+        &mut self,
+        graphics: &mut dyn Graphics,
+        layout: &LayoutNode,
+        info: &mut AppInfo,
+        context: AppContext,
+    ) {
+        let palette = context.palette();
+        
+        // DEBUG: Log render calls to investigate frequency
+        // use std::sync::atomic::{AtomicU64, Ordering};
+        // static RENDER_COUNTER: AtomicU64 = AtomicU64::new(0);
+        // let count = RENDER_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // if count % 60 == 0 {
+        //     // println!("FileList render called {} times", count);
+        // }
+
+        let view_mode = *self.view_mode.get();
+
+        if view_mode == FileListViewMode::Icon {
+            self.render_icon_view(graphics, palette, layout, info);
+        } else if view_mode == FileListViewMode::Compact {
+            self.render_compact_view(graphics, palette, layout, info);
+        } else {
+            self.render_list_view(graphics, palette, layout, info);
+        }
+
+        // Draw drag selection rectangle
+        if self.is_dragging {
+            if let (Some(start), Some(current)) = (self.drag_start, self.current_drag_pos) {
+                let min_x = start.x.min(current.x);
+                let min_y = start.y.min(current.y);
+                let max_x = start.x.max(current.x);
+                let max_y = start.y.max(current.y);
+
+                let rect = Rect::new(min_x, min_y, max_x, max_y);
+
+                let selection_color = palette.color(ColorRole::Selection);
+
+                // Draw selection fill
+                graphics.fill(
+                    Fill::NonZero,
+                    Affine::translate((
+                        layout.layout.location.x as f64,
+                        layout.layout.location.y as f64,
+                    )),
+                    &Brush::Solid(selection_color.with_alpha(0.2)),
+                    None,
+                    &rect.to_path(0.1),
+                );
+
+                // Draw selection border
+                graphics.stroke(
+                    &Stroke::new(1.0),
+                    Affine::translate((
+                        layout.layout.location.x as f64,
+                        layout.layout.location.y as f64,
+                    )),
+                    &Brush::Solid(selection_color.with_alpha(0.8)),
+                    None,
+                    &rect.to_path(0.1),
+                );
+            }
+        }
+    }
+}
+

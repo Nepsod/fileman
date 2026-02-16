@@ -1,4 +1,5 @@
-use super::{FileListContent, PendingAction};
+use super::content::FileListContent;
+use super::types::PendingAction;
 use nptk::core::menu::{MenuItem, MenuCommand};
 use nptk::core::app::update::Update;
 use npio::service::filesystem::mime_registry::MimeRegistry;

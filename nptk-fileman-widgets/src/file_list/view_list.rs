@@ -1,4 +1,4 @@
-use super::FileListContent;
+use super::content::FileListContent;
 use nptk::widgets::file_icon::renderer::{render_cached_icon, render_fallback_icon};
 use nptk::core::app::info::AppInfo;
 use nptk::core::layout::LayoutNode;
