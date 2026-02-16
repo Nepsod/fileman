@@ -10,6 +10,7 @@ license = "GPL-3.0"
 npio = { workspace = true }
 nptk = { workspace = true }
 nptk-fileman-widgets = { workspace = true }
+nptk-widgets-extra = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
 smol = { workspace = true }

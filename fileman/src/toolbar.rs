@@ -8,8 +8,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc;
-use nptk::core::menu::{MenuTemplate, MenuItem, MenuCommand};
-use nptk::core::vg::kurbo::Point;
+use nptk::core::menu::MenuCommand;
+use nptk_widgets_extra::menu_button::MenuButton;
+
+// Helper to create menu items with unified type
+use nptk::core::menu::unified::MenuItem;
+use nptk::widgets::container::Container;
+use nptk::core::layout::{FlexDirection, AlignItems, LayoutStyle, LengthPercentage, Dimension};
 
 // Toolbar types are re-exported from nptk prelude
 // They're already available via `use nptk::prelude::*;`
@@ -81,7 +86,6 @@ pub struct ToolbarWrapper {
     delete_requested: Arc<Mutex<bool>>,
     rename_requested: Arc<Mutex<bool>>,
     view_mode_signal: nptk::core::signal::state::StateSignal<FileListViewMode>,
-    view_menu_requested: Arc<Mutex<bool>>,
 }
 
 impl ToolbarWrapper {
@@ -216,23 +220,53 @@ impl ToolbarWrapper {
             .with_tooltip("Delete")
             .with_status_tip("Delete the selected items");
 
-        let view_menu_requested = Arc::new(Mutex::new(false));
-        let view_btn = ToolbarButton::with_children(vec![
-            Box::new(Icon::new("view-list-details", 24, None)), // Fallback icon name, hopefully exists or falls back text
-            Box::new(Text::new("View".to_string()).with_font_size(14.0))
-        ])
-         // Use FuncSignal because we need side effects every time
-         .with_on_pressed({
-                let view_menu_flag = view_menu_requested.clone();
-                nptk::core::signal::MaybeSignal::signal(Box::new(FuncSignal::new(move || {
-                    if let Ok(mut flag) = view_menu_flag.lock() {
-                        *flag = true;
-                    }
-                    Update::DRAW
-                })))
+        let view_btn = MenuButton::with_child(
+            Container::new(vec![
+                Box::new(Icon::new("view-list-details", 24, None)),
+                Box::new(Text::new("View".to_string()).with_font_size(14.0))
+            ])
+            .with_layout_style(LayoutStyle {
+                flex_direction: FlexDirection::Row,
+                align_items: Some(AlignItems::Center),
+                gap: nalgebra::Vector2::new(LengthPercentage::length(4.0), LengthPercentage::length(0.0)),
+                ..Default::default()
             })
-            .with_tooltip("Change View")
-            .with_status_tip("Switch between List, Icon, and Details views");
+        )
+        .with_items_builder({
+            let view_mode_signal = view_mode_signal.clone();
+            move || {
+                let current_mode = *view_mode_signal.get();
+                let signal = view_mode_signal.clone();
+                vec![
+                    MenuItem::new(MenuCommand::ViewIcon, "Icon View")
+                        .with_checked(current_mode == FileListViewMode::Icon)
+                        .with_action({
+                            let signal = signal.clone();
+                            move || { signal.set(FileListViewMode::Icon); Update::DRAW }
+                        }),
+                    MenuItem::new(MenuCommand::ViewList, "List View")
+                        .with_checked(current_mode == FileListViewMode::List)
+                        .with_action({
+                            let signal = signal.clone();
+                            move || { signal.set(FileListViewMode::List); Update::DRAW }
+                        }),
+                    MenuItem::new(MenuCommand::ViewSmallIcon, "Compact View")
+                        .with_checked(current_mode == FileListViewMode::Compact)
+                        .with_action({
+                            let signal = signal.clone();
+                            move || { signal.set(FileListViewMode::Compact); Update::DRAW }
+                        }),
+                    MenuItem::new(MenuCommand::ViewDetails, "Table View")
+                        .with_checked(current_mode == FileListViewMode::Table)
+                        .with_action({
+                            let signal = signal.clone();
+                            move || { signal.set(FileListViewMode::Table); Update::DRAW }
+                        }),
+                ]
+            }
+        })
+        .with_tooltip("Change View");
+        // .with_status_tip("Switch between List, Icon, and Details views"); // MenuButton doesn't support status tip yet
 
         let toolbar = Toolbar::new()
             .with_child(back_btn)
@@ -266,7 +300,6 @@ impl ToolbarWrapper {
             delete_requested,
             rename_requested,
             view_mode_signal,
-            view_menu_requested,
         };
 
         (wrapper, nav_tx)
@@ -405,75 +438,7 @@ impl Widget for ToolbarWrapper {
             }
         }
 
-        // Handle view menu request
-        if let Ok(mut flag) = self.view_menu_requested.lock() {
-            if *flag {
-                *flag = false;
-                
-                let current_mode = *self.view_mode_signal.get();
-                let view_signal = self.view_mode_signal.clone();
-                
-                let mut menu = MenuTemplate::new("view_mode_menu");
-                
-                // Icon View
-                let item_icon = MenuItem::new(MenuCommand::ViewIcon, "Icon View")
-                    .with_checked(current_mode == FileListViewMode::Icon)
-                    .with_action({
-                        let signal = view_signal.clone();
-                        move || {
-                            signal.set(FileListViewMode::Icon);
-                            Update::DRAW
-                        }
-                    });
-                menu = menu.add_item(item_icon);
 
-                // List View
-                let item_list = MenuItem::new(MenuCommand::ViewList, "List View")
-                    .with_checked(current_mode == FileListViewMode::List)
-                    .with_action({
-                        let signal = view_signal.clone();
-                        move || {
-                            signal.set(FileListViewMode::List);
-                            Update::DRAW
-                        }
-                    });
-                menu = menu.add_item(item_list);
-
-                // Compact View
-                let item_compact = MenuItem::new(MenuCommand::ViewSmallIcon, "Compact View")
-                    .with_checked(current_mode == FileListViewMode::Compact)
-                    .with_action({
-                        let signal = view_signal.clone();
-                        move || {
-                            signal.set(FileListViewMode::Compact);
-                            Update::DRAW
-                        }
-                    });
-                menu = menu.add_item(item_compact);
-
-                // Table View
-                let item_table = MenuItem::new(MenuCommand::ViewDetails, "Table View")
-                    .with_checked(current_mode == FileListViewMode::Table)
-                    .with_action({
-                        let signal = view_signal.clone();
-                        move || {
-                            signal.set(FileListViewMode::Table);
-                            Update::DRAW
-                        }
-                    });
-                menu = menu.add_item(item_table);
-                
-                // Show menu at cursor position if available, or default position
-                let pos = if let Some(cursor) = info.cursor_pos {
-                    Point::new(cursor.x, cursor.y)
-                } else {
-                    Point::new(100.0, 100.0)
-                };
-                
-                context.menu_manager.show(menu, pos);
-                update.insert(Update::DRAW);
-            }
-        }
 
         // Update button states reactively from navigation
         if let Ok(nav) = self.navigation.lock() {
@@ -498,6 +463,16 @@ impl Widget for ToolbarWrapper {
         context: nptk::core::app::context::AppContext,
     ) {
         self.inner.render(graphics, layout, info, context)
+    }
+
+    fn render_postfix(
+        &mut self,
+        graphics: &mut dyn nptk::core::vgi::Graphics,
+        layout: &nptk::core::layout::LayoutNode,
+        info: &mut nptk::core::app::info::AppInfo,
+        context: nptk::core::app::context::AppContext,
+    ) {
+        self.inner.render_postfix(graphics, layout, info, context)
     }
 }
 

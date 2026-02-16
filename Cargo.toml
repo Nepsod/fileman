@@ -14,6 +14,7 @@ repository = "https://github.com/Nepsod/fileman"
 [workspace.dependencies]
 npio = { path = "../npio" }
 nptk = { path = "../nptk" }
+nptk-widgets-extra = { path = "../nptk/nptk-widgets-extra" }
 
 # For rust-analyzer visibility
 nptk-fileman-widgets = { path = "nptk-fileman-widgets" }
