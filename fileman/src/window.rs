@@ -741,7 +741,6 @@ impl Widget for FileListWrapper {
                 },
                 FileListOperation::Delete(paths) => {
                      // Convert to FileOperationRequest and process
-                    let paths_clone = paths.clone();
                     self.perform_delete_request(paths, context.clone());
                 },
                 FileListOperation::Sort(col, order) => {

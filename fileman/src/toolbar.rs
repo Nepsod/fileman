@@ -14,7 +14,7 @@ use nptk_widgets_extra::menu_button::MenuButton;
 // Helper to create menu items with unified type
 use nptk::core::menu::unified::MenuItem;
 use nptk::widgets::container::Container;
-use nptk::core::layout::{FlexDirection, AlignItems, LayoutStyle, LengthPercentage, Dimension};
+use nptk::core::layout::{FlexDirection, AlignItems, LayoutStyle, LengthPercentage};
 
 // Toolbar types are re-exported from nptk prelude
 // They're already available via `use nptk::prelude::*;`
