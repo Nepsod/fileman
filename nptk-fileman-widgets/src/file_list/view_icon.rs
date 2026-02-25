@@ -425,12 +425,7 @@ impl FileListContent {
             )
         };
 
-        // Apply clipping for text rendering to prevent overflow
-        use nptk::core::vg::peniko::Mix;
-        #[allow(deprecated)]
-        graphics.push_layer(
-            Mix::Clip,
-            1.0,
+        graphics.push_clip_layer(
             Affine::IDENTITY,
             &text_clip_rect.to_path(0.1),
         );
