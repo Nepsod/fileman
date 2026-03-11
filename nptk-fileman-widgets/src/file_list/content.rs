@@ -622,27 +622,16 @@ impl Widget for FileListContent {
 
     async fn update(&mut self, layout: &LayoutNode, context: AppContext, info: &mut AppInfo) -> Update {
         let mut update = Update::empty();
-        
-        // Poll for cache updates to trigger redraw when icons/thumbnails are loaded
-        // This is shared with FileListContent, but FileList needs to know to redraw ItemView
-        {
-            if let Ok(mut rx) = self.cache_update_rx.try_lock() {
-                let mut received = false;
-                while let Ok(_) = rx.try_recv() {
-                    received = true;
-                }
-                if received {
-                    update.insert(Update::DRAW);
-                }
-            }
-        }
+
+        const MAX_CACHE_UPDATES_PER_FRAME: usize = 256;
+        const MAX_INVALIDATIONS_PER_FRAME: usize = 256;
+        const MAX_THUMBNAIL_EVENTS_PER_FRAME: usize = 128;
+
         // Store update manager for async tasks to trigger redraws
         {
             let mut update_mgr = self.update_manager.lock().expect("Failed to lock update_manager");
             *update_mgr = Some(context.update());
         }
-        
-        let mut update = Update::empty();
         
         // Check if directory changed and clear selection state if so
         let current_path = self.current_path.get().clone();
@@ -657,7 +646,9 @@ impl Widget for FileListContent {
         
         // Poll cache update notifications (non-blocking)
         if let Ok(mut rx) = self.cache_update_rx.try_lock() {
-            while rx.try_recv().is_ok() {
+            let mut processed = 0usize;
+            while processed < MAX_CACHE_UPDATES_PER_FRAME && rx.try_recv().is_ok() {
+                processed += 1;
                 update.insert(Update::DRAW);
             }
         } else {
@@ -667,7 +658,13 @@ impl Widget for FileListContent {
         // Poll cache invalidation requests (non-blocking)
         let mut paths_to_invalidate = Vec::new();
         if let Ok(mut rx) = self.cache_invalidate_rx.try_lock() {
-            while let Ok(path) = rx.try_recv() {
+            let mut processed = 0usize;
+            while processed < MAX_INVALIDATIONS_PER_FRAME {
+                let path = match rx.try_recv() {
+                    Ok(path) => path,
+                    Err(_) => break,
+                };
+                processed += 1;
                 paths_to_invalidate.push(path);
             }
         }
@@ -750,7 +747,13 @@ impl Widget for FileListContent {
 
         // Poll thumbnail events
         if let Ok(mut rx) = self.thumbnail_event_rx.try_lock() {
-            while let Ok(event) = rx.try_recv() {
+            let mut processed = 0usize;
+            while processed < MAX_THUMBNAIL_EVENTS_PER_FRAME {
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(_) => break,
+                };
+                processed += 1;
                 match event {
                     ThumbnailEvent::ThumbnailReady { uri, size, .. } => {
                         // Convert URI to path for pending tracking

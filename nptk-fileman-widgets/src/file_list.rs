@@ -15,7 +15,7 @@ use nptk::core::vgi::Graphics;
 use nptk::core::widget::{BoxedWidget, Widget, WidgetLayoutExt};
 use nptk::core::window::{ElementState, MouseButton};
 use nptk::prelude::LayoutContext;
-use nptk::services::filesystem::entry::{FileEntry, FileType};
+use nptk::services::filesystem::entry::{FileEntry, FileMetadata, FileType};
 use nptk::services::filesystem::model::{FileSystemEvent, FileSystemModel};
 use npio::service::icon::IconRegistry;
 use npio::{ThumbnailService, ThumbnailEvent, ThumbnailImage, get_file_for_uri, register_backend};
@@ -66,6 +66,7 @@ pub struct FileList {
     view_mode: StateSignal<FileListViewMode>,
     icon_size: StateSignal<u32>,
     search_query: StateSignal<String>,
+    search_scope: Option<StateSignal<SearchScope>>,
 
     // Model
     fs_model: Arc<FileSystemModel>,
@@ -119,6 +120,17 @@ pub struct FileList {
     
     // Model for sorting
     sort_model: Option<Arc<FileSystemItemModel>>,
+
+    // Recursive search: when scope is FolderAndSubfolders
+    recursive_result_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<FileEntry>>>,
+    last_recursive_search: Option<(PathBuf, String)>,
+    // Track the last current-folder filter key so we only recompute when needed
+    last_current_folder_search: Option<(PathBuf, String, usize)>,
+    /// Receiver for current-folder filter results (filter runs in spawn_blocking to avoid blocking UI)
+    current_folder_result_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<FileEntry>>>,
+
+    // Pending search query from location bar (avoids setting signal from inside TextInput update)
+    search_pending_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 }
 
 impl FileList {
@@ -129,17 +141,21 @@ impl FileList {
 
     /// Create a new file list widget.
     pub fn new(initial_path: PathBuf) -> Self {
-        Self::new_with_operations(initial_path, None, None)
+        Self::new_with_operations(initial_path, None, None, None, None)
     }
 
     /// Create a new file list widget with optional operation channel for file operations.
-    /// 
+    ///
     /// `operation_tx` - if provided, file operations (like delete) will be sent via this channel.
     /// `selection_change_tx` - if provided, selection changes will be notified via this channel.
+    /// `search_query_signal` - if provided, this signal is used for search filtering (shared with location bar for live search).
+    /// `search_pending_rx` - if provided with search_query_signal, search text is received here (from location bar) and applied in update to avoid reentrant signal writes.
     pub fn new_with_operations(
         initial_path: PathBuf,
         operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
         selection_change_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>,
+        search_query_signal: Option<StateSignal<String>>,
+        search_pending_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     ) -> Self {
         let fs_model = Arc::new(
             FileSystemModel::new(initial_path.clone())
@@ -171,7 +187,7 @@ impl FileList {
         let selected_paths = StateSignal::new(Vec::new());
         let view_mode = StateSignal::new(FileListViewMode::List);
         let icon_size = StateSignal::new(48);
-        let search_query = StateSignal::new(String::new());
+        let search_query = search_query_signal.unwrap_or_else(|| StateSignal::new(String::new()));
 
         // Create icon registry
         let icon_registry =
@@ -249,6 +265,7 @@ impl FileList {
             view_mode,
             icon_size,
             search_query,
+            search_scope: None,
             fs_model,
             _event_rx: event_rx,
             layout_style: LayoutStyle {
@@ -276,6 +293,11 @@ impl FileList {
             svg_scene_cache,
             operation_tx,
             sort_model: None,
+            recursive_result_rx: None,
+            last_recursive_search: None,
+            last_current_folder_search: None,
+            current_folder_result_rx: None,
+            search_pending_rx,
         }
     }
 
@@ -638,6 +660,11 @@ impl FileList {
     pub fn set_search_query(&mut self, query: String) {
         self.search_query.set(query);
     }
+
+    pub fn with_search_scope_signal(mut self, signal: StateSignal<SearchScope>) -> Self {
+        self.search_scope = Some(signal);
+        self
+    }
     
     /// Sort the file list by the given column and order.
     /// Columns: 0=Name, 1=Size, 2=Type, 3=Date
@@ -677,8 +704,7 @@ impl Widget for FileList {
     }
 
     async fn update(&mut self, layout: &LayoutNode, context: AppContext, info: &mut AppInfo) -> Update {
-        let mode = *self.view_mode.get();
-        println!("FileList::update: mode={:?}, layout_children={}", mode, layout.children.len());
+        let _mode = *self.view_mode.get();
         
         // Ensure ItemView is initialized for all view modes
         self.ensure_item_view();
@@ -691,8 +717,34 @@ impl Widget for FileList {
             context.hook_signal(&mut self.selected_paths);
             context.hook_signal(&mut self.view_mode);
             context.hook_signal(&mut self.icon_size);
-            context.hook_signal(&mut self.search_query);
+            if self.search_pending_rx.is_none() {
+                context.hook_signal(&mut self.search_query);
+            }
+            if let Some(ref mut scope) = self.search_scope {
+                context.hook_signal(scope);
+            }
             self.signals_hooked = true;
+        }
+
+        // Apply pending search query from location bar (avoids signal write from inside TextInput update).
+        // Coalesce and bound the number of updates per frame to keep UI responsive even if many keystrokes
+        // are queued (e.g. when typing quickly or if a slow search/filtering path is active).
+        if let Some(ref mut rx) = self.search_pending_rx {
+            const MAX_SEARCH_UPDATES_PER_FRAME: usize = 64;
+            let mut updates_processed = 0usize;
+            let mut last_value: Option<String> = None;
+            while updates_processed < MAX_SEARCH_UPDATES_PER_FRAME {
+                match rx.try_recv() {
+                    Ok(value) => {
+                        updates_processed += 1;
+                        last_value = Some(value);
+                    }
+                    Err(_) => break,
+                }
+            }
+            if let Some(value) = last_value {
+                self.search_query.set(value);
+            }
         }
         
         let mut update = Update::empty();
@@ -737,35 +789,45 @@ impl Widget for FileList {
         }
         
         // Poll filesystem events FIRST - this must happen before ItemView handling
-        // so that entries get updated even when using ItemView
+        // so that entries get updated even when using ItemView.
+        // Limit per-frame event processing and coalesce refreshes to keep UI responsive.
         if let Ok(mut rx) = self._event_rx.try_lock() {
-            while let Ok(event) = rx.try_recv() {
+            const MAX_FS_EVENTS_PER_UPDATE: usize = 256;
+            let mut events_processed = 0usize;
+            while events_processed < MAX_FS_EVENTS_PER_UPDATE {
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(_) => break,
+                };
+                events_processed += 1;
                 match event {
                     FileSystemEvent::DirectoryLoaded { path, entries } => {
                         if path == *self.current_path.get() {
                             self.all_entries.set(entries.clone());
-                            
-                            // Apply filtering
+
+                            let scope_is_recursive = self
+                                .search_scope
+                                .as_ref()
+                                .map(|s| *s.get() == SearchScope::FolderAndSubfolders)
+                                .unwrap_or(false);
                             let query = self.search_query.get().to_lowercase();
-                            if query.is_empty() {
+                            let use_current_folder_only =
+                                !scope_is_recursive || query.is_empty();
+
+                            if use_current_folder_only && query.is_empty() {
                                 self.entries.set(entries);
-                            } else {
-                                let filtered: Vec<FileEntry> = entries.into_iter()
-                                    .filter(|e| e.name.to_lowercase().contains(&query))
-                                    .collect();
-                                self.entries.set(filtered);
                             }
-                            
+
                             update.insert(Update::LAYOUT | Update::DRAW);
                         }
                     },
                     FileSystemEvent::EntryAdded { path, .. } | FileSystemEvent::EntryRemoved { path } | FileSystemEvent::EntryModified { path, .. } => {
                         if let Some(parent) = path.parent() {
                             if parent == *self.current_path.get() {
-                                let _ = self.fs_model.refresh(parent);
                                 if let Err(e) = self.cache_invalidate_tx.send(path.clone()) {
                                     log::warn!("Failed to send cache invalidation request: {}", e);
                                 }
+                                update.insert(Update::DRAW);
                             }
                         }
                     },
@@ -816,59 +878,82 @@ impl Widget for FileList {
         // Actually, let's just re-filter every time for now inside the update loop if we can efficiently check change.
         // But we can't easily check change without previous value.
         // Let's add logic:
-        {
-            let all = self.all_entries.get();
-            let query = self.search_query.get().to_lowercase();
-            // let current_entries_len = self.entries.get().len();
-            
-            // This is a bit hacky: we re-filter every frame. 
-            // Better: Check if `all_entries` or `search_query` signal has changed?
-            // NPTK signals don't expose "has_changed" easily in update() without tracking.
-            // Let's assume for now that if we are here, something might have changed.
-            // But rewriting `entries` every frame causes loops if `entries` signal triggers update.
-            // So we MUST check if the result is different.
-            
-            let filtered: Vec<FileEntry> = if query.is_empty() {
-                all.clone()
-            } else {
-                all.iter()
-                    .filter(|e| e.name.to_lowercase().contains(&query))
-                    .cloned()
-                    .collect()
-            };
-            
-            // Only set if different (simple length check + first item check for optimization)
-            // Or just deep comparison since Vec<FileEntry> might not be cheap.
-            // Actually, `entries.set()` likely checks equality if T: PartialEq. FileEntry implements PartialEq.
-            // So we can just set it.
-            
-            // self.entries.set(filtered); 
-            // The problem is `self.entries.set` triggers update() again -> infinite loop!
-            // We need to check against current value before setting.
-            
-            // Perform manual equality check based on paths and essential metadata
-            // since FileEntry doesn't implement PartialEq
-            let current = self.entries.get();
-            let mut changed = current.len() != filtered.len();
-            if !changed {
-                for (a, b) in current.iter().zip(filtered.iter()) {
-                    if a.path != b.path || a.name != b.name {
-                        changed = true;
-                        break;
-                    }
-                }
+        let scope_is_recursive = self
+            .search_scope
+            .as_ref()
+            .map(|s| *s.get() == SearchScope::FolderAndSubfolders)
+            .unwrap_or(false);
+        let query = self.search_query.get().to_lowercase();
+        let use_current_folder_only = !scope_is_recursive || query.is_empty();
+
+        if !use_current_folder_only {
+            let path = self.current_path.get().clone();
+            let need_search = self
+                .last_recursive_search
+                .as_ref()
+                != Some(&(path.clone(), query.clone()));
+            if need_search {
+                self.last_recursive_search = Some((path.clone(), query.clone()));
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                self.recursive_result_rx = Some(rx);
+                let path_move = path.clone();
+                let query_move = query.clone();
+                tokio::task::spawn_blocking(move || {
+                    let results =
+                        recursive_search_entries(path_move, &query_move, MAX_RECURSIVE_SEARCH_DEPTH);
+                    let _ = tx.send(results);
+                });
             }
-            
-            if changed {
-                 self.entries.set(filtered);
-                 update.insert(Update::LAYOUT | Update::DRAW);
+        } else {
+            self.last_recursive_search = None;
+        }
+
+        if let Some(ref mut recv_rx) = self.recursive_result_rx {
+            while let Ok(results) = recv_rx.try_recv() {
+                self.entries.set(results);
+                update.insert(Update::LAYOUT | Update::DRAW);
             }
+        }
+
+        if let Some(ref mut rx) = self.current_folder_result_rx {
+            if let Ok(filtered) = rx.try_recv() {
+                self.entries.set(filtered);
+                update.insert(Update::LAYOUT | Update::DRAW);
+            }
+        }
+
+        if use_current_folder_only {
+            let path = self.current_path.get().clone();
+            let all_snapshot = self.all_entries.get().clone();
+            let filter_key = (path.clone(), query.clone(), all_snapshot.len());
+            let need_filter = self
+                .last_current_folder_search
+                .as_ref()
+                != Some(&filter_key);
+            if need_filter {
+                self.last_current_folder_search = Some(filter_key);
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                self.current_folder_result_rx = Some(rx);
+                let query_move = query.clone();
+                tokio::task::spawn_blocking(move || {
+                    let filtered: Vec<FileEntry> = if query_move.is_empty() {
+                        all_snapshot
+                    } else {
+                        all_snapshot
+                            .into_iter()
+                            .filter(|e| e.name.to_lowercase().contains(&query_move))
+                            .collect()
+                    };
+                    let _ = tx.send(filtered);
+                });
+            }
+        } else {
+            self.last_current_folder_search = None;
+            self.current_folder_result_rx = None;
         }
         
         // Ensure ItemView exists if mode is Table or List
-        let mode = *self.view_mode.get();
-        
-        if mode == FileListViewMode::Table || mode == FileListViewMode::List {
+        if _mode == FileListViewMode::Table || _mode == FileListViewMode::List {
             self.ensure_item_view();
             if let Some(ref mut view) = self.item_view {
                  // Sync FileList selection (paths) -> ItemView selection (indices)
@@ -884,13 +969,19 @@ impl Widget for FileList {
                      }
                      
                      if let Some(signal) = &self.item_view_selection {
-                         signal.set(indices);
+                         let current_indices = signal.get();
+                         if current_indices.as_slice() != indices.as_slice() {
+                             drop(current_indices);
+                             signal.set(indices);
+                         }
                      }
                  } // entries dropped here!
                  
                  // ItemView is a child in layout tree, use layout.children[0]
                 if !layout.children.is_empty() {
-                    return view.update(&layout.children[0], context, info).await;
+                    let mut ret = view.update(&layout.children[0], context.clone(), info).await;
+                    ret |= update;
+                    return ret;
                 }
             }
         }
@@ -952,6 +1043,85 @@ impl Widget for FileList {
                 .render(graphics, &layout.children[0], info, context);
         }
     }
+}
+
+const MAX_RECURSIVE_SEARCH_DEPTH: u32 = 4;
+
+fn recursive_search_entries(
+    root: PathBuf,
+    query_lower: &str,
+    max_depth: u32,
+) -> Vec<FileEntry> {
+    use std::fs;
+    use std::time::SystemTime;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut out = Vec::new();
+    fn go(
+        path: &std::path::Path,
+        query: &str,
+        depth: u32,
+        out: &mut Vec<FileEntry>,
+    ) {
+        if depth == 0 {
+            return;
+        }
+        let read_dir = match fs::read_dir(path) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        for entry in read_dir.filter_map(Result::ok) {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let meta = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let file_type = if meta.is_dir() {
+                FileType::Directory
+            } else if meta.is_symlink() {
+                FileType::Symlink
+            } else if meta.is_file() {
+                FileType::File
+            } else {
+                FileType::Other
+            };
+            #[cfg(unix)]
+            let permissions = meta.permissions().mode();
+            #[cfg(not(unix))]
+            let permissions = 0o644;
+            let metadata = FileMetadata {
+                size: meta.len(),
+                modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                created: meta.created().ok(),
+                permissions,
+                mime_type: None,
+                is_hidden: name.starts_with('.'),
+            };
+            let parent = path.parent().map(PathBuf::from);
+            if name.to_lowercase().contains(query) {
+                out.push(FileEntry::new(
+                    path.clone(),
+                    name,
+                    file_type,
+                    metadata,
+                    parent,
+                ));
+            }
+            if meta.is_dir() && !meta.is_symlink() {
+                go(&path, query, depth.saturating_sub(1), out);
+            }
+        }
+    }
+    go(&root, query_lower, max_depth, &mut out);
+    out
 }
 
 impl WidgetLayoutExt for FileList {

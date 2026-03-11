@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use nptk::core::signal::eval::EvalSignal;
 use nptk::core::shortcut::Shortcut;
 use nptk::core::window::KeyCode;
-use nptk_fileman_widgets::file_list::{FileList, FileListOperation};
+use nptk_fileman_widgets::file_list::{FileList, FileListOperation, SearchScope};
 use nptk::services::filesystem::entry::FileEntry;
 use nptk_fileman_widgets::FilemanSidebar;
 // use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem}; // Unused
@@ -65,12 +65,22 @@ impl FileListWrapper {
         operation_rx: mpsc::UnboundedReceiver<FileOperationRequest>,
         status_tx: mpsc::UnboundedSender<String>,
         navigation_path_signal: StateSignal<PathBuf>,
+        search_scope_signal: StateSignal<SearchScope>,
+        search_query_signal: StateSignal<String>,
+        search_pending_rx: Option<mpsc::UnboundedReceiver<String>>,
     ) -> Self {
         // Create channel for FileList operations
         let (file_list_op_tx, file_list_op_rx) = mpsc::unbounded_channel::<FileListOperation>();
         
-        // Create FileList (selection_change_tx is optional for backward compatibility)
-        let file_list = FileList::new_with_operations(initial_path.clone(), Some(file_list_op_tx.clone()), None);
+        // Create FileList with shared search_query for live search; search_pending_rx avoids signal write from TextInput
+        let file_list = FileList::new_with_operations(
+            initial_path.clone(),
+            Some(file_list_op_tx.clone()),
+            None,
+            Some(search_query_signal),
+            search_pending_rx,
+        )
+            .with_search_scope_signal(search_scope_signal);
         
         // Clone signals from FileList for reactive subscription
         let file_list_path_signal = file_list.current_path_signal().clone();
@@ -998,6 +1008,7 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     
     // Create focus channel for location bar
     let (focus_tx, focus_rx) = mpsc::unbounded_channel::<()>();
+    let (activate_search_tx, activate_search_rx) = mpsc::unbounded_channel::<()>();
 
     // Register keyboard shortcuts
     // Focus location bar
@@ -1021,6 +1032,13 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
             }
         },
     );
+    context.shortcut_registry.register(
+        Shortcut::ctrl(KeyCode::KeyF),
+        move || {
+            let _ = activate_search_tx.send(());
+            Update::DRAW
+        },
+    );
 
     // Create FilemanSidebar
     let mut sidebar = FilemanSidebar::new()
@@ -1034,6 +1052,10 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     let sidebar_nav_rx = sidebar.take_navigation_receiver()
         .expect("FilemanSidebar should provide navigation receiver");
 
+    let search_scope_signal = StateSignal::new(SearchScope::CurrentFolder);
+    let search_query_signal = StateSignal::new(String::new());
+    let (search_tx, search_rx) = mpsc::unbounded_channel::<String>();
+
     // Create FileList wrapper that syncs with navigation state
     let mut file_list_wrapper = FileListWrapper::new(
         initial_path.clone(),
@@ -1042,6 +1064,9 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         operation_rx,
         status_tx.clone(),
         navigation_path_signal.clone(),
+        search_scope_signal.clone(),
+        search_query_signal.clone(),
+        Some(search_rx),
     );
     
     // Set file list to grow and fill remaining space
@@ -1064,16 +1089,18 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         file_list_wrapper.view_mode_signal().clone(),
     );
 
-    // Create FileLocationBar
+    // Create FileLocationBar (shared search_query_signal for live search)
     use nptk_fileman_widgets::location_bar::FileLocationBar;
     
-    // Get search query signal from FileList wrapper
-    let file_list_search_query = file_list_wrapper.search_query_signal();
-
     let nav_tx_clone = toolbar_nav_tx.clone();
-    let location_bar = FileLocationBar::new(navigation_path_signal.clone())
+    let location_bar = FileLocationBar::new(
+        navigation_path_signal.clone(),
+        search_query_signal,
+        Some(search_tx),
+    )
         .with_focus_receiver(focus_rx)
-        .with_search_query_signal(file_list_search_query) // Pass the shared signal
+        .with_activate_search_receiver(activate_search_rx)
+        .with_search_scope_signal(search_scope_signal)
         .with_on_navigate(move |path| {
              let _ = nav_tx_clone.send(crate::toolbar::NavigationAction::NavigateTo(path));
              Update::DRAW

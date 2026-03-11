@@ -3,10 +3,51 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use async_trait::async_trait;
+use nptk::core::app::focus::{FocusBounds, FocusId, FocusProperties, FocusState, FocusableWidget};
 use nptk::core::signal::state::StateSignal;
+use nptk::core::signal::Signal;
 use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem};
 use nptk::widgets::text_input::TextInput;
-use nptk::core::app::focus::FocusId;
+
+use crate::file_list::SearchScope;
+
+const MAX_SEARCH_HISTORY: usize = 10;
+
+/// A signal that runs its closure on every `get()` call.
+#[derive(Clone)]
+struct FuncSignal<F, T> {
+    f: F,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<F, T> FuncSignal<F, T> {
+    fn new(f: F) -> Self {
+        Self {
+            f,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<F, T> Signal<T> for FuncSignal<F, T>
+where
+    F: Fn() -> T + Send + Sync + Clone + 'static,
+    T: Send + Sync + 'static + Clone,
+{
+    fn get(&self) -> nptk::core::reference::Ref<'_, T> {
+        nptk::core::reference::Ref::Owned((self.f)())
+    }
+
+    fn set_value(&self, _value: T) {}
+
+    fn listen(&self, _listener: nptk::core::signal::Listener<T>) {}
+
+    fn notify(&self) {}
+
+    fn dyn_clone(&self) -> nptk::core::signal::BoxedSignal<T> {
+        Box::new((*self).clone())
+    }
+}
 
 /// Helper function to convert PathBuf to breadcrumb items
 fn path_to_breadcrumb_items(path: &std::path::Path) -> Vec<BreadcrumbItem> {
@@ -47,26 +88,47 @@ pub struct FileLocationBar {
     on_navigate: Option<Box<dyn Fn(PathBuf) -> Update + Send + Sync>>,
     signals_hooked: bool,
     internal_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
+    clear_focus_rx: Option<mpsc::UnboundedReceiver<()>>,
+    request_focus_rx: Option<mpsc::UnboundedReceiver<()>>,
     focus_rx: Option<mpsc::UnboundedReceiver<()>>,
+    activate_search_rx: Option<mpsc::UnboundedReceiver<()>>,
+    toggle_search_rx: Option<mpsc::UnboundedReceiver<bool>>,
     text_input_focus_id: FocusId,
+    bar_focus_id: FocusId,
     // Search
     search_query: StateSignal<String>,
     search_active: StateSignal<bool>,
+    search_scope: StateSignal<SearchScope>,
+    search_history: StateSignal<Vec<String>>,
     search_input_focus_id: Option<FocusId>,
+    edit_mode: StateSignal<bool>,
 }
 
 impl FileLocationBar {
-    pub fn new(current_path: StateSignal<PathBuf>) -> Self {
+    /// Create a new location bar. `search_query` is shared with the file list so that typing in the
+    /// search field filters the list live (Dolphin-style).
+    /// `search_deferred_tx`: when set, search text is sent here instead of writing to the signal (avoids freeze when typing).
+    pub fn new(
+        current_path: StateSignal<PathBuf>,
+        search_query: StateSignal<String>,
+        search_deferred_tx: Option<mpsc::UnboundedSender<String>>,
+    ) -> Self {
         let path_val = (*current_path.get()).clone();
         let initial_items = path_to_breadcrumb_items(&path_val);
         let breadcrumb_items = StateSignal::new(initial_items);
         let text_value = StateSignal::new(path_val.to_string_lossy().to_string());
         
-        let search_query = StateSignal::new(String::new());
+        let edit_mode = StateSignal::new(false);
+        
         let search_active = StateSignal::new(false);
+        let search_scope = StateSignal::new(SearchScope::CurrentFolder);
+        let search_history = StateSignal::new(Vec::new());
         
         let (tx, rx) = mpsc::unbounded_channel();
         let tx = Arc::new(tx);
+        
+        let (clear_focus_tx, clear_focus_rx) = mpsc::unbounded_channel();
+        let clear_focus_tx = Arc::new(clear_focus_tx);
         
         // Breadcrumbs
         let tx_crumb = tx.clone();
@@ -80,82 +142,340 @@ impl FileLocationBar {
                 }
                 Update::empty()
             })
-            .with_layout_style(LayoutStyle {
-                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+            .with_layout_style(MaybeSignal::signal(Box::new(edit_mode.map(|edit| {
+                nptk::prelude::Ref::Owned(LayoutStyle {
+                    size: Vector2::new(Dimension::auto(), Dimension::auto()),
+                    display: if *edit { Display::None } else { Display::Flex },
+                    ..Default::default()
+                })
+            }))));
+
+        // Clickable empty space
+        use nptk::widgets::gesture_detector::GestureDetector;
+        
+        let (request_focus_tx, request_focus_rx) = mpsc::unbounded_channel();
+        let request_focus_tx = Arc::new(request_focus_tx);
+
+        let (toggle_search_tx, toggle_search_rx) = mpsc::unbounded_channel();
+
+        let click_edit_mode = edit_mode.clone();
+        let current_path_clone = current_path.clone();
+        let text_value_clone = text_value.clone();
+        let tx_request_focus = request_focus_tx.clone();
+        
+        let empty_space = Container::new(vec![Box::new(
+            GestureDetector::new(
+                Container::new(vec![]).with_layout_style(LayoutStyle {
+                    size: Vector2::new(Dimension::percent(1.0), Dimension::percent(1.0)),
+                    flex_grow: 1.0,
+                    ..Default::default()
+                })
+            )
+            .with_on_press(MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                if !*click_edit_mode.get() {
+                    click_edit_mode.set(true);
+                    
+                    // Sync current path to text before editing
+                    let current = (*current_path_clone.get()).clone();
+                    text_value_clone.set(current.to_string_lossy().to_string());
+                    
+                    let _ = tx_request_focus.send(());
+                }
+                
+                Update::LAYOUT | Update::DRAW
+            }))))
+        )])
+        .with_layout_style(MaybeSignal::signal(Box::new(edit_mode.map(|edit| {
+            nptk::prelude::Ref::Owned(LayoutStyle {
+                size: Vector2::new(Dimension::percent(1.0), Dimension::length(30.0)),
+                flex_grow: 1.0,
+                display: if *edit { Display::None } else { Display::Flex },
                 ..Default::default()
-            });
+            })
+        }))));
 
         // Text Input
+        let tx_submit = tx.clone();
+        let submit_edit_mode = edit_mode.clone();
+        let submit_text_value = text_value.clone();
+        
+        let cancel_edit_mode = edit_mode.clone();
+        let cancel_current_path = current_path.clone();
+        let cancel_text_value = text_value.clone();
+
+        let focus_lost_edit_mode = edit_mode.clone();
+        let focus_lost_current_path = current_path.clone();
+        let focus_lost_text_value = text_value.clone();
+        
+        let tx_clear_focus1 = clear_focus_tx.clone();
+        let tx_clear_focus2 = clear_focus_tx.clone();
+
         let text_input = TextInput::new()
             .with_text_signal(text_value.clone())
             .with_placeholder("Path...".to_string())
-            .with_layout_style(LayoutStyle {
-                size: Vector2::new(Dimension::auto(), Dimension::length(30.0)),
-                flex_grow: 1.0, 
-                min_size: Vector2::new(Dimension::length(200.0), Dimension::auto()),
-                ..Default::default()
-            });
+            .with_layout_style(MaybeSignal::signal(Box::new(edit_mode.map(|edit| {
+                nptk::prelude::Ref::Owned(LayoutStyle {
+                    size: Vector2::new(Dimension::percent(1.0), Dimension::length(30.0)),
+                    flex_grow: 1.0,
+                    display: if *edit { Display::Flex } else { Display::None },
+                    ..Default::default()
+                })
+            }))))
+            .with_on_submit(MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                  let path = PathBuf::from(&*submit_text_value.get());
+                 let _ = tx_submit.send(path);
+                 let _ = tx_clear_focus1.send(());
+                 submit_edit_mode.set(false);
+                 Update::LAYOUT | Update::DRAW
+            }))))
+            .with_on_escape(MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                  cancel_edit_mode.set(false);
+                 // Revert to original path
+                 let current = (*cancel_current_path.get()).clone();
+                 cancel_text_value.set(current.to_string_lossy().to_string());
+                 let _ = tx_clear_focus2.send(());
+                 Update::LAYOUT | Update::DRAW
+            }))))
+            .with_on_focus_lost(MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                 focus_lost_edit_mode.set(false);
+                 // Revert to original path
+                 let current = (*focus_lost_current_path.get()).clone();
+                 focus_lost_text_value.set(current.to_string_lossy().to_string());
+                 Update::LAYOUT | Update::DRAW
+            }))))
+            .with_layout_style(MaybeSignal::signal(Box::new(edit_mode.map(|edit| {
+                nptk::prelude::Ref::Owned(LayoutStyle {
+                    size: Vector2::new(Dimension::auto(), Dimension::length(30.0)),
+                    flex_grow: 1.0, 
+                    min_size: Vector2::new(Dimension::length(200.0), Dimension::auto()),
+                    display: if *edit { Display::Flex } else { Display::None },
+                    ..Default::default()
+                })
+            }))));
         
         let focus_id = text_input.focus_id();
+        let bar_focus_id = FocusId::new();
 
-        // Search UI
+        let container_focus_rx_edit_mode = edit_mode.clone();
+
+        // Search UI - hidden when in path edit mode (search only when showing breadcrumbs/empty space)
         let search_query_clone = search_query.clone();
-        // let search_active_clone = search_active.clone(); // Removed unused clone
+        let search_active_for_style = search_active.clone();
+        let search_active_for_column = search_active.clone();
+        let search_active_for_scope = search_active.clone();
 
-        // Search Input
-        let search_input_style = search_active.map(|active| {
-            let display = if *active { Display::Flex } else { Display::None };
+        // Search field visibility depends primarily on search_active; edit_mode hides it
+        let edit_mode_for_input_style = edit_mode.clone();
+        let search_input_style = search_active_for_style.map(move |active| {
+            let edit = *edit_mode_for_input_style.get();
             nptk::prelude::Ref::Owned(LayoutStyle {
-                size: Vector2::new(Dimension::length(200.0), Dimension::length(30.0)),
-                display,
+                size: Vector2::new(Dimension::auto(), Dimension::length(30.0)),
+                flex_direction: FlexDirection::Row,
+                gap: Vector2::new(LengthPercentage::length(4.0), LengthPercentage::length(0.0)),
+                align_items: Some(AlignItems::Center),
+                display: if edit { Display::None } else if *active { Display::Flex } else { Display::None },
                 ..Default::default()
             })
         });
 
-        let search_input = TextInput::new()
+        let search_query_escape = search_query.clone();
+        let search_history_for_submit = search_history.clone();
+        let search_query_for_submit = search_query.clone();
+        let mut search_input = TextInput::new()
             .with_text_signal(search_query.clone())
-            .with_placeholder("Search...".to_string())
-            .with_layout_style(MaybeSignal::signal(Box::new(search_input_style)));
+            .with_placeholder("Search in this folder…".to_string())
+            .with_on_escape(MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                search_query_escape.set(String::new());
+                Update::LAYOUT | Update::DRAW
+            }))))
+            .with_on_submit(MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                let q = search_query_for_submit.get().trim().to_string();
+                if !q.is_empty() {
+                    let mut h = search_history_for_submit.get().clone();
+                    h.retain(|x| x != &q);
+                    h.insert(0, q);
+                    if h.len() > MAX_SEARCH_HISTORY {
+                        h.truncate(MAX_SEARCH_HISTORY);
+                    }
+                    search_history_for_submit.set(h);
+                }
+                Update::LAYOUT | Update::DRAW
+            }))))
+            .with_layout_style(LayoutStyle {
+                size: Vector2::new(Dimension::length(200.0), Dimension::length(30.0)),
+                ..Default::default()
+            });
+        if let Some(tx) = search_deferred_tx {
+            search_input = search_input.with_deferred_signal_sender(tx);
+        }
 
         let search_input_focus_id = Some(search_input.focus_id());
 
-        // Search Toggle Button
-        use nptk::widgets::button::Button;
-        use nptk::widgets::text::Text;
-        
-        // Simple text button for now, should be icon later
-        let search_toggle = Button::new(
-             // Use conditional text or icon
-             Text::new(MaybeSignal::signal(Box::new(search_active.map(|active| {
-                 nptk::prelude::Ref::Owned(if *active { "Cancel" } else { "Search" }.to_string())
-             }))))
-        )
-        .with_on_pressed({
-            let active = search_active.clone();
+        let search_clear_btn = {
             let query = search_query_clone.clone();
-            MaybeSignal::signal(Box::new(EvalSignal::new(move || {
-                let new_state = !*active.get();
-                active.set(new_state);
-                if !new_state {
-                    query.set(String::new()); // Clear query when closing
-                }
-                Update::LAYOUT | Update::DRAW
-            })))
-        })
-        .with_layout_style(LayoutStyle {
-             margin: nptk::core::layout::Rect {
-                 left: LengthPercentageAuto::length(4.0),
-                 right: LengthPercentageAuto::length(0.0),
-                 top: LengthPercentageAuto::length(0.0),
-                 bottom: LengthPercentageAuto::length(0.0),
-             },
-             ..Default::default()
+            let btn = Button::new(Text::new("×".to_string()))
+                .with_layout_style(MaybeSignal::signal(Box::new(search_query.map(move |q| {
+                    nptk::prelude::Ref::Owned(LayoutStyle {
+                        display: if q.is_empty() { Display::None } else { Display::Flex },
+                        size: Vector2::new(Dimension::length(24.0), Dimension::length(24.0)),
+                        ..Default::default()
+                    })
+                }))));
+            GestureDetector::new(btn)
+                .with_on_press(MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                    query.set(String::new());
+                    Update::LAYOUT | Update::DRAW
+                }))))
+        };
+
+        let search_field_container = Container::new(vec![
+            Box::new(search_input),
+            Box::new(search_clear_btn),
+        ])
+        .with_layout_style(MaybeSignal::signal(Box::new(search_input_style)));
+
+        let search_active_for_history = search_active.clone();
+        let search_history_for_style = search_history.clone();
+        let edit_mode_for_history_style = edit_mode.clone();
+        let history_dropdown_style = search_active_for_history.map(move |active| {
+            let edit = *edit_mode_for_history_style.get();
+            let hist = search_history_for_style.get();
+            nptk::prelude::Ref::Owned(LayoutStyle {
+                size: Vector2::new(Dimension::length(200.0), Dimension::auto()),
+                flex_direction: FlexDirection::Column,
+                gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(2.0)),
+                display: if edit || !*active || hist.is_empty() {
+                    Display::None
+                } else {
+                    Display::Flex
+                },
+                ..Default::default()
+            })
         });
+        const HISTORY_BUTTON_COUNT: usize = 5;
+        let mut history_buttons: Vec<nptk::core::widget::BoxedWidget> =
+            Vec::with_capacity(HISTORY_BUTTON_COUNT);
+        for i in 0..HISTORY_BUTTON_COUNT {
+            let hist_clone = search_history.clone();
+            let idx = i;
+            let btn = Button::new(Text::new(MaybeSignal::signal(Box::new(hist_clone.clone().map(
+                move |h| nptk::prelude::Ref::Owned(h.get(idx).cloned().unwrap_or_default()),
+            )))))
+            .with_layout_style(MaybeSignal::signal(Box::new(hist_clone.map(move |h| {
+                nptk::prelude::Ref::Owned(LayoutStyle {
+                    display: if idx < h.len() { Display::Flex } else { Display::None },
+                    size: Vector2::new(Dimension::length(200.0), Dimension::length(22.0)),
+                    ..Default::default()
+                })
+            }))));
+            let hist_for_press = search_history.clone();
+            let query_for_press = search_query.clone();
+            history_buttons.push(Box::new(GestureDetector::new(btn).with_on_press(
+                MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                    let h = hist_for_press.get().clone();
+                    if let Some(q) = h.get(idx) {
+                        query_for_press.set(q.clone());
+                    }
+                    Update::LAYOUT | Update::DRAW
+                }))),
+            )));
+        }
+        let history_dropdown = Container::new(history_buttons)
+            .with_layout_style(MaybeSignal::signal(Box::new(history_dropdown_style)));
+
+        let edit_mode_for_column_style = edit_mode.clone();
+        let search_column_style = search_active_for_column.map(move |active| {
+            let edit = *edit_mode_for_column_style.get();
+            nptk::prelude::Ref::Owned(LayoutStyle {
+                size: Vector2::new(Dimension::auto(), Dimension::auto()),
+                flex_direction: FlexDirection::Column,
+                gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(2.0)),
+                align_items: Some(AlignItems::FlexStart),
+                display: if edit { Display::None } else if *active { Display::Flex } else { Display::None },
+                ..Default::default()
+            })
+        });
+        let search_column = Container::new(vec![
+            Box::new(search_field_container),
+            Box::new(history_dropdown),
+        ])
+        .with_layout_style(MaybeSignal::signal(Box::new(search_column_style)));
+
+        let edit_mode_for_scope_style = edit_mode.clone();
+        let scope_style = search_active_for_scope.map(move |active| {
+            let edit = *edit_mode_for_scope_style.get();
+            nptk::prelude::Ref::Owned(LayoutStyle {
+                size: Vector2::new(Dimension::auto(), Dimension::length(30.0)),
+                flex_direction: FlexDirection::Row,
+                gap: Vector2::new(LengthPercentage::length(2.0), LengthPercentage::length(0.0)),
+                align_items: Some(AlignItems::Center),
+                display: if edit { Display::None } else if *active { Display::Flex } else { Display::None },
+                ..Default::default()
+            })
+        });
+        let scope_for_folder = search_scope.clone();
+        let scope_for_subfolders = search_scope.clone();
+        let btn_folder = Button::new(Text::new("Folder".to_string()))
+            .with_layout_style(LayoutStyle {
+                size: Vector2::new(Dimension::length(56.0), Dimension::length(24.0)),
+                ..Default::default()
+            });
+        let btn_subfolders = Button::new(Text::new("Subfolders".to_string()))
+            .with_layout_style(LayoutStyle {
+                size: Vector2::new(Dimension::length(72.0), Dimension::length(24.0)),
+                ..Default::default()
+            });
+        let scope_container = Container::new(vec![
+            Box::new(GestureDetector::new(btn_folder).with_on_press(MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                scope_for_folder.set(SearchScope::CurrentFolder);
+                Update::LAYOUT | Update::DRAW
+            }))))),
+            Box::new(GestureDetector::new(btn_subfolders).with_on_press(MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                scope_for_subfolders.set(SearchScope::FolderAndSubfolders);
+                Update::LAYOUT | Update::DRAW
+            }))))),
+        ])
+        .with_layout_style(MaybeSignal::signal(Box::new(scope_style)));
+
+        // Search Toggle Button. Use GestureDetector for the action so it fires exactly once on press.
+        // The inner Button is only the visual shell; its own on_pressed is intentionally a no-op.
+        let search_toggle = {
+            let active = search_active.clone();
+            let toggle_tx = toggle_search_tx.clone();
+            let visual_button = Button::new(
+                Text::new(MaybeSignal::signal(Box::new(search_active.map(|a| {
+                    nptk::prelude::Ref::Owned(if *a { "Cancel" } else { "Search" }.to_string())
+                }))))
+            )
+            .with_on_pressed(MaybeSignal::value(Update::empty()))
+            .with_layout_style(MaybeSignal::signal(Box::new(edit_mode.map(|edit| {
+                nptk::prelude::Ref::Owned(LayoutStyle {
+                    display: if *edit { Display::None } else { Display::Flex },
+                    margin: nptk::core::layout::Rect {
+                        left: LengthPercentageAuto::length(4.0),
+                        right: LengthPercentageAuto::length(0.0),
+                        top: LengthPercentageAuto::length(0.0),
+                        bottom: LengthPercentageAuto::length(0.0),
+                    },
+                    ..Default::default()
+                })
+            }))));
+
+            GestureDetector::new(visual_button).with_on_press(MaybeSignal::signal(Box::new(
+                FuncSignal::new(move || {
+                    let new_state = !*active.get();
+                    let _ = toggle_tx.send(new_state);
+                    Update::LAYOUT | Update::DRAW
+                }),
+            )))
+        };
             
         let container = Container::new(vec![
             Box::new(breadcrumbs),
+            Box::new(empty_space),
             Box::new(text_input),
-            Box::new(search_input),
+            Box::new(search_column),
+            Box::new(scope_container),
             Box::new(search_toggle),
         ]).with_layout_style(LayoutStyle {
             size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
@@ -174,11 +494,58 @@ impl FileLocationBar {
             on_navigate: None,
             signals_hooked: false,
             internal_rx: Some(rx),
+            clear_focus_rx: Some(clear_focus_rx),
+            request_focus_rx: Some(request_focus_rx),
             focus_rx: None,
+            activate_search_rx: None,
+            toggle_search_rx: Some(toggle_search_rx),
             text_input_focus_id: focus_id,
+            bar_focus_id,
             search_query,
             search_active,
+            search_scope,
+            search_history,
             search_input_focus_id,
+            edit_mode,
+        }
+    }
+
+    /// Unregister the text input from the focus manager so it cannot receive focus on the next click.
+    /// When the bar exits edit mode via Escape, the TextInput has already registered with full
+    /// bounds this frame; the next frame the click is processed before update(), so we must
+    /// unregister when we process clear_focus_rx. The TextInput will re-register (with zero bounds)
+    /// on the next update when it receives dummy layout.
+    fn unregister_text_input_focus(info: &mut nptk::core::app::info::AppInfo, focus_id: FocusId) {
+        if let Ok(mut manager) = info.focus_manager.lock() {
+            manager.unregister_widget(focus_id);
+        }
+    }
+
+    fn unregister_focus(info: &mut nptk::core::app::info::AppInfo, focus_id: FocusId) {
+        if let Ok(mut manager) = info.focus_manager.lock() {
+            manager.unregister_widget(focus_id);
+        }
+    }
+
+    fn register_bar_focus(
+        info: &mut nptk::core::app::info::AppInfo,
+        focus_id: FocusId,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) {
+        if let Ok(mut manager) = info.focus_manager.lock() {
+            manager.register_widget(FocusableWidget {
+                id: focus_id,
+                properties: FocusProperties {
+                    tab_focusable: false,
+                    click_focusable: true,
+                    tab_index: 0,
+                    accepts_keyboard: false,
+                },
+                bounds: FocusBounds { x, y, width, height },
+            });
         }
     }
     
@@ -197,14 +564,22 @@ impl FileLocationBar {
         self.search_input_focus_id
     }
 
-    /// Set search query signal (builder pattern)
-    pub fn with_search_query_signal(mut self, signal: StateSignal<String>) -> Self {
-        self.search_query = signal;
+    pub fn search_scope_signal(&self) -> &StateSignal<SearchScope> {
+        &self.search_scope
+    }
+
+    pub fn with_search_scope_signal(mut self, signal: StateSignal<SearchScope>) -> Self {
+        self.search_scope = signal;
         self
     }
     
     pub fn with_focus_receiver(mut self, rx: mpsc::UnboundedReceiver<()>) -> Self {
         self.focus_rx = Some(rx);
+        self
+    }
+
+    pub fn with_activate_search_receiver(mut self, rx: mpsc::UnboundedReceiver<()>) -> Self {
+        self.activate_search_rx = Some(rx);
         self
     }
     
@@ -236,7 +611,87 @@ impl Widget for FileLocationBar {
             context.hook_signal(&self.current_path);
             context.hook_signal(&self.breadcrumb_items);
             context.hook_signal(&self.text_value);
+            context.hook_signal(&self.edit_mode);
+            context.hook_signal(&self.search_active);
             self.signals_hooked = true;
+        }
+
+        // Exit edit mode directly when Escape or Enter is pressed and we have focus, so we don't
+        // rely on the TextInput callback or the channel (which can fail after multiple enter/exit cycles).
+        if *self.edit_mode.get() && context.get_focused_widget() == Some(self.text_input_focus_id) {
+            let escape_or_enter_pressed = info.keys.iter().any(|(_, e)| {
+                e.state == nptk::core::window::ElementState::Pressed
+                    && matches!(
+                        e.physical_key,
+                        nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::Escape)
+                            | nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::Enter)
+                            | nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::NumpadEnter)
+                    )
+            });
+            if escape_or_enter_pressed {
+                self.edit_mode.set(false);
+                context.clear_focus();
+                Self::unregister_text_input_focus(info, self.text_input_focus_id);
+                update |= Update::LAYOUT | Update::DRAW;
+            }
+        }
+
+        // When search is active, Escape closes the search field (whether or not the search input had focus).
+        if *self.search_active.get() {
+            let escape_pressed = info.keys.iter().any(|(_, e)| {
+                e.state == nptk::core::window::ElementState::Pressed
+                    && e.physical_key == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::Escape)
+            });
+            if escape_pressed {
+                self.search_active.set(false);
+                self.search_query.set(String::new());
+                if let Some(sid) = self.search_input_focus_id {
+                    if context.get_focused_widget() == Some(sid) {
+                        context.clear_focus();
+                        Self::unregister_focus(info, sid);
+                    }
+                }
+                update |= Update::LAYOUT | Update::DRAW;
+            }
+        }
+
+        // When not in edit mode, ensure the text input cannot steal focus: clear focus and
+        // unregister if focus is still on it (e.g. escape channel not processed yet or click
+        // already happened before this frame's update).
+        if !*self.edit_mode.get() {
+            let focused = context.get_focused_widget();
+            if focused == Some(self.text_input_focus_id) {
+                context.clear_focus();
+                Self::unregister_text_input_focus(info, self.text_input_focus_id);
+                update |= Update::LAYOUT | Update::DRAW;
+            }
+        }
+
+        // When not in edit mode, register the bar as click-focusable so a click on the bar
+        // gives us focus; we then enter edit mode. Use only the empty_space child's bounds
+        // (index 1) so breadcrumbs and search button do not trigger edit mode.
+        // When in edit mode, unregister so we don't steal focus from the text input.
+        if *self.edit_mode.get() {
+            Self::unregister_focus(info, self.bar_focus_id);
+        } else if let Some(empty_layout) = layout.children.get(1) {
+            let loc = empty_layout.layout.location;
+            let size = empty_layout.layout.size;
+            if size.width > 0.0 && size.height > 0.0 {
+                Self::register_bar_focus(info, self.bar_focus_id, loc.x, loc.y, size.width, size.height);
+                let bar_has_focus = context.get_focused_widget() == Some(self.bar_focus_id);
+                let bar_gained_focus = info.focus_manager.lock()
+                    .map(|mut m| m.get_focus_state(self.bar_focus_id) == FocusState::Gained)
+                    .unwrap_or(false);
+                if bar_has_focus && bar_gained_focus {
+                    self.edit_mode.set(true);
+                    context.set_focus(Some(self.text_input_focus_id));
+                    update |= Update::LAYOUT | Update::DRAW;
+                }
+            } else {
+                Self::unregister_focus(info, self.bar_focus_id);
+            }
+        } else {
+            Self::unregister_focus(info, self.bar_focus_id);
         }
         
         // Sync path changes to UI
@@ -263,18 +718,91 @@ impl Widget for FileLocationBar {
             }
         }
         
+        // Handle explicit clear focus requests (before inner update so we clear focus early)
+        if let Some(ref mut rx) = self.clear_focus_rx {
+            while let Ok(_) = rx.try_recv() {
+                self.edit_mode.set(false);
+                context.clear_focus();
+                Self::unregister_text_input_focus(info, self.text_input_focus_id);
+                update |= Update::LAYOUT | Update::DRAW;
+            }
+        }
+
         // Handle focus requests
         // Extract ID to avoid borrowing self mutably during loop if we used a method
         let focus_id = self.text_input_focus_id;
         
         if let Some(ref mut rx) = self.focus_rx {
              while let Ok(_) = rx.try_recv() {
+                 self.edit_mode.set(true); // Switch to edit mode when receiving external focus request
                  context.set_focus(Some(focus_id));
-                 update |= Update::DRAW;
+                 update |= Update::LAYOUT | Update::DRAW;
              }
         }
         
-        update |= self.inner.update(layout, context, info).await;
+        // Handle focus requests specifically from within the component
+        if let Some(ref mut rx) = self.request_focus_rx {
+             while let Ok(_) = rx.try_recv() {
+                 context.set_focus(Some(self.text_input_focus_id));
+                 update |= Update::DRAW;
+             }
+        }
+
+        if let Some(ref mut rx) = self.activate_search_rx.as_mut() {
+            while rx.try_recv().is_ok() {
+                self.edit_mode.set(false);
+                self.search_active.set(true);
+                if let Some(sid) = self.search_input_focus_id {
+                    context.set_focus(Some(sid));
+                }
+                update |= Update::LAYOUT | Update::DRAW;
+            }
+        }
+        
+        update |= self.inner.update(layout, context.clone(), info).await;
+
+        if let Some(ref mut rx) = self.toggle_search_rx {
+            while let Ok(new_state) = rx.try_recv() {
+                self.edit_mode.set(false);
+                self.search_active.set(new_state);
+                if new_state {
+                    if let Some(sid) = self.search_input_focus_id {
+                        context.set_focus(Some(sid));
+                    }
+                } else {
+                    self.search_query.set(String::new());
+                    if let Some(sid) = self.search_input_focus_id {
+                        if context.get_focused_widget() == Some(sid) {
+                            context.clear_focus();
+                            Self::unregister_focus(info, sid);
+                        }
+                    }
+                }
+                update |= Update::LAYOUT | Update::DRAW;
+            }
+        }
+
+        if !*self.search_active.get() {
+            if let Some(sid) = self.search_input_focus_id {
+                if context.get_focused_widget() == Some(sid) {
+                    context.clear_focus();
+                    Self::unregister_focus(info, sid);
+                    update |= Update::LAYOUT | Update::DRAW;
+                }
+            }
+        }
+
+        // Process clear_focus again: escape handler runs inside a child's update(), so the
+        // message is sent during inner.update() and would otherwise be handled only next frame.
+        if let Some(ref mut rx) = self.clear_focus_rx {
+            while let Ok(_) = rx.try_recv() {
+                self.edit_mode.set(false);
+                context.clear_focus();
+                Self::unregister_text_input_focus(info, self.text_input_focus_id);
+                update |= Update::LAYOUT | Update::DRAW;
+            }
+        }
+
         update
     }
 

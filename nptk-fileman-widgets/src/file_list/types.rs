@@ -1,6 +1,15 @@
 use std::path::PathBuf;
 use nptk::core::model::SortOrder;
 
+/// Search scope for the location bar filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    /// Filter only entries in the current folder.
+    CurrentFolder,
+    /// Search in current folder and all subfolders (recursive).
+    FolderAndSubfolders,
+}
+
 /// View mode for the file list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileListViewMode {
