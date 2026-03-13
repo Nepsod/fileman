@@ -4,16 +4,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use async_trait::async_trait;
 use nptk::core::app::focus::{FocusBounds, FocusId, FocusProperties, FocusState, FocusableWidget};
-use nptk::core::app::info::AppInfo;
 use nptk::core::signal::state::StateSignal;
 use nptk::core::signal::Signal;
-use nptk::core::theme::ColorRole;
-use nptk::core::vg::kurbo::{Affine, RoundedRect, Stroke};
-use nptk::core::vg::peniko::Brush;
-use nptk::core::vgi::Graphics;
 use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem};
-use nptk::widgets::icon::Icon;
 use nptk::widgets::text_input::TextInput;
+use nptk::widgets::toggle::ToggleButton;
 
 use crate::file_list::SearchScope;
 
@@ -52,115 +47,6 @@ where
 
     fn dyn_clone(&self) -> nptk::core::signal::BoxedSignal<T> {
         Box::new((*self).clone())
-    }
-}
-
-struct SearchToggleVisual {
-    inner: Container,
-    active: StateSignal<bool>,
-    layout_style: MaybeSignal<LayoutStyle>,
-}
-
-impl SearchToggleVisual {
-    fn new(active: StateSignal<bool>) -> Self {
-        let content = Container::new(vec![
-            Box::new(Icon::new("system-search", 14, None)),
-            Box::new(Text::new("Search".to_string()).with_font_size(13.0)),
-        ])
-        .with_layout_style(LayoutStyle {
-            flex_direction: FlexDirection::Row,
-            align_items: Some(AlignItems::Center),
-            gap: Vector2::new(LengthPercentage::length(4.0), LengthPercentage::length(0.0)),
-            ..Default::default()
-        });
-
-        Self {
-            inner: content,
-            active,
-            layout_style: LayoutStyle {
-                padding: Rect {
-                    left: LengthPercentage::length(2.0),
-                    right: LengthPercentage::length(2.0),
-                    top: LengthPercentage::length(4.0),
-                    bottom: LengthPercentage::length(4.0),
-                },
-                ..Default::default()
-            }
-            .into(),
-        }
-    }
-}
-
-impl WidgetLayoutExt for SearchToggleVisual {
-    fn set_layout_style(&mut self, layout_style: impl Into<MaybeSignal<LayoutStyle>>) {
-        self.layout_style = layout_style.into();
-    }
-}
-
-#[async_trait(?Send)]
-impl Widget for SearchToggleVisual {
-    fn render(
-        &mut self,
-        graphics: &mut dyn Graphics,
-        layout_node: &LayoutNode,
-        info: &mut AppInfo,
-        context: AppContext,
-    ) {
-        let palette = context.palette();
-        let button_bounds = RoundedRect::from_rect(
-            nptk::core::vg::kurbo::Rect::new(
-                layout_node.layout.location.x as f64,
-                layout_node.layout.location.y as f64,
-                (layout_node.layout.location.x + layout_node.layout.size.width) as f64,
-                (layout_node.layout.location.y + layout_node.layout.size.height) as f64,
-            ),
-            nptk::core::vg::kurbo::RoundedRectRadii::from_single_radius(8.0),
-        );
-
-        graphics.fill_rounded_rect(
-            Affine::IDENTITY,
-            &Brush::Solid(palette.color(ColorRole::Button)),
-            None,
-            button_bounds,
-        );
-
-        let stroke_color = if *self.active.get() {
-            palette.color(ColorRole::ThreedShadow1)
-        } else {
-            palette.color(ColorRole::ThreedHighlight)
-        };
-        graphics.stroke_rounded_rect(
-            &Stroke::new(1.0),
-            Affine::IDENTITY,
-            &Brush::Solid(stroke_color),
-            None,
-            button_bounds,
-        );
-
-        if let Some(child_layout) = layout_node.children.first() {
-            self.inner.render(graphics, child_layout, info, context);
-        }
-    }
-
-    fn layout_style(&self, context: &nptk::core::layout::LayoutContext) -> nptk::core::layout::StyleNode {
-        StyleNode {
-            style: self.layout_style.get().clone(),
-            children: vec![self.inner.layout_style(context)],
-            measure_func: None,
-        }
-    }
-
-    async fn update(
-        &mut self,
-        layout: &nptk::core::layout::LayoutNode,
-        context: nptk::core::app::context::AppContext,
-        info: &mut nptk::core::app::info::AppInfo,
-    ) -> nptk::core::app::update::Update {
-        if let Some(child_layout) = layout.children.first() {
-            self.inner.update(child_layout, context, info).await
-        } else {
-            Update::empty()
-        }
     }
 }
 
@@ -554,8 +440,13 @@ impl FileLocationBar {
         let search_toggle = {
             let active = search_active.clone();
             let toggle_tx = toggle_search_tx.clone();
-            let visual_button = SearchToggleVisual::new(search_active.clone()).with_layout_style(
-                MaybeSignal::signal(Box::new(edit_mode.map(|edit| {
+            let visual_button = ToggleButton::new(
+                "Search".to_string(),
+                MaybeSignal::signal(Box::new(search_active.clone())),
+            )
+                .with_icon("system-search", 14)
+                .with_font_size(13.0)
+                .with_layout_style(MaybeSignal::signal(Box::new(edit_mode.map(|edit| {
                     nptk::prelude::Ref::Owned(LayoutStyle {
                         display: if *edit { Display::None } else { Display::Flex },
                         padding: Rect {
@@ -572,8 +463,7 @@ impl FileLocationBar {
                         },
                         ..Default::default()
                     })
-                }))),
-            );
+                }))));
 
             GestureDetector::new(visual_button).with_on_press(MaybeSignal::signal(Box::new(
                 FuncSignal::new(move || {
