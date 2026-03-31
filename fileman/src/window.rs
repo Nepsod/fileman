@@ -4,6 +4,7 @@ use nptk::core::signal::eval::EvalSignal;
 use nptk::core::shortcut::Shortcut;
 use nptk::core::window::KeyCode;
 use nptk_fileman_widgets::file_list::{FileList, FileListOperation, SearchScope};
+use nptk_fileman_widgets::file_list::FileListViewMode;
 use nptk::services::filesystem::entry::FileEntry;
 use nptk_fileman_widgets::FilemanSidebar;
 // use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem}; // Unused
@@ -29,7 +30,11 @@ pub enum FileOperationRequest {
     PromptRename(PathBuf), // Prompt for new name for single file
     PromptCreateDirectory(PathBuf), // Prompt for new directory name in parent
     Properties(Vec<PathBuf>),
-    // Future: Copy, Move, etc.
+    Copy(Vec<PathBuf>),
+    Cut(Vec<PathBuf>),
+    Paste,
+    /// Reload entries for the current path (same as list context "refresh" behavior).
+    Refresh,
 }
 
 /// Wrapper widget that manages FileList and connects it to navigation state
@@ -772,7 +777,8 @@ impl Widget for FileListWrapper {
         let mut pending_properties = Vec::new();
         let mut pending_renames = Vec::new();
         let mut pending_creates = Vec::new();
-        
+        let mut deferred_operation_channel_ops: Vec<FileOperationRequest> = Vec::new();
+
         if let Some(ref mut rx) = self.operation_rx {
             while let Ok(op) = rx.try_recv() {
                 match op {
@@ -833,7 +839,59 @@ impl Widget for FileListWrapper {
                     FileOperationRequest::PromptCreateDirectory(parent) => {
                         pending_creates.push(parent);
                     }
+                    FileOperationRequest::Copy(paths) => {
+                        deferred_operation_channel_ops.push(FileOperationRequest::Copy(paths));
+                    }
+                    FileOperationRequest::Cut(paths) => {
+                        deferred_operation_channel_ops.push(FileOperationRequest::Cut(paths));
+                    }
+                    FileOperationRequest::Paste => {
+                        deferred_operation_channel_ops.push(FileOperationRequest::Paste);
+                    }
+                    FileOperationRequest::Refresh => {
+                        deferred_operation_channel_ops.push(FileOperationRequest::Refresh);
+                    }
                 }
+            }
+        }
+
+        for op in deferred_operation_channel_ops {
+            match op {
+                FileOperationRequest::Copy(paths) => {
+                    if let Ok(mut clipboard) = self.clipboard.lock() {
+                        if let Err(e) = clipboard.set_files(&paths, false) {
+                            log::error!("Failed to copy files: {}", e);
+                            if let Some(tx) = &self.status_tx {
+                                let _ = tx.send(format!("Failed to copy: {}", e));
+                            }
+                        } else if let Some(tx) = &self.status_tx {
+                            let _ = tx.send(format!("Copied {} path(s)", paths.len()));
+                        }
+                    }
+                    update.insert(Update::DRAW);
+                }
+                FileOperationRequest::Cut(paths) => {
+                    if let Ok(mut clipboard) = self.clipboard.lock() {
+                        if let Err(e) = clipboard.set_files(&paths, true) {
+                            log::error!("Failed to cut files: {}", e);
+                            if let Some(tx) = &self.status_tx {
+                                let _ = tx.send(format!("Failed to cut: {}", e));
+                            }
+                        } else if let Some(tx) = &self.status_tx {
+                            let _ = tx.send(format!("Cut {} path(s)", paths.len()));
+                        }
+                    }
+                    update.insert(Update::DRAW);
+                }
+                FileOperationRequest::Paste => {
+                    update.insert(self.paste_files());
+                }
+                FileOperationRequest::Refresh => {
+                    let path = self.file_list.get_current_path();
+                    self.file_list.set_path(path);
+                    update.insert(Update::LAYOUT | Update::DRAW);
+                }
+                _ => {}
             }
         }
         
@@ -985,6 +1043,7 @@ impl WidgetLayoutExt for FileListWrapper {
 
 // Ensure FileListWrapper exposes file_list or search signal
 impl FileListWrapper {
+    #[allow(dead_code)]
     pub fn search_query_signal(&self) -> StateSignal<String> {
         self.file_list.search_query_signal().clone()
     }
@@ -1005,7 +1064,7 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     // Create channels for operations and status (async operations still use channels)
     let (operation_tx, operation_rx) = mpsc::unbounded_channel::<FileOperationRequest>();
     let (status_tx, status_rx) = mpsc::unbounded_channel::<String>();
-    
+
     // Create focus channel for location bar
     let (focus_tx, focus_rx) = mpsc::unbounded_channel::<()>();
     let (activate_search_tx, activate_search_rx) = mpsc::unbounded_channel::<()>();
@@ -1032,10 +1091,11 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
             }
         },
     );
+    let activate_search_shortcut_tx = activate_search_tx.clone();
     context.shortcut_registry.register(
         Shortcut::ctrl(KeyCode::KeyF),
         move || {
-            let _ = activate_search_tx.send(());
+            let _ = activate_search_shortcut_tx.send(());
             Update::DRAW
         },
     );
@@ -1088,6 +1148,124 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         selected_paths_signal.clone(),
         file_list_wrapper.view_mode_signal().clone(),
     );
+    let view_mode_signal = file_list_wrapper.view_mode_signal().clone();
+
+    let menu_bar = crate::menus::build_reference_menubar(
+        status_tx.clone(),
+        crate::menus::ReferenceMenubarActions {
+            focus_location: Arc::new({
+                let tx = focus_tx.clone();
+                move || {
+                    let _ = tx.send(());
+                }
+            }),
+            activate_search: Arc::new({
+                let tx = activate_search_tx.clone();
+                move || {
+                    let _ = tx.send(());
+                }
+            }),
+            navigate_home: Arc::new({
+                let tx = toolbar_nav_tx.clone();
+                move || {
+                    let _ = tx.send(crate::toolbar::NavigationAction::Home);
+                }
+            }),
+            navigate_back: Arc::new({
+                let tx = toolbar_nav_tx.clone();
+                move || {
+                    let _ = tx.send(crate::toolbar::NavigationAction::Back);
+                }
+            }),
+            navigate_forward: Arc::new({
+                let tx = toolbar_nav_tx.clone();
+                move || {
+                    let _ = tx.send(crate::toolbar::NavigationAction::Forward);
+                }
+            }),
+            navigate_up: Arc::new({
+                let tx = toolbar_nav_tx.clone();
+                move || {
+                    let _ = tx.send(crate::toolbar::NavigationAction::Up);
+                }
+            }),
+            set_view_list: Arc::new({
+                let signal = view_mode_signal.clone();
+                move || {
+                    signal.set(FileListViewMode::List);
+                }
+            }),
+            set_view_icon: Arc::new({
+                let signal = view_mode_signal.clone();
+                move || {
+                    signal.set(FileListViewMode::Icon);
+                }
+            }),
+            set_view_compact: Arc::new({
+                let signal = view_mode_signal.clone();
+                move || {
+                    signal.set(FileListViewMode::Compact);
+                }
+            }),
+            set_view_table: Arc::new({
+                let signal = view_mode_signal.clone();
+                move || {
+                    signal.set(FileListViewMode::Table);
+                }
+            }),
+            show_properties: Arc::new({
+                let operation_tx = operation_tx.clone();
+                let selected_paths_signal = selected_paths_signal.clone();
+                let status_tx = status_tx.clone();
+                move || {
+                    let paths = (*selected_paths_signal.get()).clone();
+                    if paths.is_empty() {
+                        let _ = status_tx.send("Properties: nothing selected".to_string());
+                    } else {
+                        let _ = operation_tx.send(FileOperationRequest::Properties(paths));
+                    }
+                }
+            }),
+            refresh_list: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Refresh);
+                }
+            }),
+            copy_selection: Arc::new({
+                let operation_tx = operation_tx.clone();
+                let selected_paths_signal = selected_paths_signal.clone();
+                let status_tx = status_tx.clone();
+                move || {
+                    let paths = (*selected_paths_signal.get()).clone();
+                    if paths.is_empty() {
+                        let _ = status_tx.send("Copy: nothing selected".to_string());
+                    } else {
+                        let _ = operation_tx.send(FileOperationRequest::Copy(paths));
+                    }
+                }
+            }),
+            cut_selection: Arc::new({
+                let operation_tx = operation_tx.clone();
+                let selected_paths_signal = selected_paths_signal.clone();
+                let status_tx = status_tx.clone();
+                move || {
+                    let paths = (*selected_paths_signal.get()).clone();
+                    if paths.is_empty() {
+                        let _ = status_tx.send("Cut: nothing selected".to_string());
+                    } else {
+                        let _ = operation_tx.send(FileOperationRequest::Cut(paths));
+                    }
+                }
+            }),
+            paste_clipboard: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Paste);
+                }
+            }),
+        },
+    );
 
     // Create FileLocationBar (shared search_query_signal for live search)
     use nptk_fileman_widgets::location_bar::FileLocationBar;
@@ -1117,6 +1295,7 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
 
     // Build main layout
     Container::new(vec![
+        Box::new(menu_bar),
         // Toolbar area
         Box::new(Container::new(vec![
             Box::new(toolbar_wrapper),
