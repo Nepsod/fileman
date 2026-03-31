@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use tokio::{sync::broadcast, time::{Duration, Instant}};
 
 mod actions;
+use actions::launch_default_app;
 mod properties;
 mod view_compact;
 mod view_icon;
@@ -67,6 +68,8 @@ pub struct FileList {
     icon_size: StateSignal<u32>,
     search_query: StateSignal<String>,
     search_scope: Option<StateSignal<SearchScope>>,
+    /// When false, hide entries with [`FileMetadata::is_hidden`] (dotfiles on Unix).
+    show_hidden_files: StateSignal<bool>,
 
     // Model
     fs_model: Arc<FileSystemModel>,
@@ -123,9 +126,9 @@ pub struct FileList {
 
     // Recursive search: when scope is FolderAndSubfolders
     recursive_result_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<FileEntry>>>,
-    last_recursive_search: Option<(PathBuf, String)>,
+    last_recursive_search: Option<(PathBuf, String, bool)>,
     // Track the last current-folder filter key so we only recompute when needed
-    last_current_folder_search: Option<(PathBuf, String, usize)>,
+    last_current_folder_search: Option<(PathBuf, String, usize, bool)>,
     /// Receiver for current-folder filter results (filter runs in spawn_blocking to avoid blocking UI)
     current_folder_result_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<FileEntry>>>,
 
@@ -188,6 +191,7 @@ impl FileList {
         let view_mode = StateSignal::new(FileListViewMode::List);
         let icon_size = StateSignal::new(48);
         let search_query = search_query_signal.unwrap_or_else(|| StateSignal::new(String::new()));
+        let show_hidden_files = StateSignal::new(false);
 
         // Create icon registry
         let icon_registry =
@@ -266,6 +270,7 @@ impl FileList {
             icon_size,
             search_query,
             search_scope: None,
+            show_hidden_files,
             fs_model,
             _event_rx: event_rx,
             layout_style: LayoutStyle {
@@ -621,6 +626,33 @@ impl FileList {
         }
     }
 
+    /// Open paths: single directory uses `on_enter_folder`; single file launches; multiple selection launches files only.
+    pub fn open_paths(&self, paths: &[PathBuf], mut on_enter_folder: impl FnMut(PathBuf)) {
+        if paths.is_empty() {
+            return;
+        }
+        if paths.len() == 1 {
+            let p = paths[0].clone();
+            if p.is_dir() {
+                on_enter_folder(p);
+            } else {
+                launch_default_app(self.mime_registry.clone(), p);
+            }
+            return;
+        }
+        for p in paths {
+            if p.is_dir() {
+                continue;
+            }
+            launch_default_app(self.mime_registry.clone(), p.clone());
+        }
+    }
+
+    pub fn open_selected_paths(&self, on_enter_folder: impl FnMut(PathBuf)) {
+        let paths = self.selected_paths.get().clone();
+        self.open_paths(&paths, on_enter_folder);
+    }
+
     /// Set the view mode.
     pub fn set_view_mode(&mut self, mode: FileListViewMode) {
         self.view_mode.set(mode);
@@ -665,6 +697,16 @@ impl FileList {
         self.search_scope = Some(signal);
         self
     }
+
+    /// Use a shared signal to control visibility of hidden / dotfile entries.
+    pub fn with_show_hidden_files_signal(mut self, signal: StateSignal<bool>) -> Self {
+        self.show_hidden_files = signal;
+        self
+    }
+
+    pub fn show_hidden_files_signal(&self) -> StateSignal<bool> {
+        self.show_hidden_files.clone()
+    }
     
     /// Sort the file list by the given column and order.
     /// Columns: 0=Name, 1=Size, 2=Type, 3=Date
@@ -675,6 +717,17 @@ impl FileList {
         if let Some(model) = &self.sort_model {
             use nptk::core::model::ItemModel;
             model.sort(column, order);
+        }
+    }
+
+    fn filter_visible_entries(entries: Vec<FileEntry>, show_hidden: bool) -> Vec<FileEntry> {
+        if show_hidden {
+            entries
+        } else {
+            entries
+                .into_iter()
+                .filter(|e| !e.metadata.is_hidden)
+                .collect()
         }
     }
 }
@@ -717,6 +770,7 @@ impl Widget for FileList {
             context.hook_signal(&mut self.selected_paths);
             context.hook_signal(&mut self.view_mode);
             context.hook_signal(&mut self.icon_size);
+            context.hook_signal(&mut self.show_hidden_files);
             if self.search_pending_rx.is_none() {
                 context.hook_signal(&mut self.search_query);
             }
@@ -749,43 +803,86 @@ impl Widget for FileList {
         
         let mut update = Update::empty();
 
-        // Process keyboard shortcuts (Ctrl+C/X/V, Delete)
-        // We check if the widget or its children are focused effectively by handling keys here.
-        // In NPTK, bubbling/handling isn't strictly hierarchical for keys unless using FocusManager.
-        // But FileList is the main widget here.
-        // We only handle if we have operation_tx.
-        if let Some(ref tx) = self.operation_tx {
-             for (_, key_event) in &info.keys {
-                if key_event.state == nptk::core::window::ElementState::Pressed {
-                    let modifiers = info.modifiers; // AppInfo has modifiers
-                    
-                    if modifiers.control_key() {
-                        match key_event.physical_key {
-                            nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::KeyC) => {
-                                let selection = self.selected_paths.get().clone();
-                                if !selection.is_empty() {
-                                    let _ = tx.send(FileListOperation::Copy(selection));
-                                }
-                            }
-                            nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::KeyX) => {
-                                let selection = self.selected_paths.get().clone();
-                                if !selection.is_empty() {
-                                    let _ = tx.send(FileListOperation::Cut(selection));
-                                }
-                            }
-                            nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::KeyV) => {
-                                let _ = tx.send(FileListOperation::Paste);
-                            }
-                            _ => {}
-                        }
-                    } else if key_event.physical_key == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::Delete) {
-                         let selection = self.selected_paths.get().clone();
-                         if !selection.is_empty() {
-                             let _ = tx.send(FileListOperation::Delete(selection));
-                         }
+        // Keyboard: select all (does not use operation_tx). Clipboard/delete/refresh/rename go through operation_tx when set.
+        for (_, key_event) in &info.keys {
+            if key_event.state != nptk::core::window::ElementState::Pressed {
+                continue;
+            }
+            let modifiers = info.modifiers;
+            if modifiers.control_key() {
+                if key_event.physical_key
+                    == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::KeyA)
+                {
+                    self.select_all();
+                    update.insert(Update::DRAW);
+                    continue;
+                }
+            } else if key_event.physical_key
+                == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::F5)
+            {
+                if let Some(ref tx) = self.operation_tx {
+                    let _ = tx.send(FileListOperation::Refresh);
+                }
+                continue;
+            } else if key_event.physical_key
+                == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::F2)
+            {
+                if let Some(ref tx) = self.operation_tx {
+                    let paths = self.selected_paths.get().clone();
+                    if paths.len() == 1 {
+                        let _ = tx.send(FileListOperation::PromptRename(paths[0].clone()));
                     }
                 }
-             }
+                continue;
+            } else if !modifiers.control_key()
+                && (key_event.physical_key
+                    == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::Enter)
+                    || key_event.physical_key
+                        == nptk::core::window::PhysicalKey::Code(
+                            nptk::core::window::KeyCode::NumpadEnter,
+                        ))
+            {
+                if let Some(ref tx) = self.operation_tx {
+                    let _ = tx.send(FileListOperation::Open);
+                }
+                continue;
+            }
+
+            if let Some(ref tx) = self.operation_tx {
+                if modifiers.control_key() {
+                    match key_event.physical_key {
+                        nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::KeyC) => {
+                            let selection = self.selected_paths.get().clone();
+                            if !selection.is_empty() {
+                                let _ = tx.send(FileListOperation::Copy(selection));
+                            }
+                        }
+                        nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::KeyX) => {
+                            let selection = self.selected_paths.get().clone();
+                            if !selection.is_empty() {
+                                let _ = tx.send(FileListOperation::Cut(selection));
+                            }
+                        }
+                        nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::KeyV) => {
+                            let _ = tx.send(FileListOperation::Paste);
+                        }
+                        nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::KeyD) => {
+                            let selection = self.selected_paths.get().clone();
+                            if !selection.is_empty() {
+                                let _ = tx.send(FileListOperation::Duplicate(selection));
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if key_event.physical_key
+                    == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::Delete)
+                {
+                    let selection = self.selected_paths.get().clone();
+                    if !selection.is_empty() {
+                        let _ = tx.send(FileListOperation::Delete(selection));
+                    }
+                }
+            }
         }
         
         // Poll filesystem events FIRST - this must happen before ItemView handling
@@ -815,7 +912,9 @@ impl Widget for FileList {
                                 !scope_is_recursive || query.is_empty();
 
                             if use_current_folder_only && query.is_empty() {
-                                self.entries.set(entries);
+                                let show = *self.show_hidden_files.get();
+                                self.entries
+                                    .set(Self::filter_visible_entries(entries, show));
                             }
 
                             update.insert(Update::LAYOUT | Update::DRAW);
@@ -888,19 +987,26 @@ impl Widget for FileList {
 
         if !use_current_folder_only {
             let path = self.current_path.get().clone();
+            let show_hid = *self.show_hidden_files.get();
             let need_search = self
                 .last_recursive_search
                 .as_ref()
-                != Some(&(path.clone(), query.clone()));
+                != Some(&(path.clone(), query.clone(), show_hid));
             if need_search {
-                self.last_recursive_search = Some((path.clone(), query.clone()));
+                self.last_recursive_search = Some((path.clone(), query.clone(), show_hid));
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 self.recursive_result_rx = Some(rx);
                 let path_move = path.clone();
                 let query_move = query.clone();
                 tokio::task::spawn_blocking(move || {
-                    let results =
-                        recursive_search_entries(path_move, &query_move, MAX_RECURSIVE_SEARCH_DEPTH);
+                    let mut results = recursive_search_entries(
+                        path_move,
+                        &query_move,
+                        MAX_RECURSIVE_SEARCH_DEPTH,
+                    );
+                    if !show_hid {
+                        results.retain(|e| !e.metadata.is_hidden);
+                    }
                     let _ = tx.send(results);
                 });
             }
@@ -925,7 +1031,8 @@ impl Widget for FileList {
         if use_current_folder_only {
             let path = self.current_path.get().clone();
             let all_snapshot = self.all_entries.get().clone();
-            let filter_key = (path.clone(), query.clone(), all_snapshot.len());
+            let show_hid = *self.show_hidden_files.get();
+            let filter_key = (path.clone(), query.clone(), all_snapshot.len(), show_hid);
             let need_filter = self
                 .last_current_folder_search
                 .as_ref()
@@ -936,7 +1043,7 @@ impl Widget for FileList {
                 self.current_folder_result_rx = Some(rx);
                 let query_move = query.clone();
                 tokio::task::spawn_blocking(move || {
-                    let filtered: Vec<FileEntry> = if query_move.is_empty() {
+                    let mut filtered: Vec<FileEntry> = if query_move.is_empty() {
                         all_snapshot
                     } else {
                         all_snapshot
@@ -944,6 +1051,9 @@ impl Widget for FileList {
                             .filter(|e| e.name.to_lowercase().contains(&query_move))
                             .collect()
                     };
+                    if !show_hid {
+                        filtered.retain(|e| !e.metadata.is_hidden);
+                    }
                     let _ = tx.send(filtered);
                 });
             }

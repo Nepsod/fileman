@@ -8,36 +8,42 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Resolve MIME, try default app, then `xdg-open` (shared by list, content, keyboard open).
+pub(crate) fn launch_default_app(registry: MimeRegistry, path: PathBuf) {
+    let mime = smol::block_on(MimeDetector::detect_mime_type(&path))
+        .or_else(|| FileListContent::xdg_mime_filetype(&path));
+    let Some(mime) = mime else {
+        log::warn!("Could not detect MIME type for {:?}", path);
+        return;
+    };
+
+    let app = registry.resolve(&mime).or_else(|| {
+        let handlers = registry.list_handlers(&mime);
+        handlers.into_iter().next()
+    });
+
+    if let Some(app_id) = app {
+        if let Err(err) = registry.launch(&app_id, &path) {
+            log::warn!("Failed to launch app '{}': {}", app_id, err);
+        }
+        return;
+    }
+
+    match Command::new("xdg-open").arg(path).spawn() {
+        Ok(_) => {}
+        Err(err) => {
+            log::warn!(
+                "No application found for MIME {} and xdg-open failed: {}",
+                mime,
+                err
+            );
+        }
+    }
+}
+
 impl FileListContent {
     pub(super) fn launch_path(registry: MimeRegistry, path: PathBuf) {
-        let mime = smol::block_on(MimeDetector::detect_mime_type(&path)).or_else(|| Self::xdg_mime_filetype(&path));
-        let Some(mime) = mime else {
-            log::warn!("Could not detect MIME type for {:?}", path);
-            return;
-        };
-
-        let app = registry.resolve(&mime).or_else(|| {
-            let handlers = registry.list_handlers(&mime);
-            handlers.into_iter().next()
-        });
-
-        if let Some(app_id) = app {
-            if let Err(err) = registry.launch(&app_id, &path) {
-                log::warn!("Failed to launch app '{}': {}", app_id, err);
-            }
-            return;
-        }
-
-        match Command::new("xdg-open").arg(path).spawn() {
-            Ok(_) => {},
-            Err(err) => {
-                log::warn!(
-                    "No application found for MIME {} and xdg-open failed: {}",
-                    mime,
-                    err
-                );
-            },
-        }
+        launch_default_app(registry, path);
     }
 
     pub(super) fn open_label_for_path(&self, path: &Path) -> String {

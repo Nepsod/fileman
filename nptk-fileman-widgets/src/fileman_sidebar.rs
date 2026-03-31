@@ -69,6 +69,12 @@ pub struct FilemanSidebar {
     navigation_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
     bookmarks_service: Option<BookmarksService>,
     bookmarks_rx: Option<mpsc::UnboundedReceiver<Vec<Bookmark>>>, // Channel for loaded bookmarks
+    /// Add bookmark for this path (GTK-3 bookmarks file); drained in update.
+    add_bookmark_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
+    /// Remove bookmark for this path URI; drained in update.
+    remove_bookmark_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
+    /// Status messages for bookmark add/remove (e.g. not bookmarked).
+    bookmark_status_tx: Option<mpsc::UnboundedSender<String>>,
     devices_rx: Option<mpsc::UnboundedReceiver<Vec<SidebarItem>>>, // Channel for loaded devices
     layout_style: MaybeSignal<LayoutStyle>,
     current_path: StateSignal<PathBuf>,
@@ -110,6 +116,9 @@ impl FilemanSidebar {
             navigation_rx: Some(rx),
             bookmarks_service: None,
             bookmarks_rx: None,
+            add_bookmark_rx: None,
+            remove_bookmark_rx: None,
+            bookmark_status_tx: None,
             devices_rx: None,
             layout_style: LayoutStyle {
                 size: Vector2::new(Dimension::length(200.0), Dimension::percent(1.0)),
@@ -169,6 +178,22 @@ impl FilemanSidebar {
             });
         }
         self.rebuild_sidebar();
+        self
+    }
+
+    /// Receiver: sending a directory path adds it to GTK bookmarks and refreshes the sidebar.
+    pub fn with_add_bookmark_receiver(mut self, rx: mpsc::UnboundedReceiver<PathBuf>) -> Self {
+        self.add_bookmark_rx = Some(rx);
+        self
+    }
+
+    pub fn with_remove_bookmark_receiver(mut self, rx: mpsc::UnboundedReceiver<PathBuf>) -> Self {
+        self.remove_bookmark_rx = Some(rx);
+        self
+    }
+
+    pub fn with_bookmark_status_sender(mut self, tx: mpsc::UnboundedSender<String>) -> Self {
+        self.bookmark_status_tx = Some(tx);
         self
     }
 
@@ -598,6 +623,86 @@ impl Widget for FilemanSidebar {
                 self.config.bookmarks = bookmarks;
                 needs_rebuild = true;
              }
+        }
+
+        if let Some(ref mut rx) = self.add_bookmark_rx {
+            let mut pending_paths = Vec::new();
+            while let Ok(path) = rx.try_recv() {
+                pending_paths.push(path);
+            }
+            if !pending_paths.is_empty() {
+                if let Some(ref mut service) = self.bookmarks_service {
+                    for path in pending_paths {
+                        if !path.is_dir() {
+                            continue;
+                        }
+                        let uri = format!("file://{}", path.to_string_lossy());
+                        let name = path
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|s| s.to_string());
+                        service.add_bookmark(uri, name);
+                    }
+                    match service.save().await {
+                        Ok(()) => {
+                            self.config.bookmarks = service.get_bookmarks();
+                            needs_rebuild = true;
+                        }
+                        Err(e) => {
+                            log::warn!("Bookmarks save failed: {}", e);
+                            if let Some(ref tx) = self.bookmark_status_tx {
+                                let _ = tx.send(format!("Bookmarks: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(ref mut rx) = self.remove_bookmark_rx {
+            let mut pending_paths = Vec::new();
+            while let Ok(path) = rx.try_recv() {
+                pending_paths.push(path);
+            }
+            if !pending_paths.is_empty() {
+                if let Some(ref mut service) = self.bookmarks_service {
+                    let mut any_removed = false;
+                    for path in pending_paths {
+                        if !path.is_dir() {
+                            continue;
+                        }
+                        let uri = format!("file://{}", path.to_string_lossy());
+                        if !service.has_bookmark(&uri) {
+                            if let Some(ref tx) = self.bookmark_status_tx {
+                                let _ = tx.send(
+                                    "Bookmarks: current folder is not bookmarked".to_string(),
+                                );
+                            }
+                            continue;
+                        }
+                        if service.remove_bookmark(&uri) {
+                            any_removed = true;
+                        }
+                    }
+                    if any_removed {
+                        match service.save().await {
+                            Ok(()) => {
+                                self.config.bookmarks = service.get_bookmarks();
+                                needs_rebuild = true;
+                                if let Some(ref tx) = self.bookmark_status_tx {
+                                    let _ = tx.send("Removed bookmark".to_string());
+                                }
+                            }
+                            Err(e) => {
+                                log::warn!("Bookmarks save failed: {}", e);
+                                if let Some(ref tx) = self.bookmark_status_tx {
+                                    let _ = tx.send(format!("Bookmarks: {}", e));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Poll for loaded devices

@@ -21,6 +21,23 @@ pub struct ReferenceMenubarActions {
     pub copy_selection: Arc<dyn Fn() + Send + Sync>,
     pub cut_selection: Arc<dyn Fn() + Send + Sync>,
     pub paste_clipboard: Arc<dyn Fn() + Send + Sync>,
+    pub new_folder: Arc<dyn Fn() + Send + Sync>,
+    pub rename_selection: Arc<dyn Fn() + Send + Sync>,
+    pub delete_selection: Arc<dyn Fn() + Send + Sync>,
+    pub sort_name_asc: Arc<dyn Fn() + Send + Sync>,
+    pub sort_name_desc: Arc<dyn Fn() + Send + Sync>,
+    pub sort_size_asc: Arc<dyn Fn() + Send + Sync>,
+    pub sort_size_desc: Arc<dyn Fn() + Send + Sync>,
+    pub set_search_current_folder: Arc<dyn Fn() + Send + Sync>,
+    pub set_search_include_subfolders: Arc<dyn Fn() + Send + Sync>,
+    pub select_all: Arc<dyn Fn() + Send + Sync>,
+    pub toggle_show_hidden_files: Arc<dyn Fn() + Send + Sync>,
+    pub new_file: Arc<dyn Fn() + Send + Sync>,
+    pub open_selection: Arc<dyn Fn() + Send + Sync>,
+    pub duplicate_selection: Arc<dyn Fn() + Send + Sync>,
+    pub add_bookmark_current_folder: Arc<dyn Fn() + Send + Sync>,
+    pub remove_bookmark_current_folder: Arc<dyn Fn() + Send + Sync>,
+    pub open_terminal_here: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// Build a reference menubar for smoke-testing integration in fileman.
@@ -44,6 +61,23 @@ pub fn build_reference_menubar(
     let copy_selection = actions.copy_selection.clone();
     let cut_selection = actions.cut_selection.clone();
     let paste_clipboard = actions.paste_clipboard.clone();
+    let new_folder = actions.new_folder.clone();
+    let rename_selection = actions.rename_selection.clone();
+    let delete_selection = actions.delete_selection.clone();
+    let sort_name_asc = actions.sort_name_asc.clone();
+    let sort_name_desc = actions.sort_name_desc.clone();
+    let sort_size_asc = actions.sort_size_asc.clone();
+    let sort_size_desc = actions.sort_size_desc.clone();
+    let set_search_current_folder = actions.set_search_current_folder.clone();
+    let set_search_include_subfolders = actions.set_search_include_subfolders.clone();
+    let select_all = actions.select_all.clone();
+    let toggle_show_hidden_files = actions.toggle_show_hidden_files.clone();
+    let new_file = actions.new_file.clone();
+    let open_selection = actions.open_selection.clone();
+    let duplicate_selection = actions.duplicate_selection.clone();
+    let add_bookmark_current_folder = actions.add_bookmark_current_folder.clone();
+    let remove_bookmark_current_folder = actions.remove_bookmark_current_folder.clone();
+    let open_terminal_here = actions.open_terminal_here.clone();
 
     let status_tx_file_home = status_tx.clone();
 
@@ -57,6 +91,39 @@ pub fn build_reference_menubar(
                 }),
         )
         .add_item(MenuItem::separator())
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1006), "New Folder")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (new_folder)();
+                        let _ = status_tx.send("Menu: File -> New Folder".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1007), "New File")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (new_file)();
+                        let _ = status_tx.send("Menu: File -> New File".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1008), "Open")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (open_selection)();
+                        let _ = status_tx.send("Menu: File -> Open".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
         .add_item(
             MenuItem::new(MenuCommand::Custom(1002), "Properties")
                 .with_action({
@@ -127,6 +194,17 @@ pub fn build_reference_menubar(
                     }
                 }),
         )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1108), "Select All")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (select_all)();
+                        let _ = status_tx.send("Menu: Edit -> Select All".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
         .add_item(MenuItem::separator())
         .add_item(
             MenuItem::new(MenuCommand::Custom(1103), "Copy")
@@ -160,7 +238,87 @@ pub fn build_reference_menubar(
                         Update::DRAW
                     }
                 }),
+        )
+        .add_item(MenuItem::separator())
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1106), "Rename")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (rename_selection)();
+                        let _ = status_tx.send("Menu: Edit -> Rename".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1107), "Delete")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (delete_selection)();
+                        let _ = status_tx.send("Menu: Edit -> Delete".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1109), "Duplicate")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (duplicate_selection)();
+                        let _ = status_tx.send("Menu: Edit -> Duplicate".to_string());
+                        Update::DRAW
+                    }
+                }),
         );
+
+    let mut sort_menu = MenuTemplate::new("menubar-sort");
+    sort_menu = sort_menu.add_item(
+        MenuItem::new(MenuCommand::Custom(1210), "Name (Ascending)")
+            .with_action({
+                let status_tx = status_tx.clone();
+                move || {
+                    (sort_name_asc)();
+                    let _ = status_tx.send("Menu: View -> Sort -> Name (Ascending)".to_string());
+                    Update::DRAW
+                }
+            }),
+    );
+    sort_menu = sort_menu.add_item(
+        MenuItem::new(MenuCommand::Custom(1211), "Name (Descending)")
+            .with_action({
+                let status_tx = status_tx.clone();
+                move || {
+                    (sort_name_desc)();
+                    let _ = status_tx.send("Menu: View -> Sort -> Name (Descending)".to_string());
+                    Update::DRAW
+                }
+            }),
+    );
+    sort_menu = sort_menu.add_item(
+        MenuItem::new(MenuCommand::Custom(1212), "Size (Ascending)")
+            .with_action({
+                let status_tx = status_tx.clone();
+                move || {
+                    (sort_size_asc)();
+                    let _ = status_tx.send("Menu: View -> Sort -> Size (Ascending)".to_string());
+                    Update::DRAW
+                }
+            }),
+    );
+    sort_menu = sort_menu.add_item(
+        MenuItem::new(MenuCommand::Custom(1213), "Size (Descending)")
+            .with_action({
+                let status_tx = status_tx.clone();
+                move || {
+                    (sort_size_desc)();
+                    let _ = status_tx.send("Menu: View -> Sort -> Size (Descending)".to_string());
+                    Update::DRAW
+                }
+            }),
+    );
 
     let view_menu = MenuTemplate::new("View")
         .add_item(
@@ -170,6 +328,43 @@ pub fn build_reference_menubar(
                     move || {
                         (refresh_list)();
                         let _ = status_tx.send("Menu: View -> Refresh".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1240), "Sort By").with_submenu(sort_menu),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1220), "Search: Current Folder")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (set_search_current_folder)();
+                        let _ = status_tx.send("Menu: View -> Search: Current Folder".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1221), "Search: Include Subfolders")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (set_search_include_subfolders)();
+                        let _ = status_tx
+                            .send("Menu: View -> Search: Include Subfolders".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1222), "Show Hidden Files")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (toggle_show_hidden_files)();
+                        let _ = status_tx.send("Menu: View -> Show Hidden Files (toggle)".to_string());
                         Update::DRAW
                     }
                 }),
@@ -220,7 +415,45 @@ pub fn build_reference_menubar(
                 }),
         );
 
+    let tools_menu = MenuTemplate::new("Tools")
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1501), "Open Terminal Here")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (open_terminal_here)();
+                        let _ = status_tx.send("Menu: Tools -> Open Terminal Here".to_string());
+                        Update::DRAW
+                    }
+                }),
+        );
+
     let status_tx_help = status_tx.clone();
+    let bookmarks_menu = MenuTemplate::new("Bookmarks")
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1401), "Add Current Folder")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (add_bookmark_current_folder)();
+                        let _ = status_tx.send("Menu: Bookmarks -> Add Current Folder".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1402), "Remove Current Folder")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (remove_bookmark_current_folder)();
+                        let _ = status_tx
+                            .send("Menu: Bookmarks -> Remove Current Folder".to_string());
+                        Update::DRAW
+                    }
+                }),
+        );
+
     let help_menu = MenuTemplate::new("Help")
         .add_item(
             MenuItem::new(MenuCommand::Custom(1301), "About")
@@ -238,6 +471,8 @@ pub fn build_reference_menubar(
         .with_template(file_menu)
         .with_template(edit_menu)
         .with_template(view_menu)
+        .with_template(tools_menu)
+        .with_template(bookmarks_menu)
         .with_template(help_menu)
         .with_menu_manager(menu_manager)
 }

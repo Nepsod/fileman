@@ -29,12 +29,22 @@ pub enum FileOperationRequest {
     // Rename { from: PathBuf, to: PathBuf }, // Unused
     PromptRename(PathBuf), // Prompt for new name for single file
     PromptCreateDirectory(PathBuf), // Prompt for new directory name in parent
+    PromptCreateFile(PathBuf),      // Prompt for new empty file name in parent
     Properties(Vec<PathBuf>),
     Copy(Vec<PathBuf>),
     Cut(Vec<PathBuf>),
     Paste,
     /// Reload entries for the current path (same as list context "refresh" behavior).
     Refresh,
+    /// Sort file list by column index and order (same as list context menu).
+    Sort(usize, SortOrder),
+    /// Select all listed entries (same as Ctrl+A in the file list).
+    SelectAll,
+    /// Open selected paths (folders navigate, files launch default app).
+    OpenSelection,
+    Duplicate(Vec<PathBuf>),
+    /// Spawn terminal with cwd = current folder.
+    OpenTerminalHere,
 }
 
 /// Wrapper widget that manages FileList and connects it to navigation state
@@ -49,6 +59,7 @@ struct FileListWrapper {
     // File operation processing - receives from FileList widget (already confirmed)
     file_list_operation_rx: Option<mpsc::UnboundedReceiver<FileListOperation>>,
     // File operation processing - receives from toolbar/other UI (needs confirmation)
+    operation_tx: mpsc::UnboundedSender<FileOperationRequest>,
     operation_rx: Option<mpsc::UnboundedReceiver<FileOperationRequest>>,
     // Status message sender (for displaying operation results)
     status_tx: Option<mpsc::UnboundedSender<String>>,
@@ -58,8 +69,12 @@ struct FileListWrapper {
     pending_rename: Arc<Mutex<Option<(PathBuf, String)>>>,
     // Pending create directory operations (from dialog)
     pending_create_dir: Arc<Mutex<Option<(PathBuf, String)>>>,
+    pending_create_file: Arc<Mutex<Option<(PathBuf, String)>>>,
     // Clipboard service
     clipboard: Arc<Mutex<ClipboardService>>,
+    /// Notify UI thread after async folder duplicate completes (`try_recv` in `update`).
+    folder_duplicate_done_tx: mpsc::UnboundedSender<()>,
+    folder_duplicate_done_rx: Option<mpsc::UnboundedReceiver<()>>,
 }
 
 impl FileListWrapper {
@@ -67,12 +82,16 @@ impl FileListWrapper {
         initial_path: PathBuf,
         navigation: Arc<Mutex<crate::navigation::NavigationState>>,
         navigation_rx: mpsc::UnboundedReceiver<PathBuf>,
+        operation_tx: mpsc::UnboundedSender<FileOperationRequest>,
         operation_rx: mpsc::UnboundedReceiver<FileOperationRequest>,
         status_tx: mpsc::UnboundedSender<String>,
         navigation_path_signal: StateSignal<PathBuf>,
         search_scope_signal: StateSignal<SearchScope>,
         search_query_signal: StateSignal<String>,
         search_pending_rx: Option<mpsc::UnboundedReceiver<String>>,
+        show_hidden_files_signal: StateSignal<bool>,
+        folder_duplicate_done_tx: mpsc::UnboundedSender<()>,
+        folder_duplicate_done_rx: mpsc::UnboundedReceiver<()>,
     ) -> Self {
         // Create channel for FileList operations
         let (file_list_op_tx, file_list_op_rx) = mpsc::unbounded_channel::<FileListOperation>();
@@ -85,7 +104,8 @@ impl FileListWrapper {
             Some(search_query_signal),
             search_pending_rx,
         )
-            .with_search_scope_signal(search_scope_signal);
+            .with_search_scope_signal(search_scope_signal)
+            .with_show_hidden_files_signal(show_hidden_files_signal);
         
         // Clone signals from FileList for reactive subscription
         let file_list_path_signal = file_list.current_path_signal().clone();
@@ -94,7 +114,6 @@ impl FileListWrapper {
         let clipboard = Arc::new(Mutex::new(ClipboardService::new()));
         
         let file_list = file_list.with_on_context_menu({
-            let nav_tx = navigation.clone();
             let op_tx = file_list_op_tx.clone();
             move |path: PathBuf, pos: Vector2<f64>, context: AppContext| {
                 // Create native context menu using NPTK's MenuManager
@@ -102,14 +121,13 @@ impl FileListWrapper {
                 
                 // Open action
                 if path.is_dir() || path.is_file() {
-                    let nav_tx_clone = nav_tx.clone();
-                    let path_clone = path.clone();
+                    let op_open = op_tx.clone();
+                    let path_open = path.clone();
                     template = template.add_item(
                         MenuItem::new(MenuCommand::Custom(1), "Open")
                             .with_action(move || {
-                                if let Ok(mut n) = nav_tx_clone.lock() {
-                                    n.navigate_to(path_clone.clone()); 
-                                }
+                                let _ =
+                                    op_open.send(FileListOperation::OpenPaths(vec![path_open.clone()]));
                                 Update::DRAW
                             })
                     );
@@ -241,12 +259,16 @@ impl FileListWrapper {
             file_list_path_signal,
             signals_hooked: false,
             file_list_operation_rx: Some(file_list_op_rx),
+            operation_tx,
             operation_rx: Some(operation_rx),
             status_tx: Some(status_tx),
             pending_delete_confirmation: Arc::new(Mutex::new(None)),
             pending_rename: Arc::new(Mutex::new(None)),
             pending_create_dir: Arc::new(Mutex::new(None)),
+            pending_create_file: Arc::new(Mutex::new(None)),
             clipboard,
+            folder_duplicate_done_tx,
+            folder_duplicate_done_rx: Some(folder_duplicate_done_rx),
         }
     }
 
@@ -627,6 +649,68 @@ impl FileListWrapper {
 
         context.popup_manager.create_popup_at(Box::new(dialog_content), "New Folder", (400, 200), (300, 250));
     }
+
+    /// Show new empty file dialog
+    fn show_new_file_dialog(&self, parent: PathBuf, context: AppContext) {
+        let input_signal = StateSignal::new("New File".to_string());
+        let pending_create = self.pending_create_file.clone();
+        let parent_clone = parent.clone();
+
+        let message_text = Text::new("Create new empty file named:".to_string());
+
+        let input_field = TextInput::new()
+            .with_text_signal(input_signal.clone())
+            .with_placeholder("File name".to_string());
+
+        let input_signal_clone = input_signal.clone();
+
+        let cancel_btn = Button::new(Text::new("Cancel".to_string()))
+            .with_on_pressed(MaybeSignal::value(Update::DRAW));
+
+        let ok_btn = Button::new(Text::new("Create".to_string()))
+            .with_on_pressed({
+                let pending = pending_create.clone();
+                let p = parent_clone.clone();
+                let s = input_signal_clone.clone();
+                MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                    let new_name = (*s.get()).clone();
+                    if !new_name.is_empty() {
+                        if let Ok(mut lock) = pending.lock() {
+                            *lock = Some((p.clone(), new_name));
+                        }
+                    }
+                    Update::DRAW
+                })))
+            });
+
+        let dialog_content = Container::new(vec![
+            Box::new(message_text),
+            Box::new(input_field),
+            Box::new(Container::new(vec![
+                Box::new(cancel_btn),
+                Box::new(ok_btn),
+            ]).with_layout_style(LayoutStyle {
+                flex_direction: FlexDirection::Row,
+                gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
+                justify_content: Some(JustifyContent::FlexEnd),
+                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+                ..Default::default()
+            })),
+        ]).with_layout_style(LayoutStyle {
+            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+            flex_direction: FlexDirection::Column,
+            padding: Rect {
+                left: LengthPercentage::length(16.0),
+                right: LengthPercentage::length(16.0),
+                top: LengthPercentage::length(16.0),
+                bottom: LengthPercentage::length(16.0),
+            },
+            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(16.0)),
+            ..Default::default()
+        });
+
+        context.popup_manager.create_popup_at(Box::new(dialog_content), "New File", (400, 200), (300, 250));
+    }
 }
 
 #[async_trait(?Send)]
@@ -693,6 +777,18 @@ impl Widget for FileListWrapper {
                     self.file_list.set_path(recovery_path);
                     update.insert(Update::LAYOUT | Update::DRAW);
                 }
+            }
+        }
+
+        if let Some(ref mut rx) = self.folder_duplicate_done_rx {
+            let mut need_refresh = false;
+            while rx.try_recv().is_ok() {
+                need_refresh = true;
+            }
+            if need_refresh {
+                let current_path = self.file_list.get_current_path();
+                self.file_list.set_path(current_path);
+                update.insert(Update::LAYOUT | Update::DRAW);
             }
         }
 
@@ -767,6 +863,27 @@ impl Widget for FileListWrapper {
                     self.file_list.set_path(path); // Re-setting path triggers refresh
                     update.insert(Update::DRAW);
                 }
+                FileListOperation::Open => {
+                    self.file_list.open_selected_paths(|dir| {
+                        if let Ok(mut nav) = self.navigation.lock() {
+                            nav.navigate_to(dir);
+                        }
+                    });
+                    update.insert(Update::DRAW);
+                }
+                FileListOperation::OpenPaths(paths) => {
+                    self.file_list.open_paths(&paths, |dir| {
+                        if let Ok(mut nav) = self.navigation.lock() {
+                            nav.navigate_to(dir);
+                        }
+                    });
+                    update.insert(Update::DRAW);
+                }
+                FileListOperation::Duplicate(paths) => {
+                    let _ = self
+                        .operation_tx
+                        .send(FileOperationRequest::Duplicate(paths));
+                }
             }
         }
 
@@ -777,6 +894,7 @@ impl Widget for FileListWrapper {
         let mut pending_properties = Vec::new();
         let mut pending_renames = Vec::new();
         let mut pending_creates = Vec::new();
+        let mut pending_create_files = Vec::new();
         let mut deferred_operation_channel_ops: Vec<FileOperationRequest> = Vec::new();
 
         if let Some(ref mut rx) = self.operation_rx {
@@ -839,6 +957,9 @@ impl Widget for FileListWrapper {
                     FileOperationRequest::PromptCreateDirectory(parent) => {
                         pending_creates.push(parent);
                     }
+                    FileOperationRequest::PromptCreateFile(parent) => {
+                        pending_create_files.push(parent);
+                    }
                     FileOperationRequest::Copy(paths) => {
                         deferred_operation_channel_ops.push(FileOperationRequest::Copy(paths));
                     }
@@ -850,6 +971,109 @@ impl Widget for FileListWrapper {
                     }
                     FileOperationRequest::Refresh => {
                         deferred_operation_channel_ops.push(FileOperationRequest::Refresh);
+                    }
+                    FileOperationRequest::Sort(col, order) => {
+                        deferred_operation_channel_ops
+                            .push(FileOperationRequest::Sort(col, order));
+                    }
+                    FileOperationRequest::SelectAll => {
+                        self.file_list.select_all();
+                        update.insert(Update::DRAW);
+                    }
+                    FileOperationRequest::OpenSelection => {
+                        self.file_list.open_selected_paths(|dir| {
+                            if let Ok(mut nav) = self.navigation.lock() {
+                                nav.navigate_to(dir);
+                            }
+                        });
+                        update.insert(Update::DRAW);
+                    }
+                    FileOperationRequest::OpenTerminalHere => {
+                        let cwd = self.file_list.get_current_path();
+                        match crate::terminal::open_terminal_in_directory(&cwd) {
+                            Ok(()) => {
+                                if let Some(ref tx) = self.status_tx {
+                                    let _ = tx.send("Opened terminal in current folder".to_string());
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(ref tx) = self.status_tx {
+                                    let _ = tx.send(format!("Terminal: {}", e));
+                                }
+                            }
+                        }
+                    }
+                    FileOperationRequest::Duplicate(paths) => {
+                        let mut need_sync_refresh = false;
+                        for path in paths {
+                            let path_log = path.clone();
+                            if path.is_dir() {
+                                match operations::duplicate_destination_in_parent(&path) {
+                                    Ok(dest) => {
+                                        let from = path.clone();
+                                        let status_tx = self.status_tx.clone();
+                                        let done_tx = self.folder_duplicate_done_tx.clone();
+                                        tokio::spawn(async move {
+                                            match operations::duplicate_directory_tree(from, dest.clone())
+                                                .await
+                                            {
+                                                Ok(()) => {
+                                                    log::info!(
+                                                        "Duplicated folder {:?} -> {:?}",
+                                                        path_log,
+                                                        dest
+                                                    );
+                                                    if let Some(ref tx) = status_tx {
+                                                        let _ = tx.send(format!(
+                                                            "Duplicated folder to {:?}",
+                                                            dest
+                                                        ));
+                                                    }
+                                                    let _ = done_tx.send(());
+                                                }
+                                                Err(e) => {
+                                                    log::error!(
+                                                        "Folder duplicate {:?}: {}",
+                                                        path_log,
+                                                        e
+                                                    );
+                                                    if let Some(ref tx) = status_tx {
+                                                        let _ = tx.send(format!("Duplicate: {}", e));
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        log::error!("Duplicate {:?}: {}", path_log, e);
+                                        if let Some(ref tx) = self.status_tx {
+                                            let _ = tx.send(format!("Duplicate: {}", e));
+                                        }
+                                    }
+                                }
+                            } else {
+                                match operations::duplicate_in_parent(path) {
+                                    Ok(dest) => {
+                                        log::info!("Duplicated {:?} -> {:?}", path_log, dest);
+                                        if let Some(ref tx) = self.status_tx {
+                                            let _ = tx.send(format!("Duplicated to {:?}", dest));
+                                        }
+                                        need_sync_refresh = true;
+                                    }
+                                    Err(e) => {
+                                        log::error!("Duplicate {:?}: {}", path_log, e);
+                                        if let Some(ref tx) = self.status_tx {
+                                            let _ = tx.send(format!("Duplicate: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if need_sync_refresh {
+                            let current_path = self.file_list.get_current_path();
+                            self.file_list.set_path(current_path.clone());
+                            update.insert(Update::LAYOUT | Update::DRAW);
+                        }
                     }
                 }
             }
@@ -891,6 +1115,10 @@ impl Widget for FileListWrapper {
                     self.file_list.set_path(path);
                     update.insert(Update::LAYOUT | Update::DRAW);
                 }
+                FileOperationRequest::Sort(col, order) => {
+                    self.file_list.sort(col, order);
+                    update.insert(Update::DRAW);
+                }
                 _ => {}
             }
         }
@@ -911,6 +1139,11 @@ impl Widget for FileListWrapper {
         for parent in pending_creates {
              self.show_new_folder_dialog(parent, context.clone());
              update.insert(Update::DRAW);
+        }
+
+        for parent in pending_create_files {
+            self.show_new_file_dialog(parent, context.clone());
+            update.insert(Update::DRAW);
         }
         
         // Show confirmation dialogs for pending delete operations (after releasing borrow)
@@ -1012,6 +1245,29 @@ impl Widget for FileListWrapper {
                 }
             }
         }
+
+        if let Ok(mut pending) = self.pending_create_file.lock() {
+            if let Some((parent, name)) = pending.take() {
+                let new_file = parent.join(name);
+                match operations::create_file(new_file.clone()) {
+                    Ok(_) => {
+                        log::info!("Created file: {:?}", new_file);
+                        if let Some(ref tx) = self.status_tx {
+                            let _ = tx.send("File created".to_string());
+                        }
+                        let current_path = self.file_list.get_current_path();
+                        self.file_list.set_path(current_path.clone());
+                        update.insert(Update::LAYOUT | Update::DRAW);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to create file {:?}: {}", new_file, e);
+                        if let Some(ref tx) = self.status_tx {
+                            let _ = tx.send(format!("Error: {}", e));
+                        }
+                    }
+                }
+            }
+        }
         
         update
     }
@@ -1100,13 +1356,19 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         },
     );
 
+    let (add_bookmark_tx, add_bookmark_rx) = mpsc::unbounded_channel::<PathBuf>();
+    let (remove_bookmark_tx, remove_bookmark_rx) = mpsc::unbounded_channel::<PathBuf>();
+
     // Create FilemanSidebar
     let mut sidebar = FilemanSidebar::new()
         .with_places(true)
         .with_bookmarks(true)
         .with_devices(true)
         .with_width(200.0)
-        .with_current_path_signal(navigation_path_signal.clone());
+        .with_current_path_signal(navigation_path_signal.clone())
+        .with_add_bookmark_receiver(add_bookmark_rx)
+        .with_remove_bookmark_receiver(remove_bookmark_rx)
+        .with_bookmark_status_sender(status_tx.clone());
     
     // Take the navigation receiver for FileListWrapper
     let sidebar_nav_rx = sidebar.take_navigation_receiver()
@@ -1114,19 +1376,25 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
 
     let search_scope_signal = StateSignal::new(SearchScope::CurrentFolder);
     let search_query_signal = StateSignal::new(String::new());
+    let show_hidden_files_signal = StateSignal::new(false);
     let (search_tx, search_rx) = mpsc::unbounded_channel::<String>();
+    let (folder_duplicate_done_tx, folder_duplicate_done_rx) = mpsc::unbounded_channel::<()>();
 
     // Create FileList wrapper that syncs with navigation state
     let mut file_list_wrapper = FileListWrapper::new(
         initial_path.clone(),
         nav_clone.clone(),
         sidebar_nav_rx,
+        operation_tx.clone(),
         operation_rx,
         status_tx.clone(),
         navigation_path_signal.clone(),
         search_scope_signal.clone(),
         search_query_signal.clone(),
         Some(search_rx),
+        show_hidden_files_signal.clone(),
+        folder_duplicate_done_tx,
+        folder_duplicate_done_rx,
     );
     
     // Set file list to grow and fill remaining space
@@ -1149,6 +1417,7 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         file_list_wrapper.view_mode_signal().clone(),
     );
     let view_mode_signal = file_list_wrapper.view_mode_signal().clone();
+    let search_scope_for_menubar = search_scope_signal.clone();
 
     let menu_bar = crate::menus::build_reference_menubar(
         status_tx.clone(),
@@ -1262,6 +1531,169 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
                 let operation_tx = operation_tx.clone();
                 move || {
                     let _ = operation_tx.send(FileOperationRequest::Paste);
+                }
+            }),
+            new_folder: Arc::new({
+                let operation_tx = operation_tx.clone();
+                let navigation_path_signal = navigation_path_signal.clone();
+                move || {
+                    let parent = (*navigation_path_signal.get()).clone();
+                    let _ = operation_tx.send(FileOperationRequest::PromptCreateDirectory(parent));
+                }
+            }),
+            rename_selection: Arc::new({
+                let operation_tx = operation_tx.clone();
+                let selected_paths_signal = selected_paths_signal.clone();
+                let status_tx = status_tx.clone();
+                move || {
+                    let paths = (*selected_paths_signal.get()).clone();
+                    match paths.len() {
+                        0 => {
+                            let _ = status_tx.send("Rename: select a single item".to_string());
+                        }
+                        1 => {
+                            let _ =
+                                operation_tx.send(FileOperationRequest::PromptRename(paths[0].clone()));
+                        }
+                        _ => {
+                            let _ = status_tx.send("Rename: select only one item".to_string());
+                        }
+                    }
+                }
+            }),
+            delete_selection: Arc::new({
+                let operation_tx = operation_tx.clone();
+                let selected_paths_signal = selected_paths_signal.clone();
+                let status_tx = status_tx.clone();
+                move || {
+                    let paths = (*selected_paths_signal.get()).clone();
+                    if paths.is_empty() {
+                        let _ = status_tx.send("Delete: nothing selected".to_string());
+                    } else {
+                        let _ = operation_tx.send(FileOperationRequest::Delete(paths));
+                    }
+                }
+            }),
+            sort_name_asc: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Sort(0, SortOrder::Ascending));
+                }
+            }),
+            sort_name_desc: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Sort(0, SortOrder::Descending));
+                }
+            }),
+            sort_size_asc: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Sort(1, SortOrder::Ascending));
+                }
+            }),
+            sort_size_desc: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Sort(1, SortOrder::Descending));
+                }
+            }),
+            set_search_current_folder: Arc::new({
+                let scope_signal = search_scope_for_menubar.clone();
+                move || {
+                    scope_signal.set(SearchScope::CurrentFolder);
+                }
+            }),
+            set_search_include_subfolders: Arc::new({
+                let scope_signal = search_scope_for_menubar.clone();
+                move || {
+                    scope_signal.set(SearchScope::FolderAndSubfolders);
+                }
+            }),
+            select_all: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::SelectAll);
+                }
+            }),
+            toggle_show_hidden_files: Arc::new({
+                let signal = show_hidden_files_signal.clone();
+                let status_tx = status_tx.clone();
+                move || {
+                    let next = !*signal.get();
+                    signal.set(next);
+                    let msg = if next {
+                        "Showing hidden files"
+                    } else {
+                        "Hiding hidden files"
+                    };
+                    let _ = status_tx.send(msg.to_string());
+                }
+            }),
+            new_file: Arc::new({
+                let operation_tx = operation_tx.clone();
+                let navigation_path_signal = navigation_path_signal.clone();
+                move || {
+                    let parent = (*navigation_path_signal.get()).clone();
+                    let _ = operation_tx.send(FileOperationRequest::PromptCreateFile(parent));
+                }
+            }),
+            open_selection: Arc::new({
+                let operation_tx = operation_tx.clone();
+                let selected_paths_signal = selected_paths_signal.clone();
+                let status_tx = status_tx.clone();
+                move || {
+                    let paths = (*selected_paths_signal.get()).clone();
+                    if paths.is_empty() {
+                        let _ = status_tx.send("Open: nothing selected".to_string());
+                    } else {
+                        let _ = operation_tx.send(FileOperationRequest::OpenSelection);
+                    }
+                }
+            }),
+            duplicate_selection: Arc::new({
+                let operation_tx = operation_tx.clone();
+                let selected_paths_signal = selected_paths_signal.clone();
+                let status_tx = status_tx.clone();
+                move || {
+                    let paths = (*selected_paths_signal.get()).clone();
+                    if paths.is_empty() {
+                        let _ = status_tx.send("Duplicate: nothing selected".to_string());
+                    } else {
+                        let _ = operation_tx.send(FileOperationRequest::Duplicate(paths));
+                    }
+                }
+            }),
+            add_bookmark_current_folder: Arc::new({
+                let bookmark_tx = add_bookmark_tx.clone();
+                let navigation_path_signal = navigation_path_signal.clone();
+                let status_tx = status_tx.clone();
+                move || {
+                    let path = (*navigation_path_signal.get()).clone();
+                    if !path.is_dir() {
+                        let _ = status_tx.send("Bookmarks: current path is not a folder".to_string());
+                    } else {
+                        let _ = bookmark_tx.send(path);
+                    }
+                }
+            }),
+            remove_bookmark_current_folder: Arc::new({
+                let bookmark_tx = remove_bookmark_tx.clone();
+                let navigation_path_signal = navigation_path_signal.clone();
+                let status_tx = status_tx.clone();
+                move || {
+                    let path = (*navigation_path_signal.get()).clone();
+                    if !path.is_dir() {
+                        let _ = status_tx.send("Bookmarks: current path is not a folder".to_string());
+                    } else {
+                        let _ = bookmark_tx.send(path);
+                    }
+                }
+            }),
+            open_terminal_here: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::OpenTerminalHere);
                 }
             }),
         },

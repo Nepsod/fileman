@@ -36,6 +36,12 @@ pub enum FileListOperation {
     Sort(usize, SortOrder),
     /// Refresh the file list
     Refresh,
+    /// Open current selection (Enter): folders navigate, files launch default app.
+    Open,
+    /// Open explicit paths (e.g. context menu).
+    OpenPaths(Vec<PathBuf>),
+    /// Duplicate selected paths (files sync, folders async in app wrapper).
+    Duplicate(Vec<PathBuf>),
 }
 
 #[derive(Clone)]

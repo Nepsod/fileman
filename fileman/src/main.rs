@@ -4,6 +4,7 @@ mod window;
 mod toolbar;
 mod menus;
 mod operations;
+mod terminal;
 
 use std::path::PathBuf;
 
