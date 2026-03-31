@@ -28,9 +28,13 @@ pub struct ReferenceMenubarActions {
     pub sort_name_desc: Arc<dyn Fn() + Send + Sync>,
     pub sort_size_asc: Arc<dyn Fn() + Send + Sync>,
     pub sort_size_desc: Arc<dyn Fn() + Send + Sync>,
+    pub sort_modified_asc: Arc<dyn Fn() + Send + Sync>,
+    pub sort_modified_desc: Arc<dyn Fn() + Send + Sync>,
     pub set_search_current_folder: Arc<dyn Fn() + Send + Sync>,
     pub set_search_include_subfolders: Arc<dyn Fn() + Send + Sync>,
     pub select_all: Arc<dyn Fn() + Send + Sync>,
+    pub deselect_all: Arc<dyn Fn() + Send + Sync>,
+    pub invert_selection: Arc<dyn Fn() + Send + Sync>,
     pub toggle_show_hidden_files: Arc<dyn Fn() + Send + Sync>,
     pub new_file: Arc<dyn Fn() + Send + Sync>,
     pub open_selection: Arc<dyn Fn() + Send + Sync>,
@@ -68,9 +72,13 @@ pub fn build_reference_menubar(
     let sort_name_desc = actions.sort_name_desc.clone();
     let sort_size_asc = actions.sort_size_asc.clone();
     let sort_size_desc = actions.sort_size_desc.clone();
+    let sort_modified_asc = actions.sort_modified_asc.clone();
+    let sort_modified_desc = actions.sort_modified_desc.clone();
     let set_search_current_folder = actions.set_search_current_folder.clone();
     let set_search_include_subfolders = actions.set_search_include_subfolders.clone();
     let select_all = actions.select_all.clone();
+    let deselect_all = actions.deselect_all.clone();
+    let invert_selection = actions.invert_selection.clone();
     let toggle_show_hidden_files = actions.toggle_show_hidden_files.clone();
     let new_file = actions.new_file.clone();
     let open_selection = actions.open_selection.clone();
@@ -205,6 +213,28 @@ pub fn build_reference_menubar(
                     }
                 }),
         )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1110), "Deselect All")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (deselect_all)();
+                        let _ = status_tx.send("Menu: Edit -> Deselect All".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1111), "Invert Selection")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (invert_selection)();
+                        let _ = status_tx.send("Menu: Edit -> Invert Selection".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
         .add_item(MenuItem::separator())
         .add_item(
             MenuItem::new(MenuCommand::Custom(1103), "Copy")
@@ -252,12 +282,12 @@ pub fn build_reference_menubar(
                 }),
         )
         .add_item(
-            MenuItem::new(MenuCommand::Custom(1107), "Delete")
+            MenuItem::new(MenuCommand::Custom(1107), "Move to Trash")
                 .with_action({
                     let status_tx = status_tx.clone();
                     move || {
                         (delete_selection)();
-                        let _ = status_tx.send("Menu: Edit -> Delete".to_string());
+                        let _ = status_tx.send("Menu: Edit -> Move to Trash".to_string());
                         Update::DRAW
                     }
                 }),
@@ -315,6 +345,28 @@ pub fn build_reference_menubar(
                 move || {
                     (sort_size_desc)();
                     let _ = status_tx.send("Menu: View -> Sort -> Size (Descending)".to_string());
+                    Update::DRAW
+                }
+            }),
+    );
+    sort_menu = sort_menu.add_item(
+        MenuItem::new(MenuCommand::Custom(1214), "Date Modified (Ascending)")
+            .with_action({
+                let status_tx = status_tx.clone();
+                move || {
+                    (sort_modified_asc)();
+                    let _ = status_tx.send("Menu: View -> Sort -> Date Modified (Ascending)".to_string());
+                    Update::DRAW
+                }
+            }),
+    );
+    sort_menu = sort_menu.add_item(
+        MenuItem::new(MenuCommand::Custom(1215), "Date Modified (Descending)")
+            .with_action({
+                let status_tx = status_tx.clone();
+                move || {
+                    (sort_modified_desc)();
+                    let _ = status_tx.send("Menu: View -> Sort -> Date Modified (Descending)".to_string());
                     Update::DRAW
                 }
             }),

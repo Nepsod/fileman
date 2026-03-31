@@ -26,7 +26,6 @@ pub enum FileListViewMode {
 /// Simple operation request type for use within FileList widget
 /// This is converted to the full FileOperationRequest in FileListWrapper
 pub enum FileListOperation {
-    Delete(Vec<PathBuf>),
     Properties(Vec<PathBuf>),
     PromptRename(PathBuf),
     Copy(Vec<PathBuf>),
@@ -42,6 +41,14 @@ pub enum FileListOperation {
     OpenPaths(Vec<PathBuf>),
     /// Duplicate selected paths (files sync, folders async in app wrapper).
     Duplicate(Vec<PathBuf>),
+    /// Clear selection (menubar / wrapper).
+    DeselectAll,
+    /// Invert selection against current listed entries.
+    InvertSelection,
+    /// Move to trash after confirmation (Delete key, context menu, …).
+    DeleteToTrash(Vec<PathBuf>),
+    /// Permanently delete after confirmation (Shift+Delete).
+    DeletePermanent(Vec<PathBuf>),
 }
 
 #[derive(Clone)]

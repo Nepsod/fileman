@@ -24,7 +24,10 @@ use nptk::core::model::SortOrder;
 /// File operation requests that can be sent from UI to be processed
 #[derive(Debug, Clone)]
 pub enum FileOperationRequest {
+    /// Move selected paths to trash after confirmation.
     Delete(Vec<PathBuf>),
+    /// Permanently delete after confirmation (e.g. Shift+Delete from list).
+    DeletePermanent(Vec<PathBuf>),
     // CreateDirectory { parent: PathBuf, name: String }, // Unused
     // Rename { from: PathBuf, to: PathBuf }, // Unused
     PromptRename(PathBuf), // Prompt for new name for single file
@@ -40,6 +43,10 @@ pub enum FileOperationRequest {
     Sort(usize, SortOrder),
     /// Select all listed entries (same as Ctrl+A in the file list).
     SelectAll,
+    /// Clear file list selection.
+    DeselectAll,
+    /// Invert file list selection.
+    InvertSelection,
     /// Open selected paths (folders navigate, files launch default app).
     OpenSelection,
     Duplicate(Vec<PathBuf>),
@@ -63,8 +70,8 @@ struct FileListWrapper {
     operation_rx: Option<mpsc::UnboundedReceiver<FileOperationRequest>>,
     // Status message sender (for displaying operation results)
     status_tx: Option<mpsc::UnboundedSender<String>>,
-    // Pending delete operations waiting for confirmation (from toolbar)
-    pending_delete_confirmation: Arc<Mutex<Option<Vec<PathBuf>>>>,
+    /// After confirm: paths and whether to delete permanently (otherwise move to trash).
+    pending_delete_confirmation: Arc<Mutex<Option<(Vec<PathBuf>, bool)>>>,
     // Pending rename operations (from dialog)
     pending_rename: Arc<Mutex<Option<(PathBuf, String)>>>,
     // Pending create directory operations (from dialog)
@@ -164,6 +171,16 @@ impl FileListWrapper {
                             Update::empty()
                         })
                 );
+
+                let op_tx_dup = op_tx.clone();
+                let path_dup = path.clone();
+                template = template.add_item(
+                    MenuItem::new(MenuCommand::Custom(41), "Duplicate")
+                        .with_action(move || {
+                            let _ = op_tx_dup.send(FileListOperation::Duplicate(vec![path_dup.clone()]));
+                            Update::empty()
+                        })
+                );
                 
                 // Separator
                 template = template.add_item(MenuItem::separator());
@@ -190,13 +207,14 @@ impl FileListWrapper {
                         })
                 );
                 
-                // Delete action
+                // Delete → trash
                 let op_tx_clone = op_tx.clone();
                 let path_clone = path.clone();
                 template = template.add_item(
-                    MenuItem::new(MenuCommand::Custom(3), "Delete")
+                    MenuItem::new(MenuCommand::Custom(3), "Move to Trash")
                         .with_action(move || {
-                            let _ = op_tx_clone.send(FileListOperation::Delete(vec![path_clone.clone()]));
+                            let _ = op_tx_clone
+                                .send(FileListOperation::DeleteToTrash(vec![path_clone.clone()]));
                             Update::DRAW
                         })
                 );
@@ -237,6 +255,24 @@ impl FileListWrapper {
                     MenuItem::new(MenuCommand::Custom(13), "Size (Desc)")
                         .with_action(move || {
                             let _ = op_tx_sort.send(FileListOperation::Sort(1, SortOrder::Descending));
+                            Update::DRAW
+                        })
+                );
+
+                let op_tx_sort = op_tx.clone();
+                sort_menu = sort_menu.add_item(
+                    MenuItem::new(MenuCommand::Custom(14), "Date Modified (Asc)")
+                        .with_action(move || {
+                            let _ = op_tx_sort.send(FileListOperation::Sort(3, SortOrder::Ascending));
+                            Update::DRAW
+                        })
+                );
+
+                let op_tx_sort = op_tx.clone();
+                sort_menu = sort_menu.add_item(
+                    MenuItem::new(MenuCommand::Custom(15), "Date Modified (Desc)")
+                        .with_action(move || {
+                            let _ = op_tx_sort.send(FileListOperation::Sort(3, SortOrder::Descending));
                             Update::DRAW
                         })
                 );
@@ -412,84 +448,78 @@ impl FileListWrapper {
         self.file_list.show_properties_popup(paths, context);
     }
 
-    /// Perform delete request
-    fn perform_delete_request(&mut self, paths: Vec<PathBuf>, _context: AppContext) {
-        let paths_clone = paths.clone();
-        // Process delete operation
-        let mut all_success = true;
-        let mut error_msg = String::new();
-        
-        for path in &paths {
-            match operations::delete_path(path.clone()) {
-                Ok(_) => {
-                    log::info!("Deleted: {:?}", path);
-                }
-                Err(e) => {
-                    log::error!("Failed to delete {:?}: {}", path, e);
-                    all_success = false;
-                    error_msg = e;
-                    break;
-                }
-            }
-        }
-        
-        // Update status message
-        if let Some(ref tx) = self.status_tx {
-            if all_success {
-                let _ = tx.send(format!("Deleted {} item(s)", paths_clone.len()));
-            } else {
-                let _ = tx.send(format!("Error: {}", error_msg));
-            }
-        }
-        
-        // Refresh file list by resetting path (triggers reload)
-        let current_path = self.file_list.get_current_path();
-        self.file_list.set_path(current_path);
-    }
-
-    /// Show delete confirmation dialog
-    fn show_delete_confirmation_dialog(&self, paths: &[PathBuf], context: AppContext) {
+    /// Show delete confirmation dialog (`permanent`: true = skip trash).
+    fn show_delete_confirmation_dialog(
+        &self,
+        paths: &[PathBuf],
+        permanent: bool,
+        context: AppContext,
+    ) {
         if paths.is_empty() {
             return;
         }
 
-        // Build message text
-        let message = if paths.len() == 1 {
+        let message = if permanent {
+            if paths.len() == 1 {
+                let path = &paths[0];
+                let name = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("<unnamed>");
+                format!(
+                    "Permanently delete \"{}\"? This cannot be undone.",
+                    name
+                )
+            } else {
+                format!(
+                    "Permanently delete {} selected item(s)? This cannot be undone.",
+                    paths.len()
+                )
+            }
+        } else if paths.len() == 1 {
             let path = &paths[0];
             let name = path
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("<unnamed>");
-            format!("Are you sure you want to delete \"{}\"?", name)
+            format!("Move \"{}\" to the trash?", name)
         } else {
-            format!("Are you sure you want to delete {} selected item(s)?", paths.len())
+            format!(
+                "Move {} selected item(s) to the trash?",
+                paths.len()
+            )
         };
 
         let pending_delete = self.pending_delete_confirmation.clone();
         let paths_to_delete = paths.to_vec();
+        let confirm_label = if permanent {
+            "Delete permanently"
+        } else {
+            "Move to Trash"
+        };
+        let title = if permanent {
+            "Confirm permanent delete"
+        } else {
+            "Confirm trash"
+        };
 
-        // Message text widget
         let message_text = Text::new(message);
-        
-        // Cancel button - closes dialog (popup closes automatically on click outside or ESC)
+
         let cancel_btn = Button::new(Text::new("Cancel".to_string()))
             .with_on_pressed(MaybeSignal::value(Update::DRAW));
-        
-        // Delete button - confirms deletion
-        let delete_btn = Button::new(Text::new("Delete".to_string()))
+
+        let delete_btn = Button::new(Text::new(confirm_label.to_string()))
             .with_on_pressed({
                 let pending_delete_btn = pending_delete.clone();
                 let paths_btn = paths_to_delete.clone();
                 MaybeSignal::signal(Box::new(EvalSignal::new(move || {
-                    // Set pending delete confirmation - will be processed in update()
                     if let Ok(mut pending) = pending_delete_btn.lock() {
-                        *pending = Some(paths_btn.clone());
+                        *pending = Some((paths_btn.clone(), permanent));
                     }
                     Update::DRAW
                 })))
             });
 
-        // Build dialog content
         let dialog_content = Container::new(vec![
             Box::new(message_text),
             Box::new(Container::new(vec![
@@ -502,8 +532,9 @@ impl FileListWrapper {
                 size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
                 ..Default::default()
             })),
-        ]).with_layout_style(LayoutStyle {
-                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
+        ])
+        .with_layout_style(LayoutStyle {
+            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
             flex_direction: FlexDirection::Column,
             padding: Rect {
                 left: LengthPercentage::length(16.0),
@@ -515,10 +546,9 @@ impl FileListWrapper {
             ..Default::default()
         });
 
-        // Show popup at center of screen
         context
             .popup_manager
-            .create_popup_at(Box::new(dialog_content), "Confirm Delete", (400, 150), (300, 200));
+            .create_popup_at(Box::new(dialog_content), title, (400, 150), (300, 200));
     }
 
     /// Show rename dialog
@@ -850,10 +880,24 @@ impl Widget for FileListWrapper {
                 FileListOperation::Paste => {
                     update.insert(self.paste_files());
                 },
-                FileListOperation::Delete(paths) => {
-                     // Convert to FileOperationRequest and process
-                    self.perform_delete_request(paths, context.clone());
+                FileListOperation::DeleteToTrash(paths) => {
+                    let _ = self
+                        .operation_tx
+                        .send(FileOperationRequest::Delete(paths));
                 },
+                FileListOperation::DeletePermanent(paths) => {
+                    let _ = self
+                        .operation_tx
+                        .send(FileOperationRequest::DeletePermanent(paths));
+                },
+                FileListOperation::DeselectAll => {
+                    self.file_list.clear_selection();
+                    update.insert(Update::DRAW);
+                }
+                FileListOperation::InvertSelection => {
+                    self.file_list.invert_selection();
+                    update.insert(Update::DRAW);
+                }
                 FileListOperation::Sort(col, order) => {
                     self.file_list.sort(col, order);
                     update.insert(Update::DRAW);
@@ -890,7 +934,7 @@ impl Widget for FileListWrapper {
         // Process file operations from toolbar/other UI
         // Note: Delete operations need confirm, Properties need dialog
         // Collect operations first to avoid borrow conflicts
-        let mut pending_deletes = Vec::new();
+        let mut pending_deletes: Vec<(Vec<PathBuf>, bool)> = Vec::new();
         let mut pending_properties = Vec::new();
         let mut pending_renames = Vec::new();
         let mut pending_creates = Vec::new();
@@ -902,7 +946,10 @@ impl Widget for FileListWrapper {
                 match op {
                     FileOperationRequest::Delete(paths) => {
                         log::warn!("RECEIVED DELETE REQUEST for {} path(s)", paths.len());
-                        pending_deletes.push(paths);
+                        pending_deletes.push((paths, false));
+                    }
+                    FileOperationRequest::DeletePermanent(paths) => {
+                        pending_deletes.push((paths, true));
                     }
                     /*
                     FileOperationRequest::CreateDirectory { parent, name } => {
@@ -978,6 +1025,14 @@ impl Widget for FileListWrapper {
                     }
                     FileOperationRequest::SelectAll => {
                         self.file_list.select_all();
+                        update.insert(Update::DRAW);
+                    }
+                    FileOperationRequest::DeselectAll => {
+                        self.file_list.clear_selection();
+                        update.insert(Update::DRAW);
+                    }
+                    FileOperationRequest::InvertSelection => {
+                        self.file_list.invert_selection();
                         update.insert(Update::DRAW);
                     }
                     FileOperationRequest::OpenSelection => {
@@ -1150,43 +1205,50 @@ impl Widget for FileListWrapper {
         if !pending_deletes.is_empty() {
             log::warn!("SHOWING {} DELETE CONFIRMATION DIALOG(S)", pending_deletes.len());
         }
-        for paths in pending_deletes {
-            self.show_delete_confirmation_dialog(&paths, context.clone());
+        for (paths, permanent) in pending_deletes {
+            self.show_delete_confirmation_dialog(&paths, permanent, context.clone());
             update.insert(Update::DRAW);
         }
         
-        // Process confirmed delete operations from toolbar (user clicked "Delete" in confirmation dialog)
+        // Process confirmed delete operations from toolbar (user clicked confirm in dialog)
         if let Ok(mut pending_delete) = self.pending_delete_confirmation.lock() {
-            if let Some(paths) = pending_delete.take() {
-                // User confirmed - proceed with deletion
+            if let Some((paths, permanent)) = pending_delete.take() {
                 let paths_clone = paths.clone();
                 let mut all_success = true;
                 let mut error_msg = String::new();
-                
+
                 for path in &paths {
-                    match operations::delete_path(path.clone()) {
-                        Ok(_) => {
-                            log::info!("Deleted: {:?}", path);
+                    let result = if permanent {
+                        operations::delete_path(path.clone())
+                    } else {
+                        operations::move_to_trash(path.clone())
+                    };
+                    match result {
+                        Ok(()) => {
+                            log::info!("Removed: {:?} (permanent={})", path, permanent);
                         }
                         Err(e) => {
-                            log::error!("Failed to delete {:?}: {}", path, e);
+                            log::error!("Failed to remove {:?}: {}", path, e);
                             all_success = false;
                             error_msg = e;
                             break;
                         }
                     }
                 }
-                
-                // Update status message
+
                 if let Some(ref tx) = self.status_tx {
                     if all_success {
-                        let _ = tx.send(format!("Deleted {} item(s)", paths_clone.len()));
+                        let msg = if permanent {
+                            format!("Permanently deleted {} item(s)", paths_clone.len())
+                        } else {
+                            format!("Moved {} item(s) to trash", paths_clone.len())
+                        };
+                        let _ = tx.send(msg);
                     } else {
                         let _ = tx.send(format!("Error: {}", error_msg));
                     }
                 }
-                
-                // Refresh file list
+
                 let current_path = self.file_list.get_current_path();
                 self.file_list.set_path(current_path.clone());
                 update.insert(Update::LAYOUT | Update::DRAW);
@@ -1568,7 +1630,7 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
                 move || {
                     let paths = (*selected_paths_signal.get()).clone();
                     if paths.is_empty() {
-                        let _ = status_tx.send("Delete: nothing selected".to_string());
+                        let _ = status_tx.send("Move to Trash: nothing selected".to_string());
                     } else {
                         let _ = operation_tx.send(FileOperationRequest::Delete(paths));
                     }
@@ -1598,6 +1660,18 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
                     let _ = operation_tx.send(FileOperationRequest::Sort(1, SortOrder::Descending));
                 }
             }),
+            sort_modified_asc: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Sort(3, SortOrder::Ascending));
+                }
+            }),
+            sort_modified_desc: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Sort(3, SortOrder::Descending));
+                }
+            }),
             set_search_current_folder: Arc::new({
                 let scope_signal = search_scope_for_menubar.clone();
                 move || {
@@ -1614,6 +1688,18 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
                 let operation_tx = operation_tx.clone();
                 move || {
                     let _ = operation_tx.send(FileOperationRequest::SelectAll);
+                }
+            }),
+            deselect_all: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::DeselectAll);
+                }
+            }),
+            invert_selection: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::InvertSelection);
                 }
             }),
             toggle_show_hidden_files: Arc::new({

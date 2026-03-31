@@ -14,7 +14,12 @@ pub fn create_file(path: PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-/// Delete a file or directory
+/// Move a file or directory to the desktop trash (freedesktop / platform trash).
+pub fn move_to_trash(path: PathBuf) -> Result<(), String> {
+    trash::delete(&path).map_err(|e| format!("Failed to move to trash: {}", e))
+}
+
+/// Delete a file or directory permanently
 pub fn delete_path(path: PathBuf) -> Result<(), String> {
     let metadata = fs::metadata(&path)
         .map_err(|e| format!("Failed to get metadata: {}", e))?;

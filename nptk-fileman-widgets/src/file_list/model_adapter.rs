@@ -236,6 +236,15 @@ impl ItemModel for FileSystemItemModel {
                 match col {
                     0 => ModelData::String(entry.name.clone()),
                     1 => ModelData::Int(entry.metadata.size as i64),
+                    2 => ModelData::String(format!("{:?}", entry.file_type)),
+                    3 => ModelData::Int(
+                        entry
+                            .metadata
+                            .modified
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
+                    ),
                     _ => ModelData::None,
                 }
             }

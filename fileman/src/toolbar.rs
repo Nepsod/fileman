@@ -165,6 +165,70 @@ impl ToolbarWrapper {
             .with_tooltip("New Folder")
             .with_status_tip("Create a new folder");
 
+        let op_tx_refresh = operation_tx.clone();
+        let refresh_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("view-refresh", 24, None)),
+            Box::new(Text::new("Refresh".to_string()).with_font_size(14.0)),
+        ])
+        .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(FuncSignal::new(
+            move || {
+                let _ = op_tx_refresh.send(FileOperationRequest::Refresh);
+                Update::DRAW
+            },
+        ))))
+        .with_tooltip("Refresh")
+        .with_status_tip("Reload the current folder");
+
+        let op_tx_copy = operation_tx.clone();
+        let selected_for_copy = selected_paths_signal.clone();
+        let copy_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("edit-copy", 24, None)),
+            Box::new(Text::new("Copy".to_string()).with_font_size(14.0)),
+        ])
+        .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(FuncSignal::new(
+            move || {
+                let paths = (*selected_for_copy.get()).clone();
+                if !paths.is_empty() {
+                    let _ = op_tx_copy.send(FileOperationRequest::Copy(paths));
+                }
+                Update::DRAW
+            },
+        ))))
+        .with_tooltip("Copy")
+        .with_status_tip("Copy selected items to the clipboard");
+
+        let op_tx_cut = operation_tx.clone();
+        let selected_for_cut = selected_paths_signal.clone();
+        let cut_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("edit-cut", 24, None)),
+            Box::new(Text::new("Cut".to_string()).with_font_size(14.0)),
+        ])
+        .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(FuncSignal::new(
+            move || {
+                let paths = (*selected_for_cut.get()).clone();
+                if !paths.is_empty() {
+                    let _ = op_tx_cut.send(FileOperationRequest::Cut(paths));
+                }
+                Update::DRAW
+            },
+        ))))
+        .with_tooltip("Cut")
+        .with_status_tip("Cut selected items to the clipboard");
+
+        let op_tx_paste = operation_tx.clone();
+        let paste_btn = ToolbarButton::with_children(vec![
+            Box::new(Icon::new("edit-paste", 24, None)),
+            Box::new(Text::new("Paste".to_string()).with_font_size(14.0)),
+        ])
+        .with_on_pressed(nptk::core::signal::MaybeSignal::signal(Box::new(FuncSignal::new(
+            move || {
+                let _ = op_tx_paste.send(FileOperationRequest::Paste);
+                Update::DRAW
+            },
+        ))))
+        .with_tooltip("Paste")
+        .with_status_tip("Paste from the clipboard");
+
         let properties_requested = Arc::new(Mutex::new(false));
         let properties_btn = ToolbarButton::with_children(vec![
             Box::new(Icon::new("document-properties", 24, None)),
@@ -276,6 +340,11 @@ impl ToolbarWrapper {
             .with_child(home_btn)
             .with_separator()
             .with_child(new_folder_btn)
+            .with_child(refresh_btn)
+            .with_child(copy_btn)
+            .with_child(cut_btn)
+            .with_child(paste_btn)
+            .with_separator()
             .with_child(delete_btn)
             .with_separator()
             .with_child(rename_btn)

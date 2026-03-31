@@ -626,6 +626,22 @@ impl FileList {
         }
     }
 
+    /// Replace selection with entries that were not selected.
+    pub fn invert_selection(&mut self) {
+        use std::collections::HashSet;
+        let entries = self.entries.get();
+        let selected_set: HashSet<PathBuf> = self.selected_paths.get().iter().cloned().collect();
+        let paths: Vec<PathBuf> = entries
+            .iter()
+            .map(|e| e.path.clone())
+            .filter(|p| !selected_set.contains(p))
+            .collect();
+        self.selected_paths.set(paths.clone());
+        if let Some(ref tx) = self.selection_change_tx {
+            let _ = tx.send(paths);
+        }
+    }
+
     /// Open paths: single directory uses `on_enter_folder`; single file launches; multiple selection launches files only.
     pub fn open_paths(&self, paths: &[PathBuf], mut on_enter_folder: impl FnMut(PathBuf)) {
         if paths.is_empty() {
@@ -818,6 +834,12 @@ impl Widget for FileList {
                     continue;
                 }
             } else if key_event.physical_key
+                == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::Escape)
+            {
+                self.clear_selection();
+                update.insert(Update::DRAW);
+                continue;
+            } else if key_event.physical_key
                 == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::F5)
             {
                 if let Some(ref tx) = self.operation_tx {
@@ -879,7 +901,11 @@ impl Widget for FileList {
                 {
                     let selection = self.selected_paths.get().clone();
                     if !selection.is_empty() {
-                        let _ = tx.send(FileListOperation::Delete(selection));
+                        if modifiers.shift_key() {
+                            let _ = tx.send(FileListOperation::DeletePermanent(selection));
+                        } else {
+                            let _ = tx.send(FileListOperation::DeleteToTrash(selection));
+                        }
                     }
                 }
             }
