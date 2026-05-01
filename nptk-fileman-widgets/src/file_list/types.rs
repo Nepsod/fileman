@@ -49,6 +49,12 @@ pub enum FileListOperation {
     DeleteToTrash(Vec<PathBuf>),
     /// Permanently delete after confirmation (Shift+Delete).
     DeletePermanent(Vec<PathBuf>),
+    /// Go to parent directory (Backspace, Alt+Up).
+    NavigateUp,
+    /// Prompt to create a new folder in the current directory (empty-area context).
+    PromptNewFolder,
+    /// Prompt to create a new file in the current directory (empty-area context).
+    PromptNewFile,
 }
 
 #[derive(Clone)]

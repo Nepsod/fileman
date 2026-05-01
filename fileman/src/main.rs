@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod navigation;
 mod window;
 mod toolbar;
@@ -12,17 +13,17 @@ use std::path::PathBuf;
 async fn main() {
     //env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Parse command line arguments
+    let fileman_config = config::FilemanConfig::load_or_create();
+
+    // Parse command line arguments (CLI path wins over config DefaultPath)
     let mut args = std::env::args().skip(1);
-    let initial_location = args.next()
+    let initial_location = args
+        .next()
         .map(PathBuf::from)
+        .or_else(|| fileman_config.default_folder_path())
         .or_else(|| std::env::current_dir().ok())
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(PathBuf::from)
-        })
+        .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/"));
 
-    app::FilemanApp::run(initial_location);
+    app::FilemanApp::run(initial_location, fileman_config);
 }

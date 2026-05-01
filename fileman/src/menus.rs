@@ -24,12 +24,15 @@ pub struct ReferenceMenubarActions {
     pub new_folder: Arc<dyn Fn() + Send + Sync>,
     pub rename_selection: Arc<dyn Fn() + Send + Sync>,
     pub delete_selection: Arc<dyn Fn() + Send + Sync>,
+    pub delete_permanent_selection: Arc<dyn Fn() + Send + Sync>,
     pub sort_name_asc: Arc<dyn Fn() + Send + Sync>,
     pub sort_name_desc: Arc<dyn Fn() + Send + Sync>,
     pub sort_size_asc: Arc<dyn Fn() + Send + Sync>,
     pub sort_size_desc: Arc<dyn Fn() + Send + Sync>,
     pub sort_modified_asc: Arc<dyn Fn() + Send + Sync>,
     pub sort_modified_desc: Arc<dyn Fn() + Send + Sync>,
+    pub sort_type_asc: Arc<dyn Fn() + Send + Sync>,
+    pub sort_type_desc: Arc<dyn Fn() + Send + Sync>,
     pub set_search_current_folder: Arc<dyn Fn() + Send + Sync>,
     pub set_search_include_subfolders: Arc<dyn Fn() + Send + Sync>,
     pub select_all: Arc<dyn Fn() + Send + Sync>,
@@ -68,12 +71,15 @@ pub fn build_reference_menubar(
     let new_folder = actions.new_folder.clone();
     let rename_selection = actions.rename_selection.clone();
     let delete_selection = actions.delete_selection.clone();
+    let delete_permanent_selection = actions.delete_permanent_selection.clone();
     let sort_name_asc = actions.sort_name_asc.clone();
     let sort_name_desc = actions.sort_name_desc.clone();
     let sort_size_asc = actions.sort_size_asc.clone();
     let sort_size_desc = actions.sort_size_desc.clone();
     let sort_modified_asc = actions.sort_modified_asc.clone();
     let sort_modified_desc = actions.sort_modified_desc.clone();
+    let sort_type_asc = actions.sort_type_asc.clone();
+    let sort_type_desc = actions.sort_type_desc.clone();
     let set_search_current_folder = actions.set_search_current_folder.clone();
     let set_search_include_subfolders = actions.set_search_include_subfolders.clone();
     let select_all = actions.select_all.clone();
@@ -293,6 +299,17 @@ pub fn build_reference_menubar(
                 }),
         )
         .add_item(
+            MenuItem::new(MenuCommand::Custom(1112), "Delete Permanently")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (delete_permanent_selection)();
+                        let _ = status_tx.send("Menu: Edit -> Delete Permanently".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
             MenuItem::new(MenuCommand::Custom(1109), "Duplicate")
                 .with_action({
                     let status_tx = status_tx.clone();
@@ -367,6 +384,28 @@ pub fn build_reference_menubar(
                 move || {
                     (sort_modified_desc)();
                     let _ = status_tx.send("Menu: View -> Sort -> Date Modified (Descending)".to_string());
+                    Update::DRAW
+                }
+            }),
+    );
+    sort_menu = sort_menu.add_item(
+        MenuItem::new(MenuCommand::Custom(1216), "Type (Ascending)")
+            .with_action({
+                let status_tx = status_tx.clone();
+                move || {
+                    (sort_type_asc)();
+                    let _ = status_tx.send("Menu: View -> Sort -> Type (Ascending)".to_string());
+                    Update::DRAW
+                }
+            }),
+    );
+    sort_menu = sort_menu.add_item(
+        MenuItem::new(MenuCommand::Custom(1217), "Type (Descending)")
+            .with_action({
+                let status_tx = status_tx.clone();
+                move || {
+                    (sort_type_desc)();
+                    let _ = status_tx.send("Menu: View -> Sort -> Type (Descending)".to_string());
                     Update::DRAW
                 }
             }),

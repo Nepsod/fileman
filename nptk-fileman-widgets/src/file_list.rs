@@ -38,6 +38,47 @@ mod content;
 use content::FileListContent;
 pub use types::*;
 
+/// Empty-area context menu (Paste, New Folder, New File, Refresh). Shared by `ItemView` and `FileListContent`.
+fn show_file_list_background_context_menu(
+    op_tx: tokio::sync::mpsc::UnboundedSender<FileListOperation>,
+    pos: Vector2<f64>,
+    context: AppContext,
+) -> Update {
+    let op_paste = op_tx.clone();
+    let op_new_folder = op_tx.clone();
+    let op_new_file = op_tx.clone();
+    let op_refresh = op_tx;
+    let bg_menu = MenuTemplate::new("file_list_background_menu")
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(0x2101), "Paste").with_action(move || {
+                let _ = op_paste.send(FileListOperation::Paste);
+                Update::DRAW
+            }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(0x2102), "New Folder").with_action(move || {
+                let _ = op_new_folder.send(FileListOperation::PromptNewFolder);
+                Update::DRAW
+            }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(0x2103), "New File").with_action(move || {
+                let _ = op_new_file.send(FileListOperation::PromptNewFile);
+                Update::DRAW
+            }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(0x2104), "Refresh").with_action(move || {
+                let _ = op_refresh.send(FileListOperation::Refresh);
+                Update::DRAW
+            }),
+        );
+    context
+        .menu_manager
+        .show(bg_menu, Point::new(pos.x, pos.y));
+    Update::DRAW
+}
+
 
 
 
@@ -536,7 +577,13 @@ impl FileList {
                     Update::empty()
                 });
             }
-                
+
+            if let Some(op_tx_bg) = self.operation_tx.clone() {
+                view = view.with_on_background_context_menu(move |pos, context| {
+                    show_file_list_background_context_menu(op_tx_bg.clone(), pos, context)
+                });
+            }
+
             // Hook up selection signal (path -> index)
             // This is tricky because we need to map paths to indices reactively.
             // ideally we would use a mapped signal, but we can also just rely on update()
@@ -838,6 +885,23 @@ impl Widget for FileList {
             {
                 self.clear_selection();
                 update.insert(Update::DRAW);
+                continue;
+            } else if key_event.physical_key
+                == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::Backspace)
+                && !modifiers.control_key()
+            {
+                if let Some(ref tx) = self.operation_tx {
+                    let _ = tx.send(FileListOperation::NavigateUp);
+                }
+                continue;
+            } else if modifiers.alt_key()
+                && !modifiers.control_key()
+                && key_event.physical_key
+                    == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::ArrowUp)
+            {
+                if let Some(ref tx) = self.operation_tx {
+                    let _ = tx.send(FileListOperation::NavigateUp);
+                }
                 continue;
             } else if key_event.physical_key
                 == nptk::core::window::PhysicalKey::Code(nptk::core::window::KeyCode::F5)

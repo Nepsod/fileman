@@ -16,7 +16,13 @@ fn spawn_in_dir(program: &str, args: &[&str], dir: &Path) -> Result<(), String> 
 }
 
 /// Open a terminal window whose initial working directory is `dir`.
-pub fn open_terminal_in_directory(dir: &Path) -> Result<(), String> {
+///
+/// Precedence: `TERMINAL` environment variable, then `config_command` from `[System].Terminal`
+/// in `config.toml`, then common fallbacks.
+pub fn open_terminal_in_directory(
+    dir: &Path,
+    config_command: Option<&str>,
+) -> Result<(), String> {
     if !dir.is_dir() {
         return Err("Not a directory".to_string());
     }
@@ -26,6 +32,16 @@ pub fn open_terminal_in_directory(dir: &Path) -> Result<(), String> {
         if let Some(prog) = parts.first() {
             let rest: Vec<&str> = parts.iter().skip(1).copied().collect();
             return spawn_in_dir(prog, &rest, dir);
+        }
+    }
+
+    if let Some(cmd) = config_command {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        if let Some(prog) = parts.first() {
+            let rest: Vec<&str> = parts.iter().skip(1).copied().collect();
+            if spawn_in_dir(prog, &rest, dir).is_ok() {
+                return Ok(());
+            }
         }
     }
 

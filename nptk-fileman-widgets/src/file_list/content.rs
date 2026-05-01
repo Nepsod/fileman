@@ -1101,7 +1101,17 @@ impl Widget for FileListContent {
                     }
                 } else {
                     for (_, btn, el) in &info.buttons {
-                        if *btn == MouseButton::Left && *el == ElementState::Pressed {
+                        if *btn == MouseButton::Right && *el == ElementState::Pressed {
+                            if let Some(ref op_tx) = self.operation_tx {
+                                if let Some(cursor_pos) = info.cursor_pos {
+                                    update |= super::show_file_list_background_context_menu(
+                                        op_tx.clone(),
+                                        Vector2::new(cursor_pos.x, cursor_pos.y),
+                                        context.clone(),
+                                    );
+                                }
+                            }
+                        } else if *btn == MouseButton::Left && *el == ElementState::Pressed {
                             self.drag_start = Some(Point::new(local_x as f64, local_y as f64));
                             self.current_drag_pos =
                                 Some(Point::new(local_x as f64, local_y as f64));

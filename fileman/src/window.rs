@@ -9,6 +9,7 @@ use nptk::services::filesystem::entry::FileEntry;
 use nptk_fileman_widgets::FilemanSidebar;
 // use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem}; // Unused
 use crate::app::AppState;
+use crate::config::DeletePolicy;
 use crate::operations;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -82,6 +83,9 @@ struct FileListWrapper {
     /// Notify UI thread after async folder duplicate completes (`try_recv` in `update`).
     folder_duplicate_done_tx: mpsc::UnboundedSender<()>,
     folder_duplicate_done_rx: Option<mpsc::UnboundedReceiver<()>>,
+    delete_policy: DeletePolicy,
+    /// From config `[System].Terminal`; superseded by `TERMINAL` env at spawn time.
+    terminal_command: Option<String>,
 }
 
 impl FileListWrapper {
@@ -99,6 +103,8 @@ impl FileListWrapper {
         show_hidden_files_signal: StateSignal<bool>,
         folder_duplicate_done_tx: mpsc::UnboundedSender<()>,
         folder_duplicate_done_rx: mpsc::UnboundedReceiver<()>,
+        delete_policy: DeletePolicy,
+        terminal_command: Option<String>,
     ) -> Self {
         // Create channel for FileList operations
         let (file_list_op_tx, file_list_op_rx) = mpsc::unbounded_channel::<FileListOperation>();
@@ -276,6 +282,24 @@ impl FileListWrapper {
                             Update::DRAW
                         })
                 );
+
+                let op_tx_sort = op_tx.clone();
+                sort_menu = sort_menu.add_item(
+                    MenuItem::new(MenuCommand::Custom(16), "Type (Asc)")
+                        .with_action(move || {
+                            let _ = op_tx_sort.send(FileListOperation::Sort(2, SortOrder::Ascending));
+                            Update::DRAW
+                        })
+                );
+
+                let op_tx_sort = op_tx.clone();
+                sort_menu = sort_menu.add_item(
+                    MenuItem::new(MenuCommand::Custom(17), "Type (Desc)")
+                        .with_action(move || {
+                            let _ = op_tx_sort.send(FileListOperation::Sort(2, SortOrder::Descending));
+                            Update::DRAW
+                        })
+                );
                 
                 template = template.add_item(
                     MenuItem::new(MenuCommand::Custom(5), "Sort By").with_submenu(sort_menu)
@@ -305,6 +329,17 @@ impl FileListWrapper {
             clipboard,
             folder_duplicate_done_tx,
             folder_duplicate_done_rx: Some(folder_duplicate_done_rx),
+            delete_policy,
+            terminal_command,
+        }
+    }
+
+    fn apply_startup_folder_view(&mut self, fileman: &crate::config::FilemanConfig) {
+        if let Some((col, order)) = fileman.initial_sort() {
+            self.file_list.sort(col, order);
+        }
+        if let Some(sz) = fileman.initial_icon_size() {
+            self.file_list.set_icon_size(sz);
         }
     }
 
@@ -456,6 +491,19 @@ impl FileListWrapper {
         context: AppContext,
     ) {
         if paths.is_empty() {
+            return;
+        }
+
+        if permanent && !self.delete_policy.confirm_delete {
+            if let Ok(mut p) = self.pending_delete_confirmation.lock() {
+                *p = Some((paths.to_vec(), true));
+            }
+            return;
+        }
+        if !permanent && !self.delete_policy.confirm_trash {
+            if let Ok(mut p) = self.pending_delete_confirmation.lock() {
+                *p = Some((paths.to_vec(), false));
+            }
             return;
         }
 
@@ -881,9 +929,13 @@ impl Widget for FileListWrapper {
                     update.insert(self.paste_files());
                 },
                 FileListOperation::DeleteToTrash(paths) => {
-                    let _ = self
-                        .operation_tx
-                        .send(FileOperationRequest::Delete(paths));
+                    if self.delete_policy.use_trash {
+                        let _ = self.operation_tx.send(FileOperationRequest::Delete(paths));
+                    } else {
+                        let _ = self
+                            .operation_tx
+                            .send(FileOperationRequest::DeletePermanent(paths));
+                    }
                 },
                 FileListOperation::DeletePermanent(paths) => {
                     let _ = self
@@ -928,6 +980,26 @@ impl Widget for FileListWrapper {
                         .operation_tx
                         .send(FileOperationRequest::Duplicate(paths));
                 }
+                FileListOperation::NavigateUp => {
+                    if let Ok(mut nav) = self.navigation.lock() {
+                        if let Some(parent) = nav.parent_path() {
+                            nav.navigate_to(parent);
+                            update.insert(Update::LAYOUT | Update::DRAW);
+                        }
+                    }
+                }
+                FileListOperation::PromptNewFolder => {
+                    let parent = self.file_list.get_current_path();
+                    let _ = self
+                        .operation_tx
+                        .send(FileOperationRequest::PromptCreateDirectory(parent));
+                }
+                FileListOperation::PromptNewFile => {
+                    let parent = self.file_list.get_current_path();
+                    let _ = self
+                        .operation_tx
+                        .send(FileOperationRequest::PromptCreateFile(parent));
+                }
             }
         }
 
@@ -946,7 +1018,8 @@ impl Widget for FileListWrapper {
                 match op {
                     FileOperationRequest::Delete(paths) => {
                         log::warn!("RECEIVED DELETE REQUEST for {} path(s)", paths.len());
-                        pending_deletes.push((paths, false));
+                        let permanent = !self.delete_policy.use_trash;
+                        pending_deletes.push((paths, permanent));
                     }
                     FileOperationRequest::DeletePermanent(paths) => {
                         pending_deletes.push((paths, true));
@@ -1045,7 +1118,10 @@ impl Widget for FileListWrapper {
                     }
                     FileOperationRequest::OpenTerminalHere => {
                         let cwd = self.file_list.get_current_path();
-                        match crate::terminal::open_terminal_in_directory(&cwd) {
+                        match crate::terminal::open_terminal_in_directory(
+                            &cwd,
+                            self.terminal_command.as_deref(),
+                        ) {
                             Ok(()) => {
                                 if let Some(ref tx) = self.status_tx {
                                     let _ = tx.send("Opened terminal in current folder".to_string());
@@ -1426,7 +1502,7 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         .with_places(true)
         .with_bookmarks(true)
         .with_devices(true)
-        .with_width(200.0)
+        .with_width(state.fileman.sidebar_width() as f32)
         .with_current_path_signal(navigation_path_signal.clone())
         .with_add_bookmark_receiver(add_bookmark_rx)
         .with_remove_bookmark_receiver(remove_bookmark_rx)
@@ -1438,11 +1514,15 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
 
     let search_scope_signal = StateSignal::new(SearchScope::CurrentFolder);
     let search_query_signal = StateSignal::new(String::new());
-    let show_hidden_files_signal = StateSignal::new(false);
+    let show_hidden_files_signal =
+        StateSignal::new(state.fileman.initial_show_hidden());
     let (search_tx, search_rx) = mpsc::unbounded_channel::<String>();
     let (folder_duplicate_done_tx, folder_duplicate_done_rx) = mpsc::unbounded_channel::<()>();
 
     // Create FileList wrapper that syncs with navigation state
+    let delete_policy = state.fileman.delete_policy();
+    let terminal_command = state.fileman.terminal_command().map(str::to_string);
+
     let mut file_list_wrapper = FileListWrapper::new(
         initial_path.clone(),
         nav_clone.clone(),
@@ -1457,8 +1537,15 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         show_hidden_files_signal.clone(),
         folder_duplicate_done_tx,
         folder_duplicate_done_rx,
+        delete_policy,
+        terminal_command,
     );
-    
+
+    if let Some(mode) = state.fileman.default_view_mode() {
+        file_list_wrapper.view_mode_signal().set(mode);
+    }
+    file_list_wrapper.apply_startup_folder_view(&state.fileman);
+
     // Set file list to grow and fill remaining space
     file_list_wrapper.set_layout_style(LayoutStyle {
         size: Vector2::new(Dimension::auto(), Dimension::percent(1.0)),
@@ -1636,6 +1723,19 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
                     }
                 }
             }),
+            delete_permanent_selection: Arc::new({
+                let operation_tx = operation_tx.clone();
+                let selected_paths_signal = selected_paths_signal.clone();
+                let status_tx = status_tx.clone();
+                move || {
+                    let paths = (*selected_paths_signal.get()).clone();
+                    if paths.is_empty() {
+                        let _ = status_tx.send("Delete permanently: nothing selected".to_string());
+                    } else {
+                        let _ = operation_tx.send(FileOperationRequest::DeletePermanent(paths));
+                    }
+                }
+            }),
             sort_name_asc: Arc::new({
                 let operation_tx = operation_tx.clone();
                 move || {
@@ -1670,6 +1770,18 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
                 let operation_tx = operation_tx.clone();
                 move || {
                     let _ = operation_tx.send(FileOperationRequest::Sort(3, SortOrder::Descending));
+                }
+            }),
+            sort_type_asc: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Sort(2, SortOrder::Ascending));
+                }
+            }),
+            sort_type_desc: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Sort(2, SortOrder::Descending));
                 }
             }),
             set_search_current_folder: Arc::new({
