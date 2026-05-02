@@ -4,6 +4,7 @@ mod navigation;
 mod window;
 mod toolbar;
 mod menus;
+mod settings_dialog;
 mod operations;
 mod terminal;
 

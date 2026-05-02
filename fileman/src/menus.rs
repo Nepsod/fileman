@@ -45,6 +45,8 @@ pub struct ReferenceMenubarActions {
     pub add_bookmark_current_folder: Arc<dyn Fn() + Send + Sync>,
     pub remove_bookmark_current_folder: Arc<dyn Fn() + Send + Sync>,
     pub open_terminal_here: Arc<dyn Fn() + Send + Sync>,
+    pub show_about: Arc<dyn Fn() + Send + Sync>,
+    pub configure_fileman: Arc<dyn Fn() + Send + Sync>,
 }
 
 /// Build a reference menubar for smoke-testing integration in fileman.
@@ -92,6 +94,8 @@ pub fn build_reference_menubar(
     let add_bookmark_current_folder = actions.add_bookmark_current_folder.clone();
     let remove_bookmark_current_folder = actions.remove_bookmark_current_folder.clone();
     let open_terminal_here = actions.open_terminal_here.clone();
+    let show_about = actions.show_about.clone();
+    let configure_fileman = actions.configure_fileman.clone();
 
     let status_tx_file_home = status_tx.clone();
 
@@ -519,7 +523,6 @@ pub fn build_reference_menubar(
                 }),
         );
 
-    let status_tx_help = status_tx.clone();
     let bookmarks_menu = MenuTemplate::new("Bookmarks")
         .add_item(
             MenuItem::new(MenuCommand::Custom(1401), "Add Current Folder")
@@ -545,16 +548,27 @@ pub fn build_reference_menubar(
                 }),
         );
 
+    let settings_menu = MenuTemplate::new("Settings").add_item(
+        MenuItem::new(MenuCommand::Custom(1601), "Configure Fileman").with_action({
+            let status_tx = status_tx.clone();
+            move || {
+                (configure_fileman)();
+                let _ = status_tx.send("Menu: Settings -> Configure Fileman".to_string());
+                Update::DRAW
+            }
+        }),
+    );
+
     let help_menu = MenuTemplate::new("Help")
         .add_item(
             MenuItem::new(MenuCommand::Custom(1301), "About")
-                .with_action(move || {
-                    let _ = status_tx_help.send(format!(
-                        "About: {} {}",
-                        env!("CARGO_PKG_NAME"),
-                        env!("CARGO_PKG_VERSION")
-                    ));
-                    Update::DRAW
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (show_about)();
+                        let _ = status_tx.send("Menu: Help -> About".to_string());
+                        Update::DRAW
+                    }
                 }),
         );
 
@@ -564,6 +578,7 @@ pub fn build_reference_menubar(
         .with_template(view_menu)
         .with_template(tools_menu)
         .with_template(bookmarks_menu)
+        .with_template(settings_menu)
         .with_template(help_menu)
         .with_menu_manager(menu_manager)
 }

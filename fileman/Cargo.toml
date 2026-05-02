@@ -1,6 +1,7 @@
 [package]
 name = "fileman"
 version = "0.0.1"
+description = "Wayland-first NPTK-based file manager for the Nepsod desktop."
 edition.workspace = true
 authors.workspace = true
 repository.workspace = true

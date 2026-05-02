@@ -9,7 +9,7 @@ use nptk::services::filesystem::entry::FileEntry;
 use nptk_fileman_widgets::FilemanSidebar;
 // use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem}; // Unused
 use crate::app::AppState;
-use crate::config::DeletePolicy;
+use crate::config::{DeletePolicy, FilemanConfig};
 use crate::operations;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -53,6 +53,10 @@ pub enum FileOperationRequest {
     Duplicate(Vec<PathBuf>),
     /// Spawn terminal with cwd = current folder.
     OpenTerminalHere,
+    /// Show Help → About popup.
+    ShowAbout,
+    /// Open Settings → Configure Fileman.
+    ShowSettings,
 }
 
 /// Wrapper widget that manages FileList and connects it to navigation state
@@ -83,9 +87,11 @@ struct FileListWrapper {
     /// Notify UI thread after async folder duplicate completes (`try_recv` in `update`).
     folder_duplicate_done_tx: mpsc::UnboundedSender<()>,
     folder_duplicate_done_rx: Option<mpsc::UnboundedReceiver<()>>,
-    delete_policy: DeletePolicy,
+    delete_policy: Arc<Mutex<DeletePolicy>>,
     /// From config `[System].Terminal`; superseded by `TERMINAL` env at spawn time.
-    terminal_command: Option<String>,
+    terminal_command: Arc<Mutex<Option<String>>>,
+    config_path: Option<PathBuf>,
+    show_hidden_files_signal: StateSignal<bool>,
 }
 
 impl FileListWrapper {
@@ -103,8 +109,9 @@ impl FileListWrapper {
         show_hidden_files_signal: StateSignal<bool>,
         folder_duplicate_done_tx: mpsc::UnboundedSender<()>,
         folder_duplicate_done_rx: mpsc::UnboundedReceiver<()>,
-        delete_policy: DeletePolicy,
-        terminal_command: Option<String>,
+        delete_policy: Arc<Mutex<DeletePolicy>>,
+        terminal_command: Arc<Mutex<Option<String>>>,
+        config_path: Option<PathBuf>,
     ) -> Self {
         // Create channel for FileList operations
         let (file_list_op_tx, file_list_op_rx) = mpsc::unbounded_channel::<FileListOperation>();
@@ -118,7 +125,7 @@ impl FileListWrapper {
             search_pending_rx,
         )
             .with_search_scope_signal(search_scope_signal)
-            .with_show_hidden_files_signal(show_hidden_files_signal);
+            .with_show_hidden_files_signal(show_hidden_files_signal.clone());
         
         // Clone signals from FileList for reactive subscription
         let file_list_path_signal = file_list.current_path_signal().clone();
@@ -331,6 +338,8 @@ impl FileListWrapper {
             folder_duplicate_done_rx: Some(folder_duplicate_done_rx),
             delete_policy,
             terminal_command,
+            config_path,
+            show_hidden_files_signal,
         }
     }
 
@@ -494,13 +503,24 @@ impl FileListWrapper {
             return;
         }
 
-        if permanent && !self.delete_policy.confirm_delete {
+        let confirm_delete = self
+            .delete_policy
+            .lock()
+            .map(|p| p.confirm_delete)
+            .unwrap_or(true);
+        let confirm_trash = self
+            .delete_policy
+            .lock()
+            .map(|p| p.confirm_trash)
+            .unwrap_or(true);
+
+        if permanent && !confirm_delete {
             if let Ok(mut p) = self.pending_delete_confirmation.lock() {
                 *p = Some((paths.to_vec(), true));
             }
             return;
         }
-        if !permanent && !self.delete_policy.confirm_trash {
+        if !permanent && !confirm_trash {
             if let Ok(mut p) = self.pending_delete_confirmation.lock() {
                 *p = Some((paths.to_vec(), false));
             }
@@ -553,50 +573,114 @@ impl FileListWrapper {
 
         let message_text = Text::new(message);
 
-        let cancel_btn = Button::new(Text::new("Cancel".to_string()))
-            .with_on_pressed(MaybeSignal::value(Update::DRAW));
+        let ctx_cancel = context.clone();
+        let dialog_content = StandardModalLayout::build(
+            vec![Box::new(message_text)],
+            vec![
+                DialogButton::new("Cancel", {
+                    context.callback(move || {
+                        ctx_cancel.close_top_popup();
+                        Update::DRAW
+                    })
+                }),
+                DialogButton::new(confirm_label, {
+                    let pending_delete_btn = pending_delete.clone();
+                    let paths_btn = paths_to_delete.clone();
+                    MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                        if let Ok(mut pending) = pending_delete_btn.lock() {
+                            *pending = Some((paths_btn.clone(), permanent));
+                        }
+                        Update::DRAW
+                    })))
+                }),
+            ],
+        );
 
-        let delete_btn = Button::new(Text::new(confirm_label.to_string()))
-            .with_on_pressed({
-                let pending_delete_btn = pending_delete.clone();
-                let paths_btn = paths_to_delete.clone();
-                MaybeSignal::signal(Box::new(EvalSignal::new(move || {
-                    if let Ok(mut pending) = pending_delete_btn.lock() {
-                        *pending = Some((paths_btn.clone(), permanent));
-                    }
-                    Update::DRAW
-                })))
-            });
+        open_popup_at(&context, title, (400, 150), (300, 200), Box::new(dialog_content));
+    }
 
-        let dialog_content = Container::new(vec![
-            Box::new(message_text),
-            Box::new(Container::new(vec![
-                Box::new(cancel_btn),
-                Box::new(delete_btn),
-            ]).with_layout_style(LayoutStyle {
-                flex_direction: FlexDirection::Row,
-                gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
-                justify_content: Some(JustifyContent::FlexEnd),
-                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
-                ..Default::default()
-            })),
-        ])
-        .with_layout_style(LayoutStyle {
+    fn show_about_dialog(&self, context: AppContext) {
+        const ABOUT_TITLE_PX: f32 = 14.0;
+        const ABOUT_BODY_PX: f32 = 11.0;
+
+        let full_row = LayoutStyle {
             size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
-            flex_direction: FlexDirection::Column,
-            padding: Rect {
-                left: LengthPercentage::length(16.0),
-                right: LengthPercentage::length(16.0),
-                top: LengthPercentage::length(16.0),
-                bottom: LengthPercentage::length(16.0),
-            },
-            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(16.0)),
             ..Default::default()
-        });
+        };
 
-        context
-            .popup_manager
-            .create_popup_at(Box::new(dialog_content), title, (400, 150), (300, 200));
+        let title_line = Text::new(env!("CARGO_PKG_NAME").to_string())
+            .with_font_size(ABOUT_TITLE_PX)
+            .with_layout_style(full_row.clone());
+        let version_line = Text::new(format!(
+            "Version\u{00A0}{}",
+            env!("CARGO_PKG_VERSION")
+        ))
+            .with_font_size(ABOUT_BODY_PX + 1.4)
+            .with_layout_style(full_row.clone());
+        let blurb = Text::new(env!("CARGO_PKG_DESCRIPTION").to_string())
+            .with_font_size(ABOUT_BODY_PX)
+            .with_layout_style(full_row.clone());
+        let authors_line = Text::new(format!(
+            "Authors:\u{00A0}{}",
+            env!("CARGO_PKG_AUTHORS")
+        ))
+            .with_font_size(ABOUT_BODY_PX)
+            .with_layout_style(full_row.clone());
+        let license_line = Text::new(format!("License:\u{00A0}{}", env!("CARGO_PKG_LICENSE")))
+            .with_font_size(ABOUT_BODY_PX)
+            .with_layout_style(full_row.clone());
+
+        let repo_url = env!("CARGO_PKG_REPOSITORY");
+        let repo_display = if let Some(slash_idx) = repo_url.rfind('/') {
+            format!(
+                "Repository:\n{}\u{2060}{}",
+                &repo_url[..=slash_idx],
+                &repo_url[slash_idx + 1..]
+            )
+        } else {
+            format!("Repository:\n{}", repo_url)
+        };
+        let repo_line = Text::new(repo_display)
+            .with_font_size(ABOUT_BODY_PX)
+            .with_layout_style(full_row.clone());
+
+        let ctx_close = context.clone();
+        let dialog_content = StandardModalLayout::build_with_style(
+            vec![
+                Box::new(title_line),
+                Box::new(version_line),
+                Box::new(blurb),
+                Box::new(authors_line),
+                Box::new(license_line),
+                Box::new(repo_line),
+            ],
+            vec![DialogButton::new("Close", {
+                context.callback(move || {
+                    ctx_close.close_top_popup();
+                    Update::DRAW
+                })
+            })
+            .with_font_size(14.0)],
+            StandardModalStyle::about_like(),
+        );
+
+        open_popup_at(
+            &context,
+            "About Fileman",
+            (400, 220),
+            (400, 380),
+            Box::new(dialog_content),
+        );
+    }
+
+    fn show_settings_dialog(&self, context: AppContext) {
+        crate::settings_dialog::open_configure_fileman_popup(
+            context,
+            self.config_path.clone(),
+            self.show_hidden_files_signal.clone(),
+            self.delete_policy.clone(),
+            self.terminal_command.clone(),
+        );
     }
 
     /// Show rename dialog
@@ -614,54 +698,37 @@ impl FileListWrapper {
             
         let input_signal_clone = input_signal.clone();
         
-        // Cancel button
-        let cancel_btn = Button::new(Text::new("Cancel".to_string()))
-            .with_on_pressed(MaybeSignal::value(Update::DRAW));
+        let ctx_cancel = context.clone();
+        let dialog_content = StandardModalLayout::build(
+            vec![
+                Box::new(message_text),
+                Box::new(input_field),
+            ],
+            vec![
+                DialogButton::new("Cancel", {
+                    context.callback(move || {
+                        ctx_cancel.close_top_popup();
+                        Update::DRAW
+                    })
+                }),
+                DialogButton::new("Rename", {
+                    let pending = pending_rename.clone();
+                    let p = path_clone.clone();
+                    let s = input_signal_clone.clone();
+                    MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                        let new_name = (*s.get()).clone();
+                        if !new_name.is_empty() {
+                             if let Ok(mut lock) = pending.lock() {
+                                 *lock = Some((p.clone(), new_name));
+                             }
+                        }
+                        Update::DRAW
+                    })))
+                }),
+            ],
+        );
 
-        // OK button
-        let ok_btn = Button::new(Text::new("Rename".to_string()))
-            .with_on_pressed({
-                let pending = pending_rename.clone();
-                let p = path_clone.clone();
-                let s = input_signal_clone.clone();
-                MaybeSignal::signal(Box::new(EvalSignal::new(move || {
-                    let new_name = (*s.get()).clone();
-                    if !new_name.is_empty() {
-                         if let Ok(mut lock) = pending.lock() {
-                             *lock = Some((p.clone(), new_name));
-                         }
-                    }
-                    Update::DRAW
-                })))
-            });
-
-        let dialog_content = Container::new(vec![
-            Box::new(message_text),
-            Box::new(input_field),
-            Box::new(Container::new(vec![
-                Box::new(cancel_btn),
-                Box::new(ok_btn),
-            ]).with_layout_style(LayoutStyle {
-                flex_direction: FlexDirection::Row,
-                gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
-                justify_content: Some(JustifyContent::FlexEnd),
-                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
-                ..Default::default()
-            })),
-        ]).with_layout_style(LayoutStyle {
-            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
-            flex_direction: FlexDirection::Column,
-            padding: Rect {
-                left: LengthPercentage::length(16.0),
-                right: LengthPercentage::length(16.0),
-                top: LengthPercentage::length(16.0),
-                bottom: LengthPercentage::length(16.0),
-            },
-            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(16.0)),
-            ..Default::default()
-        });
-
-        context.popup_manager.create_popup_at(Box::new(dialog_content), "Rename File", (400, 200), (300, 250));
+        open_popup_at(&context, "Rename File", (400, 200), (300, 250), Box::new(dialog_content));
     }
 
     /// Show new folder dialog
@@ -678,54 +745,34 @@ impl FileListWrapper {
             
         let input_signal_clone = input_signal.clone();
         
-        // Cancel button
-        let cancel_btn = Button::new(Text::new("Cancel".to_string()))
-            .with_on_pressed(MaybeSignal::value(Update::DRAW));
+        let ctx_cancel = context.clone();
+        let dialog_content = StandardModalLayout::build(
+            vec![Box::new(message_text), Box::new(input_field)],
+            vec![
+                DialogButton::new("Cancel", {
+                    context.callback(move || {
+                        ctx_cancel.close_top_popup();
+                        Update::DRAW
+                    })
+                }),
+                DialogButton::new("Create", {
+                    let pending = pending_create.clone();
+                    let p = parent_clone.clone();
+                    let s = input_signal_clone.clone();
+                    MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                        let new_name = (*s.get()).clone();
+                        if !new_name.is_empty() {
+                             if let Ok(mut lock) = pending.lock() {
+                                 *lock = Some((p.clone(), new_name));
+                             }
+                        }
+                        Update::DRAW
+                    })))
+                }),
+            ],
+        );
 
-        // OK button
-        let ok_btn = Button::new(Text::new("Create".to_string()))
-            .with_on_pressed({
-                let pending = pending_create.clone();
-                let p = parent_clone.clone();
-                let s = input_signal_clone.clone();
-                MaybeSignal::signal(Box::new(EvalSignal::new(move || {
-                    let new_name = (*s.get()).clone();
-                    if !new_name.is_empty() {
-                         if let Ok(mut lock) = pending.lock() {
-                             *lock = Some((p.clone(), new_name));
-                         }
-                    }
-                    Update::DRAW
-                })))
-            });
-
-        let dialog_content = Container::new(vec![
-            Box::new(message_text),
-            Box::new(input_field),
-            Box::new(Container::new(vec![
-                Box::new(cancel_btn),
-                Box::new(ok_btn),
-            ]).with_layout_style(LayoutStyle {
-                flex_direction: FlexDirection::Row,
-                gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
-                justify_content: Some(JustifyContent::FlexEnd),
-                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
-                ..Default::default()
-            })),
-        ]).with_layout_style(LayoutStyle {
-            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
-            flex_direction: FlexDirection::Column,
-            padding: Rect {
-                left: LengthPercentage::length(16.0),
-                right: LengthPercentage::length(16.0),
-                top: LengthPercentage::length(16.0),
-                bottom: LengthPercentage::length(16.0),
-            },
-            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(16.0)),
-            ..Default::default()
-        });
-
-        context.popup_manager.create_popup_at(Box::new(dialog_content), "New Folder", (400, 200), (300, 250));
+        open_popup_at(&context, "New Folder", (400, 200), (300, 250), Box::new(dialog_content));
     }
 
     /// Show new empty file dialog
@@ -742,52 +789,34 @@ impl FileListWrapper {
 
         let input_signal_clone = input_signal.clone();
 
-        let cancel_btn = Button::new(Text::new("Cancel".to_string()))
-            .with_on_pressed(MaybeSignal::value(Update::DRAW));
-
-        let ok_btn = Button::new(Text::new("Create".to_string()))
-            .with_on_pressed({
-                let pending = pending_create.clone();
-                let p = parent_clone.clone();
-                let s = input_signal_clone.clone();
-                MaybeSignal::signal(Box::new(EvalSignal::new(move || {
-                    let new_name = (*s.get()).clone();
-                    if !new_name.is_empty() {
-                        if let Ok(mut lock) = pending.lock() {
-                            *lock = Some((p.clone(), new_name));
+        let ctx_cancel = context.clone();
+        let dialog_content = StandardModalLayout::build(
+            vec![Box::new(message_text), Box::new(input_field)],
+            vec![
+                DialogButton::new("Cancel", {
+                    context.callback(move || {
+                        ctx_cancel.close_top_popup();
+                        Update::DRAW
+                    })
+                }),
+                DialogButton::new("Create", {
+                    let pending = pending_create.clone();
+                    let p = parent_clone.clone();
+                    let s = input_signal_clone.clone();
+                    MaybeSignal::signal(Box::new(EvalSignal::new(move || {
+                        let new_name = (*s.get()).clone();
+                        if !new_name.is_empty() {
+                            if let Ok(mut lock) = pending.lock() {
+                                *lock = Some((p.clone(), new_name));
+                            }
                         }
-                    }
-                    Update::DRAW
-                })))
-            });
+                        Update::DRAW
+                    })))
+                }),
+            ],
+        );
 
-        let dialog_content = Container::new(vec![
-            Box::new(message_text),
-            Box::new(input_field),
-            Box::new(Container::new(vec![
-                Box::new(cancel_btn),
-                Box::new(ok_btn),
-            ]).with_layout_style(LayoutStyle {
-                flex_direction: FlexDirection::Row,
-                gap: Vector2::new(LengthPercentage::length(8.0), LengthPercentage::length(0.0)),
-                justify_content: Some(JustifyContent::FlexEnd),
-                size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
-                ..Default::default()
-            })),
-        ]).with_layout_style(LayoutStyle {
-            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
-            flex_direction: FlexDirection::Column,
-            padding: Rect {
-                left: LengthPercentage::length(16.0),
-                right: LengthPercentage::length(16.0),
-                top: LengthPercentage::length(16.0),
-                bottom: LengthPercentage::length(16.0),
-            },
-            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(16.0)),
-            ..Default::default()
-        });
-
-        context.popup_manager.create_popup_at(Box::new(dialog_content), "New File", (400, 200), (300, 250));
+        open_popup_at(&context, "New File", (400, 200), (300, 250), Box::new(dialog_content));
     }
 }
 
@@ -929,7 +958,12 @@ impl Widget for FileListWrapper {
                     update.insert(self.paste_files());
                 },
                 FileListOperation::DeleteToTrash(paths) => {
-                    if self.delete_policy.use_trash {
+                    let use_trash = self
+                        .delete_policy
+                        .lock()
+                        .map(|p| p.use_trash)
+                        .unwrap_or(true);
+                    if use_trash {
                         let _ = self.operation_tx.send(FileOperationRequest::Delete(paths));
                     } else {
                         let _ = self
@@ -1012,13 +1046,20 @@ impl Widget for FileListWrapper {
         let mut pending_creates = Vec::new();
         let mut pending_create_files = Vec::new();
         let mut deferred_operation_channel_ops: Vec<FileOperationRequest> = Vec::new();
+        let mut pending_show_about = false;
+        let mut pending_show_settings = false;
 
         if let Some(ref mut rx) = self.operation_rx {
             while let Ok(op) = rx.try_recv() {
                 match op {
                     FileOperationRequest::Delete(paths) => {
                         log::warn!("RECEIVED DELETE REQUEST for {} path(s)", paths.len());
-                        let permanent = !self.delete_policy.use_trash;
+                        let use_trash = self
+                            .delete_policy
+                            .lock()
+                            .map(|p| p.use_trash)
+                            .unwrap_or(true);
+                        let permanent = !use_trash;
                         pending_deletes.push((paths, permanent));
                     }
                     FileOperationRequest::DeletePermanent(paths) => {
@@ -1118,9 +1159,14 @@ impl Widget for FileListWrapper {
                     }
                     FileOperationRequest::OpenTerminalHere => {
                         let cwd = self.file_list.get_current_path();
+                        let term_owned: Option<String> = self
+                            .terminal_command
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.clone());
                         match crate::terminal::open_terminal_in_directory(
                             &cwd,
-                            self.terminal_command.as_deref(),
+                            term_owned.as_deref(),
                         ) {
                             Ok(()) => {
                                 if let Some(ref tx) = self.status_tx {
@@ -1133,6 +1179,12 @@ impl Widget for FileListWrapper {
                                 }
                             }
                         }
+                    }
+                    FileOperationRequest::ShowAbout => {
+                        pending_show_about = true;
+                    }
+                    FileOperationRequest::ShowSettings => {
+                        pending_show_settings = true;
                     }
                     FileOperationRequest::Duplicate(paths) => {
                         let mut need_sync_refresh = false;
@@ -1276,7 +1328,17 @@ impl Widget for FileListWrapper {
             self.show_new_file_dialog(parent, context.clone());
             update.insert(Update::DRAW);
         }
-        
+
+        if pending_show_about {
+            self.show_about_dialog(context.clone());
+            update.insert(Update::DRAW);
+        }
+
+        if pending_show_settings {
+            self.show_settings_dialog(context.clone());
+            update.insert(Update::DRAW);
+        }
+
         // Show confirmation dialogs for pending delete operations (after releasing borrow)
         if !pending_deletes.is_empty() {
             log::warn!("SHOWING {} DELETE CONFIRMATION DIALOG(S)", pending_deletes.len());
@@ -1520,8 +1582,11 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     let (folder_duplicate_done_tx, folder_duplicate_done_rx) = mpsc::unbounded_channel::<()>();
 
     // Create FileList wrapper that syncs with navigation state
-    let delete_policy = state.fileman.delete_policy();
-    let terminal_command = state.fileman.terminal_command().map(str::to_string);
+    let config_path = FilemanConfig::config_file_path();
+    let delete_policy = Arc::new(Mutex::new(state.fileman.delete_policy()));
+    let terminal_command = Arc::new(Mutex::new(
+        state.fileman.terminal_command().map(str::to_string),
+    ));
 
     let mut file_list_wrapper = FileListWrapper::new(
         initial_path.clone(),
@@ -1539,6 +1604,7 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         folder_duplicate_done_rx,
         delete_policy,
         terminal_command,
+        config_path,
     );
 
     if let Some(mode) = state.fileman.default_view_mode() {
@@ -1892,6 +1958,18 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
                 let operation_tx = operation_tx.clone();
                 move || {
                     let _ = operation_tx.send(FileOperationRequest::OpenTerminalHere);
+                }
+            }),
+            show_about: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::ShowAbout);
+                }
+            }),
+            configure_fileman: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::ShowSettings);
                 }
             }),
         },

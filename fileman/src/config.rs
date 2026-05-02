@@ -149,6 +149,16 @@ pub struct DeletePolicy {
     pub use_trash: bool,
 }
 
+impl Default for DeletePolicy {
+    fn default() -> Self {
+        Self {
+            confirm_delete: true,
+            confirm_trash: true,
+            use_trash: true,
+        }
+    }
+}
+
 impl Default for FilemanConfig {
     fn default() -> Self {
         Self {
@@ -204,7 +214,7 @@ impl FilemanConfig {
         Self::load_from_path(&path)
     }
 
-    fn load_from_path(path: &Path) -> Self {
+    pub(crate) fn load_from_path(path: &Path) -> Self {
         if !path.is_file() {
             log::debug!("fileman: no config at {:?}, using defaults", path);
             return Self::default();
@@ -423,6 +433,79 @@ pub(crate) fn persist_window_geometry(
         set_or_replace_value(window, "LastWindowHeight", value(height));
     }
 
+    std::fs::write(path, doc.to_string())
+}
+
+/// Values written by the Configure Fileman dialog (`[FolderView]`, `[Behavior]`, `[System]`, `[Window]` subset).
+#[derive(Debug, Clone)]
+pub struct UserSettingsPersist {
+    pub show_hidden: bool,
+    pub confirm_delete: bool,
+    pub confirm_trash: bool,
+    pub use_trash: bool,
+    pub remember_window_size: bool,
+    pub terminal: String,
+}
+
+/// Updates user preference keys in `config.toml` via TOML AST (preserves comments and unrelated keys).
+pub(crate) fn persist_user_settings(
+    path: &Path,
+    patch: &UserSettingsPersist,
+) -> std::io::Result<()> {
+    let content = if path.is_file() {
+        std::fs::read_to_string(path)?
+    } else {
+        DEFAULT_CONFIG_TEMPLATE.to_string()
+    };
+    let mut doc: DocumentMut = content
+        .parse::<DocumentMut>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let folder = doc.entry("FolderView").or_insert(Item::Table(Table::new()));
+    let folder = folder.as_table_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "fileman: config key \"FolderView\" must be a table",
+        )
+    })?;
+    set_or_replace_value(folder, "ShowHidden", value(patch.show_hidden));
+
+    let behavior = doc.entry("Behavior").or_insert(Item::Table(Table::new()));
+    let behavior = behavior.as_table_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "fileman: config key \"Behavior\" must be a table",
+        )
+    })?;
+    set_or_replace_value(behavior, "ConfirmDelete", value(patch.confirm_delete));
+    set_or_replace_value(behavior, "ConfirmTrash", value(patch.confirm_trash));
+    set_or_replace_value(behavior, "UseTrash", value(patch.use_trash));
+
+    let system = doc.entry("System").or_insert(Item::Table(Table::new()));
+    let system = system.as_table_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "fileman: config key \"System\" must be a table",
+        )
+    })?;
+    set_or_replace_value(system, "Terminal", value(patch.terminal.as_str()));
+
+    let window = doc.entry("Window").or_insert(Item::Table(Table::new()));
+    let window = window.as_table_mut().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "fileman: config key \"Window\" must be a table",
+        )
+    })?;
+    set_or_replace_value(
+        window,
+        "RememberWindowSize",
+        value(patch.remember_window_size),
+    );
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     std::fs::write(path, doc.to_string())
 }
 
@@ -727,6 +810,53 @@ Mode = "list"
         assert_eq!(cfg.window.last_window_width, Some(640));
         assert_eq!(cfg.window.last_window_height, Some(480));
         assert_eq!(cfg.window.last_window_maximized, Some(false));
+    }
+
+    #[test]
+    fn persist_user_settings_updates_sections_and_preserves_other_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"# header
+[Window]
+RememberWindowSize = true
+WindowTitle = "KeepMe"
+
+[FolderView]
+ShowHidden = false
+Mode = "list"
+
+[Behavior]
+ConfirmDelete = true
+ConfirmTrash = true
+UseTrash = true
+
+[System]
+Terminal = ""
+
+[Desktop]
+"#,
+        )
+        .expect("write");
+        let patch = UserSettingsPersist {
+            show_hidden: true,
+            confirm_delete: false,
+            confirm_trash: false,
+            use_trash: false,
+            remember_window_size: false,
+            terminal: "alacritty".to_string(),
+        };
+        super::persist_user_settings(&path, &patch).expect("persist");
+        let raw = std::fs::read_to_string(&path).expect("read");
+        assert!(raw.contains("# header"));
+        assert!(raw.contains("WindowTitle = \"KeepMe\""));
+        assert!(raw.contains("[Desktop]"));
+        let cfg = parse_toml(&raw);
+        assert_eq!(cfg.folder_view.show_hidden, Some(true));
+        assert_eq!(cfg.behavior.confirm_delete, Some(false));
+        assert_eq!(cfg.system.terminal.as_deref(), Some("alacritty"));
+        assert_eq!(cfg.window.remember_window_size, Some(false));
     }
 
     static LOAD_OR_CREATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();

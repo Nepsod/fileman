@@ -76,7 +76,15 @@ impl Plugin for WindowGeometryPersistPlugin {
         info: &AppInfo,
         _event_loop: &ActiveEventLoop,
     ) {
-        if !self.persist_when_remember {
+        let remember = if let Some(ref path) = self.config_path {
+            FilemanConfig::load_from_path(path)
+                .window
+                .remember_window_size
+                .unwrap_or(true)
+        } else {
+            self.persist_when_remember
+        };
+        if !remember {
             return;
         }
         let Some(ref path) = self.config_path else {
