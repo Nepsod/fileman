@@ -1,7 +1,7 @@
 use nptk::core::app::info::AppInfo;
 use nptk::core::config::MayConfig;
 use nptk::core::plugin::{Plugin, PluginManager};
-use nptk::core::window::{ActiveEventLoop, Window};
+use nptk::core::app::loop_control::LoopControl;
 use nptk::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -56,9 +56,9 @@ impl FilemanApp {
     }
 }
 
-/// Saves `[Window]` size (and maximized flag) on shutdown when `RememberWindowSize` is true.
-/// Uses [nptk::core::plugin::Plugin::on_shutting_down] so native Wayland (no main winit window,
-/// `Update::EXIT` from the surface) is covered in addition to X11/winit close.
+/// Saves configured window size (and maximized flag from [MayConfig]) on shutdown when
+/// `RememberWindowSize` is true. Uses [nptk::core::plugin::Plugin::on_shutting_down] so Wayland
+/// exits (`Update::EXIT`) are covered as well as normal close.
 struct WindowGeometryPersistPlugin {
     config_path: Option<PathBuf>,
     persist_when_remember: bool,
@@ -72,9 +72,8 @@ impl Plugin for WindowGeometryPersistPlugin {
     fn on_shutting_down(
         &mut self,
         config: &mut MayConfig,
-        window: Option<&Arc<Window>>,
         info: &AppInfo,
-        _event_loop: &ActiveEventLoop,
+        _loop_ctl: &LoopControl,
     ) {
         let remember = if let Some(ref path) = self.config_path {
             FilemanConfig::load_from_path(path)
@@ -92,9 +91,7 @@ impl Plugin for WindowGeometryPersistPlugin {
         };
         let width = info.size.x.round() as i64;
         let height = info.size.y.round() as i64;
-        let maximized = window
-            .map(|w| w.is_maximized())
-            .unwrap_or(config.window.maximized);
+        let maximized = config.window.maximized;
         if let Err(e) = crate::config::persist_window_geometry(path, width, height, maximized) {
             log::warn!("fileman: could not persist window geometry: {}", e);
         }
