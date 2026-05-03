@@ -5,6 +5,7 @@ const ICON_SIZE_MIN: u32 = 16;
 const ICON_SIZE_MAX: u32 = 256;
 
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
 use nptk::core::config::{MayConfig, WindowConfig};
@@ -28,6 +29,10 @@ fn set_or_replace_value(table: &mut Table, key: &str, new_item: Item) {
     } else {
         table.insert(key, Item::Value(new_val));
     }
+}
+
+fn fileman_xdg() -> Option<BaseDirectories> {
+    BaseDirectories::with_prefix("fileman").ok()
 }
 
 /// Default shipped template written when `config.toml` does not exist yet.
@@ -171,10 +176,51 @@ impl Default for FilemanConfig {
     }
 }
 
+fn apply_window_title_from_section(section: &WindowSection, window: &mut WindowConfig) {
+    if let Some(ref title) = section.window_title {
+        if !title.is_empty() {
+            window.title = title.clone();
+        }
+    }
+}
+
+fn apply_window_size_from_section(section: &WindowSection, window: &mut WindowConfig) {
+    let remember = section.remember_window_size.unwrap_or(true);
+    if remember {
+        if let Some(width) = section.last_window_width {
+            if width > 0 {
+                window.size.x = width as f64;
+            }
+        }
+        if let Some(height) = section.last_window_height {
+            if height > 0 {
+                window.size.y = height as f64;
+            }
+        }
+    } else {
+        if let Some(fw) = section.fixed_width {
+            if fw > 0 {
+                window.size.x = fw as f64;
+            }
+        }
+        if let Some(fh) = section.fixed_height {
+            if fh > 0 {
+                window.size.y = fh as f64;
+            }
+        }
+    }
+}
+
+fn apply_window_maximized_from_section(section: &WindowSection, window: &mut WindowConfig) {
+    if let Some(max) = section.last_window_maximized {
+        window.maximized = max;
+    }
+}
+
 impl FilemanConfig {
     /// Ensures `~/.config/fileman` exists, writes default `config.toml` if missing, then loads.
     pub fn load_or_create() -> Self {
-        let Ok(xdg) = BaseDirectories::with_prefix("fileman") else {
+        let Some(xdg) = fileman_xdg() else {
             log::warn!("fileman: XDG base directories unavailable, using default config");
             return Self::default();
         };
@@ -202,7 +248,7 @@ impl FilemanConfig {
 
     /// Load without creating files (e.g. tests). Uses `find_config_file` or `get_config_home()/config.toml`.
     pub fn load() -> Self {
-        let Ok(xdg) = BaseDirectories::with_prefix("fileman") else {
+        let Some(xdg) = fileman_xdg() else {
             log::warn!("fileman: XDG base directories unavailable, using default config");
             return Self::default();
         };
@@ -245,40 +291,9 @@ impl FilemanConfig {
     }
 
     pub fn apply_to_window(&self, window: &mut WindowConfig) {
-        if let Some(ref title) = self.window.window_title {
-            if !title.is_empty() {
-                window.title = title.clone();
-            }
-        }
-
-        let remember = self.window.remember_window_size.unwrap_or(true);
-        if remember {
-            if let Some(width) = self.window.last_window_width {
-                if width > 0 {
-                    window.size.x = width as f64;
-                }
-            }
-            if let Some(height) = self.window.last_window_height {
-                if height > 0 {
-                    window.size.y = height as f64;
-                }
-            }
-        } else {
-            if let Some(fw) = self.window.fixed_width {
-                if fw > 0 {
-                    window.size.x = fw as f64;
-                }
-            }
-            if let Some(fh) = self.window.fixed_height {
-                if fh > 0 {
-                    window.size.y = fh as f64;
-                }
-            }
-        }
-
-        if let Some(max) = self.window.last_window_maximized {
-            window.maximized = max;
-        }
+        apply_window_title_from_section(&self.window, window);
+        apply_window_size_from_section(&self.window, window);
+        apply_window_maximized_from_section(&self.window, window);
     }
 
     pub fn sidebar_width(&self) -> f64 {
@@ -397,9 +412,28 @@ impl FilemanConfig {
 
     /// XDG path to `config.toml` (`…/fileman/config.toml`), if base directories resolve.
     pub fn config_file_path() -> Option<PathBuf> {
-        let xdg = BaseDirectories::with_prefix("fileman").ok()?;
+        let xdg = fileman_xdg()?;
         Some(xdg.get_config_home().join("config.toml"))
     }
+}
+
+fn toml_parse_io_error(err: impl Display) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string())
+}
+
+fn ensure_doc_table<'a>(
+    doc: &'a mut DocumentMut,
+    key: &'static str,
+) -> std::io::Result<&'a mut Table> {
+    doc.entry(key)
+        .or_insert(Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("fileman: config key \"{key}\" must be a table"),
+            )
+        })
 }
 
 /// Writes `[Window].LastWindowWidth`, `LastWindowHeight`, and `LastWindowMaximized` using a TOML AST
@@ -417,15 +451,9 @@ pub(crate) fn persist_window_geometry(
     let content = std::fs::read_to_string(path)?;
     let mut doc: DocumentMut = content
         .parse::<DocumentMut>()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        .map_err(toml_parse_io_error)?;
 
-    let window_item = doc.entry("Window").or_insert(Item::Table(Table::new()));
-    let window = window_item.as_table_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "fileman: config key \"Window\" must be a table",
-        )
-    })?;
+    let window = ensure_doc_table(&mut doc, "Window")?;
 
     set_or_replace_value(window, "LastWindowMaximized", value(maximized));
     if !maximized {
@@ -459,44 +487,20 @@ pub(crate) fn persist_user_settings(
     };
     let mut doc: DocumentMut = content
         .parse::<DocumentMut>()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        .map_err(toml_parse_io_error)?;
 
-    let folder = doc.entry("FolderView").or_insert(Item::Table(Table::new()));
-    let folder = folder.as_table_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "fileman: config key \"FolderView\" must be a table",
-        )
-    })?;
+    let folder = ensure_doc_table(&mut doc, "FolderView")?;
     set_or_replace_value(folder, "ShowHidden", value(patch.show_hidden));
 
-    let behavior = doc.entry("Behavior").or_insert(Item::Table(Table::new()));
-    let behavior = behavior.as_table_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "fileman: config key \"Behavior\" must be a table",
-        )
-    })?;
+    let behavior = ensure_doc_table(&mut doc, "Behavior")?;
     set_or_replace_value(behavior, "ConfirmDelete", value(patch.confirm_delete));
     set_or_replace_value(behavior, "ConfirmTrash", value(patch.confirm_trash));
     set_or_replace_value(behavior, "UseTrash", value(patch.use_trash));
 
-    let system = doc.entry("System").or_insert(Item::Table(Table::new()));
-    let system = system.as_table_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "fileman: config key \"System\" must be a table",
-        )
-    })?;
+    let system = ensure_doc_table(&mut doc, "System")?;
     set_or_replace_value(system, "Terminal", value(patch.terminal.as_str()));
 
-    let window = doc.entry("Window").or_insert(Item::Table(Table::new()));
-    let window = window.as_table_mut().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "fileman: config key \"Window\" must be a table",
-        )
-    })?;
+    let window = ensure_doc_table(&mut doc, "Window")?;
     set_or_replace_value(
         window,
         "RememberWindowSize",

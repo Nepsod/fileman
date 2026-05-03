@@ -24,6 +24,7 @@ use nptk::services::thumbnail::npio_adapter::{uri_to_path, thumbnail_size_to_u32
 use nptk::core::theme::ColorRole;
 use std::collections::HashSet;
 use tokio::{sync::broadcast, time::{Duration, Instant}};
+use std::time::Duration as StdDuration;
 
 mod actions;
 use actions::launch_default_app;
@@ -97,6 +98,17 @@ use std::fs;
 
 use crate::file_list::model_adapter::FileSystemItemModel;
 use nptk::core::model::SortOrder;
+
+#[derive(Default)]
+struct FileListPerfStats {
+    frames: u64,
+    update_total: StdDuration,
+    render_total: StdDuration,
+    entries_processed: u64,
+    visible_rows_rendered: u64,
+    refresh_triggers: u64,
+    search_rebuild_triggers: u64,
+}
 
 /// A widget that displays a list of files.
 pub struct FileList {
@@ -175,6 +187,7 @@ pub struct FileList {
 
     // Pending search query from location bar (avoids setting signal from inside TextInput update)
     search_pending_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    perf: FileListPerfStats,
 }
 
 impl FileList {
@@ -344,7 +357,24 @@ impl FileList {
             last_current_folder_search: None,
             current_folder_result_rx: None,
             search_pending_rx,
+            perf: FileListPerfStats::default(),
         }
+    }
+
+    fn estimate_visible_rows(&self, layout: &LayoutNode) -> usize {
+        let total_entries = self.entries.get().len();
+        if total_entries == 0 {
+            return 0;
+        }
+        let mode = *self.view_mode.get();
+        let row_height = match mode {
+            FileListViewMode::List | FileListViewMode::Table => 24.0,
+            FileListViewMode::Compact => 24.0,
+            FileListViewMode::Icon => (*self.icon_size.get() as f32 + 20.0).max(24.0),
+        };
+        let viewport_h = layout.layout.size.height.max(1.0);
+        let visible = ((viewport_h / row_height).ceil() as usize).saturating_add(2);
+        visible.min(total_entries)
     }
 
     pub fn show_properties_popup(&self, paths: &[PathBuf], context: AppContext) {
@@ -820,6 +850,7 @@ impl Widget for FileList {
     }
 
     async fn update(&mut self, layout: &LayoutNode, context: AppContext, info: &mut AppInfo) -> Update {
+        let update_start = Instant::now();
         let _mode = *self.view_mode.get();
         
         // Ensure ItemView is initialized for all view modes
@@ -1040,6 +1071,7 @@ impl Widget for FileList {
         if self.last_path.as_ref() != Some(&current_path_value) {
             self.last_path = Some(current_path_value.clone());
             let _ = self.fs_model.refresh(&current_path_value);
+            self.perf.refresh_triggers += 1;
             update.insert(Update::LAYOUT | Update::DRAW);
         }
         
@@ -1083,6 +1115,7 @@ impl Widget for FileList {
                 .as_ref()
                 != Some(&(path.clone(), query.clone(), show_hid));
             if need_search {
+                self.perf.search_rebuild_triggers += 1;
                 self.last_recursive_search = Some((path.clone(), query.clone(), show_hid));
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 self.recursive_result_rx = Some(rx);
@@ -1128,6 +1161,7 @@ impl Widget for FileList {
                 .as_ref()
                 != Some(&filter_key);
             if need_filter {
+                self.perf.search_rebuild_triggers += 1;
                 self.last_current_folder_search = Some(filter_key);
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 self.current_folder_result_rx = Some(rx);
@@ -1196,6 +1230,9 @@ impl Widget for FileList {
                  update |= self.scroll_container.update(&layout.children[0], context.clone(), info).await;
             }
         }
+        self.perf.update_total += update_start.elapsed();
+        self.perf.frames += 1;
+        self.perf.entries_processed += self.entries.get().len() as u64;
 
         update
     }
@@ -1207,6 +1244,7 @@ impl Widget for FileList {
         info: &mut AppInfo,
         context: AppContext,
     ) {
+        let render_start = Instant::now();
         // Draw background for the file list
         let rect = Rect::new(
             layout.layout.location.x as f64,
@@ -1241,6 +1279,20 @@ impl Widget for FileList {
         if !layout.children.is_empty() {
             self.scroll_container
                 .render(graphics, &layout.children[0], info, context);
+        }
+        self.perf.render_total += render_start.elapsed();
+        self.perf.visible_rows_rendered += self.estimate_visible_rows(layout) as u64;
+        if self.perf.frames % 240 == 0 && self.perf.frames > 0 {
+            let frames = self.perf.frames as u128;
+            log::info!(
+                "FileList perf: avg_update={}us avg_render={}us avg_entries={} avg_visible_rows={} refresh={} search_rebuilds={}",
+                self.perf.update_total.as_micros() / frames,
+                self.perf.render_total.as_micros() / frames,
+                self.perf.entries_processed as u128 / frames,
+                self.perf.visible_rows_rendered as u128 / frames,
+                self.perf.refresh_triggers,
+                self.perf.search_rebuild_triggers
+            );
         }
     }
 }

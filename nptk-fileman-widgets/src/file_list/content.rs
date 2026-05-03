@@ -425,8 +425,13 @@ impl FileListContent {
         if view_mode == FileListViewMode::Icon {
             let (columns, cell_width, cell_height) =
                 self.calculate_icon_view_layout(layout_width, icon_size);
+            let start_row = (selection_rect.y0.max(0.0) as f32 / cell_height).floor().max(0.0) as usize;
+            let end_row = (selection_rect.y1.max(0.0) as f32 / cell_height).ceil() as usize + 1;
+            let start_index = (start_row * columns).min(entries.len());
+            let end_index = (end_row * columns).min(entries.len());
 
-            for (i, entry) in entries.iter().enumerate() {
+            for i in start_index..end_index {
+                let entry = &entries[i];
                 let (x, y) = self.get_icon_position(i, columns, cell_width, cell_height);
                 // We use the full cell rect for intersection to make it easier to select
                 let cell_rect = Rect::new(
@@ -448,8 +453,17 @@ impl FileListContent {
         } else if view_mode == FileListViewMode::Compact {
             let (columns, cell_width, cell_height, spacing) =
                 self.calculate_compact_view_layout(layout_width);
+            let row_height = cell_height + spacing;
+            let start_row = ((selection_rect.y0 as f32 - self.icon_view_padding).max(0.0) / row_height)
+                .floor()
+                .max(0.0) as usize;
+            let end_row = ((selection_rect.y1 as f32 - self.icon_view_padding).max(0.0) / row_height)
+                .ceil() as usize + 1;
+            let start_index = (start_row * columns).min(entries.len());
+            let end_index = (end_row * columns).min(entries.len());
 
-            for (i, entry) in entries.iter().enumerate() {
+            for i in start_index..end_index {
+                let entry = &entries[i];
                 let col = i % columns;
                 let row = i / columns;
                 let x = self.icon_view_padding + col as f32 * (cell_width + spacing);
@@ -470,7 +484,12 @@ impl FileListContent {
             }
         } else {
             // List view
-            for (i, entry) in entries.iter().enumerate() {
+            let start_index = (selection_rect.y0.max(0.0) as f32 / self.item_height).floor().max(0.0) as usize;
+            let end_index = (selection_rect.y1.max(0.0) as f32 / self.item_height).ceil() as usize + 1;
+            let start_index = start_index.min(entries.len());
+            let end_index = end_index.min(entries.len());
+            for i in start_index..end_index {
+                let entry = &entries[i];
                 let y = i as f32 * self.item_height;
                 let row_rect = Rect::new(
                     0.0,

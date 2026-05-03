@@ -1,66 +1,23 @@
-use nptk::prelude::*;
+use super::file_operation::FileOperationRequest;
 use async_trait::async_trait;
-use nptk::core::signal::eval::EvalSignal;
-use nptk::core::shortcut::Shortcut;
-use nptk::core::window::KeyCode;
-use nptk_fileman_widgets::file_list::{FileList, FileListOperation, SearchScope};
-use nptk_fileman_widgets::file_list::FileListViewMode;
-use nptk::services::filesystem::entry::FileEntry;
-use nptk_fileman_widgets::FilemanSidebar;
-// use nptk::widgets::breadcrumbs::{Breadcrumbs, BreadcrumbItem}; // Unused
-use crate::app::AppState;
-use crate::config::{DeletePolicy, FilemanConfig};
+use crate::config::DeletePolicy;
 use crate::operations;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex;
-use tokio::sync::mpsc;
 use nalgebra::Vector2;
-use nptk::core::menu::unified::{MenuTemplate, MenuItem};
+use nptk::core::menu::unified::{MenuItem, MenuTemplate};
 use nptk::core::menu::MenuCommand;
-use nptk::core::vg::kurbo::Point;
-use nptk::services::clipboard::ClipboardService;
 use nptk::core::model::SortOrder;
-
-/// File operation requests that can be sent from UI to be processed
-#[derive(Debug, Clone)]
-pub enum FileOperationRequest {
-    /// Move selected paths to trash after confirmation.
-    Delete(Vec<PathBuf>),
-    /// Permanently delete after confirmation (e.g. Shift+Delete from list).
-    DeletePermanent(Vec<PathBuf>),
-    // CreateDirectory { parent: PathBuf, name: String }, // Unused
-    // Rename { from: PathBuf, to: PathBuf }, // Unused
-    PromptRename(PathBuf), // Prompt for new name for single file
-    PromptCreateDirectory(PathBuf), // Prompt for new directory name in parent
-    PromptCreateFile(PathBuf),      // Prompt for new empty file name in parent
-    Properties(Vec<PathBuf>),
-    Copy(Vec<PathBuf>),
-    Cut(Vec<PathBuf>),
-    Paste,
-    /// Reload entries for the current path (same as list context "refresh" behavior).
-    Refresh,
-    /// Sort file list by column index and order (same as list context menu).
-    Sort(usize, SortOrder),
-    /// Select all listed entries (same as Ctrl+A in the file list).
-    SelectAll,
-    /// Clear file list selection.
-    DeselectAll,
-    /// Invert file list selection.
-    InvertSelection,
-    /// Open selected paths (folders navigate, files launch default app).
-    OpenSelection,
-    Duplicate(Vec<PathBuf>),
-    /// Spawn terminal with cwd = current folder.
-    OpenTerminalHere,
-    /// Show Help → About popup.
-    ShowAbout,
-    /// Open Settings → Configure Fileman.
-    ShowSettings,
-}
+use nptk::core::signal::eval::EvalSignal;
+use nptk::core::vg::kurbo::Point;
+use nptk::prelude::*;
+use nptk::services::clipboard::ClipboardService;
+use nptk::services::filesystem::entry::FileEntry;
+use nptk_fileman_widgets::file_list::{FileList, FileListOperation, SearchScope};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 
 /// Wrapper widget that manages FileList and connects it to navigation state
-struct FileListWrapper {
+pub(crate) struct FileListWrapper {
     file_list: FileList,
     navigation: Arc<Mutex<crate::navigation::NavigationState>>,
     navigation_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
@@ -95,7 +52,7 @@ struct FileListWrapper {
 }
 
 impl FileListWrapper {
-    fn new(
+    pub(crate) fn new(
         initial_path: PathBuf,
         navigation: Arc<Mutex<crate::navigation::NavigationState>>,
         navigation_rx: mpsc::UnboundedReceiver<PathBuf>,
@@ -343,7 +300,7 @@ impl FileListWrapper {
         }
     }
 
-    fn apply_startup_folder_view(&mut self, fileman: &crate::config::FilemanConfig) {
+    pub(crate) fn apply_startup_folder_view(&mut self, fileman: &crate::config::FilemanConfig) {
         if let Some((col, order)) = fileman.initial_sort() {
             self.file_list.sort(col, order);
         }
@@ -818,31 +775,23 @@ impl FileListWrapper {
 
         open_popup_at(&context, "New File", (400, 200), (300, 250), Box::new(dialog_content));
     }
-}
 
-#[async_trait(?Send)]
-impl Widget for FileListWrapper {
-
-    fn layout_style(&self, _context: &nptk::core::layout::LayoutContext) -> nptk::core::layout::StyleNode {
-        self.file_list.layout_style(_context)
+    fn refresh_file_list_at_current_path(&mut self) -> Update {
+        let current_path = self.file_list.get_current_path();
+        self.file_list.set_path(current_path.clone());
+        Update::LAYOUT | Update::DRAW
     }
 
-    async fn update(
-        &mut self,
-        layout: &nptk::core::layout::LayoutNode,
-        context: nptk::core::app::context::AppContext,
-        info: &mut nptk::core::app::info::AppInfo,
-    ) -> nptk::core::app::update::Update {
-        let mut update = Update::empty();
-
-        // Hook signals on first update for reactive subscription
+    fn ensure_signals_hooked(&mut self, context: &AppContext) {
         if !self.signals_hooked {
             context.hook_signal(&mut self.navigation_path_signal);
             context.hook_signal(&mut self.file_list_path_signal);
             self.signals_hooked = true;
         }
+    }
 
-        // Handle sidebar navigation events (sync to NavigationState, which will reactively update FileList)
+    fn drain_sidebar_navigation_rx(&mut self) -> Update {
+        let mut update = Update::empty();
         if let Some(ref mut rx) = self.navigation_rx {
             while let Ok(path) = rx.try_recv() {
                 if let Ok(mut nav) = self.navigation.lock() {
@@ -851,24 +800,24 @@ impl Widget for FileListWrapper {
                 }
             }
         }
+        update
+    }
 
-        // Reactively sync NavigationState path changes to FileList
+    fn sync_navigation_path_into_file_list_if_differ(&mut self) -> Update {
+        let mut update = Update::empty();
         let nav_path = (*self.navigation_path_signal.get()).clone();
         let file_list_path = (*self.file_list_path_signal.get()).clone();
         if nav_path != file_list_path {
             self.file_list.set_path(nav_path.clone());
             update.insert(Update::LAYOUT | Update::DRAW);
         }
+        update
+    }
 
-        // Update the wrapped FileList to let it handle internal updates
-        let file_list_update = self.file_list.update(layout, context.clone(), info).await;
-        update |= file_list_update;
-
-        // Path refresh/recovery logic: If current directory no longer exists, navigate to parent
-        // This handles the case where a directory is deleted externally
+    fn recover_file_list_path_if_missing(&mut self) -> Update {
+        let mut update = Update::empty();
         let current_path = (*self.file_list_path_signal.get()).clone();
         if !current_path.exists() {
-            // Navigate to parent directory, continuing up until we find a valid directory
             let mut recovery_path = current_path.clone();
             while !recovery_path.exists() && recovery_path != PathBuf::from("/") {
                 if let Some(parent) = recovery_path.parent() {
@@ -877,7 +826,6 @@ impl Widget for FileListWrapper {
                     break;
                 }
             }
-            // If we found a valid parent, navigate there
             if recovery_path.exists() && recovery_path != current_path {
                 if let Ok(mut nav) = self.navigation.lock() {
                     nav.navigate_to(recovery_path.clone());
@@ -886,7 +834,11 @@ impl Widget for FileListWrapper {
                 }
             }
         }
+        update
+    }
 
+    fn poll_folder_duplicate_done_channel(&mut self) -> Update {
+        let mut update = Update::empty();
         if let Some(ref mut rx) = self.folder_duplicate_done_rx {
             let mut need_refresh = false;
             while rx.try_recv().is_ok() {
@@ -898,8 +850,11 @@ impl Widget for FileListWrapper {
                 update.insert(Update::LAYOUT | Update::DRAW);
             }
         }
+        update
+    }
 
-        // Reactively sync FileList path changes to NavigationState (e.g., from double-click navigation)
+    fn sync_file_list_path_into_navigation_if_differ(&mut self, nav_path: PathBuf) -> Update {
+        let mut update = Update::empty();
         let file_list_path_after = (*self.file_list_path_signal.get()).clone();
         if file_list_path_after != nav_path {
             if let Ok(mut nav) = self.navigation.lock() {
@@ -907,56 +862,55 @@ impl Widget for FileListWrapper {
                 update.insert(Update::LAYOUT | Update::DRAW);
             }
         }
+        update
+    }
 
-        // Process file operations from FileList widget (context menu, etc.)
-        // Collect operations to avoid borrow conflicts
+    fn handle_drained_file_list_operations(
+        &mut self,
+        context: AppContext,
+        update: &mut Update,
+    ) {
         let mut operations = Vec::new();
-        
         if let Some(ref mut rx) = self.file_list_operation_rx {
             while let Ok(op) = rx.try_recv() {
                 operations.push(op);
             }
         }
-        
         for op in operations {
             match op {
                 FileListOperation::Properties(paths) => {
-                     self.show_properties_for_paths(&paths, context.clone());
+                    self.show_properties_for_paths(&paths, context.clone());
                 }
                 FileListOperation::PromptRename(path) => {
                     self.show_rename_dialog(path, context.clone());
-                },
+                }
                 FileListOperation::Copy(paths) => {
-                     if let Ok(mut clipboard) = self.clipboard.lock() {
+                    if let Ok(mut clipboard) = self.clipboard.lock() {
                         if let Err(e) = clipboard.set_files(&paths, false) {
                             log::error!("Failed to copy files: {}", e);
                             if let Some(tx) = &self.status_tx {
                                 let _ = tx.send(format!("Failed to copy: {}", e));
                             }
-                        } else {
-                            if let Some(tx) = &self.status_tx {
-                                let _ = tx.send(format!("Copied {} files", paths.len()));
-                            }
+                        } else if let Some(tx) = &self.status_tx {
+                            let _ = tx.send(format!("Copied {} files", paths.len()));
                         }
                     }
-                },
+                }
                 FileListOperation::Cut(paths) => {
-                     if let Ok(mut clipboard) = self.clipboard.lock() {
+                    if let Ok(mut clipboard) = self.clipboard.lock() {
                         if let Err(e) = clipboard.set_files(&paths, true) {
                             log::error!("Failed to cut files: {}", e);
-                             if let Some(tx) = &self.status_tx {
+                            if let Some(tx) = &self.status_tx {
                                 let _ = tx.send(format!("Failed to cut: {}", e));
                             }
-                        } else {
-                            if let Some(tx) = &self.status_tx {
-                                let _ = tx.send(format!("Cut {} files", paths.len()));
-                            }
+                        } else if let Some(tx) = &self.status_tx {
+                            let _ = tx.send(format!("Cut {} files", paths.len()));
                         }
                     }
-                },
+                }
                 FileListOperation::Paste => {
                     update.insert(self.paste_files());
-                },
+                }
                 FileListOperation::DeleteToTrash(paths) => {
                     let use_trash = self
                         .delete_policy
@@ -970,12 +924,12 @@ impl Widget for FileListWrapper {
                             .operation_tx
                             .send(FileOperationRequest::DeletePermanent(paths));
                     }
-                },
+                }
                 FileListOperation::DeletePermanent(paths) => {
                     let _ = self
                         .operation_tx
                         .send(FileOperationRequest::DeletePermanent(paths));
-                },
+                }
                 FileListOperation::DeselectAll => {
                     self.file_list.clear_selection();
                     update.insert(Update::DRAW);
@@ -987,10 +941,10 @@ impl Widget for FileListWrapper {
                 FileListOperation::Sort(col, order) => {
                     self.file_list.sort(col, order);
                     update.insert(Update::DRAW);
-                },
+                }
                 FileListOperation::Refresh => {
                     let path = self.file_list.get_current_path();
-                    self.file_list.set_path(path); // Re-setting path triggers refresh
+                    self.file_list.set_path(path);
                     update.insert(Update::DRAW);
                 }
                 FileListOperation::Open => {
@@ -1036,10 +990,13 @@ impl Widget for FileListWrapper {
                 }
             }
         }
+    }
 
-        // Process file operations from toolbar/other UI
-        // Note: Delete operations need confirm, Properties need dialog
-        // Collect operations first to avoid borrow conflicts
+    fn process_operation_request_channel_and_followups(
+        &mut self,
+        context: AppContext,
+        update: &mut Update,
+    ) {
         let mut pending_deletes: Vec<(Vec<PathBuf>, bool)> = Vec::new();
         let mut pending_properties = Vec::new();
         let mut pending_renames = Vec::new();
@@ -1049,9 +1006,14 @@ impl Widget for FileListWrapper {
         let mut pending_show_about = false;
         let mut pending_show_settings = false;
 
+        let mut drained_requests = Vec::new();
         if let Some(ref mut rx) = self.operation_rx {
             while let Ok(op) = rx.try_recv() {
-                match op {
+                drained_requests.push(op);
+            }
+        }
+        for op in drained_requests {
+            match op {
                     FileOperationRequest::Delete(paths) => {
                         log::warn!("RECEIVED DELETE REQUEST for {} path(s)", paths.len());
                         let use_trash = self
@@ -1109,7 +1071,6 @@ impl Widget for FileListWrapper {
                     }
                     */
                     FileOperationRequest::Properties(paths) => {
-                        // Collect properties requests
                         pending_properties.push(paths);
                     }
                     FileOperationRequest::PromptRename(path) => {
@@ -1253,13 +1214,10 @@ impl Widget for FileListWrapper {
                             }
                         }
                         if need_sync_refresh {
-                            let current_path = self.file_list.get_current_path();
-                            self.file_list.set_path(current_path.clone());
-                            update.insert(Update::LAYOUT | Update::DRAW);
+                            update.insert(self.refresh_file_list_at_current_path());
                         }
                     }
                 }
-            }
         }
 
         for op in deferred_operation_channel_ops {
@@ -1305,23 +1263,20 @@ impl Widget for FileListWrapper {
                 _ => {}
             }
         }
-        
-        // Process pending properties requests (after releasing borrow)
+
         for paths in pending_properties {
-             self.show_properties_for_paths(&paths, context.clone());
-             update.insert(Update::DRAW);
+            self.show_properties_for_paths(&paths, context.clone());
+            update.insert(Update::DRAW);
         }
 
-        // Process pending renames
         for path in pending_renames {
-             self.show_rename_dialog(path, context.clone());
-             update.insert(Update::DRAW);
+            self.show_rename_dialog(path, context.clone());
+            update.insert(Update::DRAW);
         }
 
-        // Process pending creates
         for parent in pending_creates {
-             self.show_new_folder_dialog(parent, context.clone());
-             update.insert(Update::DRAW);
+            self.show_new_folder_dialog(parent, context.clone());
+            update.insert(Update::DRAW);
         }
 
         for parent in pending_create_files {
@@ -1339,105 +1294,78 @@ impl Widget for FileListWrapper {
             update.insert(Update::DRAW);
         }
 
-        // Show confirmation dialogs for pending delete operations (after releasing borrow)
         if !pending_deletes.is_empty() {
-            log::warn!("SHOWING {} DELETE CONFIRMATION DIALOG(S)", pending_deletes.len());
+            log::warn!(
+                "SHOWING {} DELETE CONFIRMATION DIALOG(S)",
+                pending_deletes.len()
+            );
         }
         for (paths, permanent) in pending_deletes {
             self.show_delete_confirmation_dialog(&paths, permanent, context.clone());
             update.insert(Update::DRAW);
         }
-        
-        // Process confirmed delete operations from toolbar (user clicked confirm in dialog)
-        if let Ok(mut pending_delete) = self.pending_delete_confirmation.lock() {
-            if let Some((paths, permanent)) = pending_delete.take() {
-                let paths_clone = paths.clone();
-                let mut all_success = true;
-                let mut error_msg = String::new();
 
-                for path in &paths {
-                    let result = if permanent {
-                        operations::delete_path(path.clone())
+        let delete_confirm_job = match self.pending_delete_confirmation.lock() {
+            Ok(mut pending_delete) => pending_delete.take(),
+            Err(_) => None,
+        };
+        if let Some((paths, permanent)) = delete_confirm_job {
+            let paths_clone = paths.clone();
+            let mut all_success = true;
+            let mut error_msg = String::new();
+
+            for path in &paths {
+                let result = if permanent {
+                    operations::delete_path(path.clone())
+                } else {
+                    operations::move_to_trash(path.clone())
+                };
+                match result {
+                    Ok(()) => {
+                        log::info!("Removed: {:?} (permanent={})", path, permanent);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to remove {:?}: {}", path, e);
+                        all_success = false;
+                        error_msg = e;
+                        break;
+                    }
+                }
+            }
+
+            if let Some(ref tx) = self.status_tx {
+                if all_success {
+                    let msg = if permanent {
+                        format!("Permanently deleted {} item(s)", paths_clone.len())
                     } else {
-                        operations::move_to_trash(path.clone())
+                        format!("Moved {} item(s) to trash", paths_clone.len())
                     };
-                    match result {
-                        Ok(()) => {
-                            log::info!("Removed: {:?} (permanent={})", path, permanent);
-                        }
-                        Err(e) => {
-                            log::error!("Failed to remove {:?}: {}", path, e);
-                            all_success = false;
-                            error_msg = e;
-                            break;
-                        }
-                    }
-                }
-
-                if let Some(ref tx) = self.status_tx {
-                    if all_success {
-                        let msg = if permanent {
-                            format!("Permanently deleted {} item(s)", paths_clone.len())
-                        } else {
-                            format!("Moved {} item(s) to trash", paths_clone.len())
-                        };
-                        let _ = tx.send(msg);
-                    } else {
-                        let _ = tx.send(format!("Error: {}", error_msg));
-                    }
-                }
-
-                let current_path = self.file_list.get_current_path();
-                self.file_list.set_path(current_path.clone());
-                update.insert(Update::LAYOUT | Update::DRAW);
-            }
-        }
-
-        // Process confirmed rename operations (from dialog)
-        if let Ok(mut pending) = self.pending_rename.lock() {
-            if let Some((path, new_name)) = pending.take() {
-                // Construct new path
-                if let Some(parent) = path.parent() {
-                    let new_path = parent.join(new_name);
-                    match operations::rename_path(path.clone(), new_path.clone()) {
-                        Ok(_) => {
-                            log::info!("Renamed: {:?} -> {:?}", path, new_path);
-                            if let Some(ref tx) = self.status_tx {
-                                let _ = tx.send("Renamed successfully".to_string());
-                            }
-                            // Refresh file list
-                            let current_path = self.file_list.get_current_path();
-                            self.file_list.set_path(current_path.clone());
-                            update.insert(Update::LAYOUT | Update::DRAW);
-                        }
-                        Err(e) => {
-                            log::error!("Failed to rename {:?} to {:?}: {}", path, new_path, e);
-                            if let Some(ref tx) = self.status_tx {
-                                let _ = tx.send(format!("Error: {}", e));
-                            }
-                        }
-                    }
+                    let _ = tx.send(msg);
+                } else {
+                    let _ = tx.send(format!("Error: {}", error_msg));
                 }
             }
+
+            update.insert(self.refresh_file_list_at_current_path());
         }
 
-        // Process confirmed create directory operations (from dialog)
-        if let Ok(mut pending) = self.pending_create_dir.lock() {
-            if let Some((parent, name)) = pending.take() {
-                let new_dir = parent.join(name);
-                match operations::create_directory(new_dir.clone()) {
+        let rename_job = match self.pending_rename.lock() {
+            Ok(mut pending) => pending.take(),
+            Err(_) => None,
+        };
+        if let Some((path, new_name)) = rename_job {
+            if let Some(parent) = path.parent() {
+                let new_path = parent.join(new_name);
+                match operations::rename_path(path.clone(), new_path.clone()) {
                     Ok(_) => {
-                        log::info!("Created directory: {:?}", new_dir);
+                        log::info!("Renamed: {:?} -> {:?}", path, new_path);
                         if let Some(ref tx) = self.status_tx {
-                            let _ = tx.send("Directory created".to_string());
+                            let _ = tx.send("Renamed successfully".to_string());
                         }
-                        // Refresh file list
-                        let current_path = self.file_list.get_current_path();
-                        self.file_list.set_path(current_path.clone());
-                        update.insert(Update::LAYOUT | Update::DRAW);
+                        update.insert(self.refresh_file_list_at_current_path());
                     }
                     Err(e) => {
-                        log::error!("Failed to create directory {:?}: {}", new_dir, e);
+                        log::error!("Failed to rename {:?} to {:?}: {}", path, new_path, e);
                         if let Some(ref tx) = self.status_tx {
                             let _ = tx.send(format!("Error: {}", e));
                         }
@@ -1446,30 +1374,87 @@ impl Widget for FileListWrapper {
             }
         }
 
-        if let Ok(mut pending) = self.pending_create_file.lock() {
-            if let Some((parent, name)) = pending.take() {
-                let new_file = parent.join(name);
-                match operations::create_file(new_file.clone()) {
-                    Ok(_) => {
-                        log::info!("Created file: {:?}", new_file);
-                        if let Some(ref tx) = self.status_tx {
-                            let _ = tx.send("File created".to_string());
-                        }
-                        let current_path = self.file_list.get_current_path();
-                        self.file_list.set_path(current_path.clone());
-                        update.insert(Update::LAYOUT | Update::DRAW);
+        let create_dir_job = match self.pending_create_dir.lock() {
+            Ok(mut pending) => pending.take(),
+            Err(_) => None,
+        };
+        if let Some((parent, name)) = create_dir_job {
+            let new_dir = parent.join(name);
+            match operations::create_directory(new_dir.clone()) {
+                Ok(_) => {
+                    log::info!("Created directory: {:?}", new_dir);
+                    if let Some(ref tx) = self.status_tx {
+                        let _ = tx.send("Directory created".to_string());
                     }
-                    Err(e) => {
-                        log::error!("Failed to create file {:?}: {}", new_file, e);
-                        if let Some(ref tx) = self.status_tx {
-                            let _ = tx.send(format!("Error: {}", e));
-                        }
+                    update.insert(self.refresh_file_list_at_current_path());
+                }
+                Err(e) => {
+                    log::error!("Failed to create directory {:?}: {}", new_dir, e);
+                    if let Some(ref tx) = self.status_tx {
+                        let _ = tx.send(format!("Error: {}", e));
                     }
                 }
             }
         }
-        
+
+        let create_file_job = match self.pending_create_file.lock() {
+            Ok(mut pending) => pending.take(),
+            Err(_) => None,
+        };
+        if let Some((parent, name)) = create_file_job {
+            let new_file = parent.join(name);
+            match operations::create_file(new_file.clone()) {
+                Ok(_) => {
+                    log::info!("Created file: {:?}", new_file);
+                    if let Some(ref tx) = self.status_tx {
+                        let _ = tx.send("File created".to_string());
+                    }
+                    update.insert(self.refresh_file_list_at_current_path());
+                }
+                Err(e) => {
+                    log::error!("Failed to create file {:?}: {}", new_file, e);
+                    if let Some(ref tx) = self.status_tx {
+                        let _ = tx.send(format!("Error: {}", e));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl Widget for FileListWrapper {
+
+    fn layout_style(&self, _context: &nptk::core::layout::LayoutContext) -> nptk::core::layout::StyleNode {
+        self.file_list.layout_style(_context)
+    }
+
+    async fn update(
+        &mut self,
+        layout: &nptk::core::layout::LayoutNode,
+        context: nptk::core::app::context::AppContext,
+        info: &mut nptk::core::app::info::AppInfo,
+    ) -> nptk::core::app::update::Update {
+        let mut update = Update::empty();
+
+        self.ensure_signals_hooked(&context);
+        update |= self.drain_sidebar_navigation_rx();
+
+        let nav_path = (*self.navigation_path_signal.get()).clone();
+        update |= self.sync_navigation_path_into_file_list_if_differ();
+
+        let file_list_update = self.file_list.update(layout, context.clone(), info).await;
+        update |= file_list_update;
+
+        update |= self.recover_file_list_path_if_missing();
+        update |= self.poll_folder_duplicate_done_channel();
+        update |= self.sync_file_list_path_into_navigation_if_differ(nav_path);
+
+        self.handle_drained_file_list_operations(context.clone(), &mut update);
+        self.process_operation_request_channel_and_followups(context, &mut update);
+
         update
+
     }
 
     fn render(
@@ -1507,528 +1492,4 @@ impl FileListWrapper {
     pub fn entries_signal(&self) -> StateSignal<Vec<FileEntry>> {
         self.file_list.entries_signal().clone()
     }
-}
-
-pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
-    let navigation = state.navigation.lock().unwrap();
-    let initial_path = navigation.get_current_path();
-    // Clone navigation path signal for reactive subscription
-    let navigation_path_signal = navigation.current_path().clone();
-    let nav_clone = state.navigation.clone();
-    drop(navigation);
-
-    // Create channels for operations and status (async operations still use channels)
-    let (operation_tx, operation_rx) = mpsc::unbounded_channel::<FileOperationRequest>();
-    let (status_tx, status_rx) = mpsc::unbounded_channel::<String>();
-
-    // Create focus channel for location bar
-    let (focus_tx, focus_rx) = mpsc::unbounded_channel::<()>();
-    let (activate_search_tx, activate_search_rx) = mpsc::unbounded_channel::<()>();
-
-    // Register keyboard shortcuts
-    // Focus location bar
-    context.shortcut_registry.register(
-        Shortcut::ctrl(KeyCode::KeyL),
-        {
-            let tx = focus_tx.clone();
-            move || {
-                let _ = tx.send(());
-                Update::DRAW
-            }
-        },
-    );
-    context.shortcut_registry.register(
-        Shortcut::new(KeyCode::F6, nptk::core::window::ModifiersState::empty()),
-        {
-            let tx = focus_tx.clone();
-            move || {
-                let _ = tx.send(());
-                Update::DRAW
-            }
-        },
-    );
-    let activate_search_shortcut_tx = activate_search_tx.clone();
-    context.shortcut_registry.register(
-        Shortcut::ctrl(KeyCode::KeyF),
-        move || {
-            let _ = activate_search_shortcut_tx.send(());
-            Update::DRAW
-        },
-    );
-
-    let (add_bookmark_tx, add_bookmark_rx) = mpsc::unbounded_channel::<PathBuf>();
-    let (remove_bookmark_tx, remove_bookmark_rx) = mpsc::unbounded_channel::<PathBuf>();
-
-    // Create FilemanSidebar
-    let mut sidebar = FilemanSidebar::new()
-        .with_places(true)
-        .with_bookmarks(true)
-        .with_devices(true)
-        .with_width(state.fileman.sidebar_width() as f32)
-        .with_current_path_signal(navigation_path_signal.clone())
-        .with_add_bookmark_receiver(add_bookmark_rx)
-        .with_remove_bookmark_receiver(remove_bookmark_rx)
-        .with_bookmark_status_sender(status_tx.clone());
-    
-    // Take the navigation receiver for FileListWrapper
-    let sidebar_nav_rx = sidebar.take_navigation_receiver()
-        .expect("FilemanSidebar should provide navigation receiver");
-
-    let search_scope_signal = StateSignal::new(SearchScope::CurrentFolder);
-    let search_query_signal = StateSignal::new(String::new());
-    let show_hidden_files_signal =
-        StateSignal::new(state.fileman.initial_show_hidden());
-    let (search_tx, search_rx) = mpsc::unbounded_channel::<String>();
-    let (folder_duplicate_done_tx, folder_duplicate_done_rx) = mpsc::unbounded_channel::<()>();
-
-    // Create FileList wrapper that syncs with navigation state
-    let config_path = FilemanConfig::config_file_path();
-    let delete_policy = Arc::new(Mutex::new(state.fileman.delete_policy()));
-    let terminal_command = Arc::new(Mutex::new(
-        state.fileman.terminal_command().map(str::to_string),
-    ));
-
-    let mut file_list_wrapper = FileListWrapper::new(
-        initial_path.clone(),
-        nav_clone.clone(),
-        sidebar_nav_rx,
-        operation_tx.clone(),
-        operation_rx,
-        status_tx.clone(),
-        navigation_path_signal.clone(),
-        search_scope_signal.clone(),
-        search_query_signal.clone(),
-        Some(search_rx),
-        show_hidden_files_signal.clone(),
-        folder_duplicate_done_tx,
-        folder_duplicate_done_rx,
-        delete_policy,
-        terminal_command,
-        config_path,
-    );
-
-    if let Some(mode) = state.fileman.default_view_mode() {
-        file_list_wrapper.view_mode_signal().set(mode);
-    }
-    file_list_wrapper.apply_startup_folder_view(&state.fileman);
-
-    // Set file list to grow and fill remaining space
-    file_list_wrapper.set_layout_style(LayoutStyle {
-        size: Vector2::new(Dimension::auto(), Dimension::percent(1.0)),
-        flex_grow: 1.0, // Grow to fill remaining horizontal space
-        flex_shrink: 1.0, // Allow shrinking if needed
-        ..Default::default()
-    });
-
-    // Clone selected paths signal from FileList for ToolbarWrapper and StatusBarWrapper
-    let selected_paths_signal = file_list_wrapper.selected_paths_signal().clone();
-
-    // Create ToolbarWrapper
-    let (toolbar_wrapper, toolbar_nav_tx) = crate::toolbar::ToolbarWrapper::new(
-        nav_clone.clone(),
-        operation_tx.clone(),
-        navigation_path_signal.clone(),
-        selected_paths_signal.clone(),
-        file_list_wrapper.view_mode_signal().clone(),
-    );
-    let view_mode_signal = file_list_wrapper.view_mode_signal().clone();
-    let search_scope_for_menubar = search_scope_signal.clone();
-
-    let menu_bar = crate::menus::build_reference_menubar(
-        status_tx.clone(),
-        crate::menus::ReferenceMenubarActions {
-            focus_location: Arc::new({
-                let tx = focus_tx.clone();
-                move || {
-                    let _ = tx.send(());
-                }
-            }),
-            activate_search: Arc::new({
-                let tx = activate_search_tx.clone();
-                move || {
-                    let _ = tx.send(());
-                }
-            }),
-            navigate_home: Arc::new({
-                let tx = toolbar_nav_tx.clone();
-                move || {
-                    let _ = tx.send(crate::toolbar::NavigationAction::Home);
-                }
-            }),
-            navigate_back: Arc::new({
-                let tx = toolbar_nav_tx.clone();
-                move || {
-                    let _ = tx.send(crate::toolbar::NavigationAction::Back);
-                }
-            }),
-            navigate_forward: Arc::new({
-                let tx = toolbar_nav_tx.clone();
-                move || {
-                    let _ = tx.send(crate::toolbar::NavigationAction::Forward);
-                }
-            }),
-            navigate_up: Arc::new({
-                let tx = toolbar_nav_tx.clone();
-                move || {
-                    let _ = tx.send(crate::toolbar::NavigationAction::Up);
-                }
-            }),
-            set_view_list: Arc::new({
-                let signal = view_mode_signal.clone();
-                move || {
-                    signal.set(FileListViewMode::List);
-                }
-            }),
-            set_view_icon: Arc::new({
-                let signal = view_mode_signal.clone();
-                move || {
-                    signal.set(FileListViewMode::Icon);
-                }
-            }),
-            set_view_compact: Arc::new({
-                let signal = view_mode_signal.clone();
-                move || {
-                    signal.set(FileListViewMode::Compact);
-                }
-            }),
-            set_view_table: Arc::new({
-                let signal = view_mode_signal.clone();
-                move || {
-                    signal.set(FileListViewMode::Table);
-                }
-            }),
-            show_properties: Arc::new({
-                let operation_tx = operation_tx.clone();
-                let selected_paths_signal = selected_paths_signal.clone();
-                let status_tx = status_tx.clone();
-                move || {
-                    let paths = (*selected_paths_signal.get()).clone();
-                    if paths.is_empty() {
-                        let _ = status_tx.send("Properties: nothing selected".to_string());
-                    } else {
-                        let _ = operation_tx.send(FileOperationRequest::Properties(paths));
-                    }
-                }
-            }),
-            refresh_list: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::Refresh);
-                }
-            }),
-            copy_selection: Arc::new({
-                let operation_tx = operation_tx.clone();
-                let selected_paths_signal = selected_paths_signal.clone();
-                let status_tx = status_tx.clone();
-                move || {
-                    let paths = (*selected_paths_signal.get()).clone();
-                    if paths.is_empty() {
-                        let _ = status_tx.send("Copy: nothing selected".to_string());
-                    } else {
-                        let _ = operation_tx.send(FileOperationRequest::Copy(paths));
-                    }
-                }
-            }),
-            cut_selection: Arc::new({
-                let operation_tx = operation_tx.clone();
-                let selected_paths_signal = selected_paths_signal.clone();
-                let status_tx = status_tx.clone();
-                move || {
-                    let paths = (*selected_paths_signal.get()).clone();
-                    if paths.is_empty() {
-                        let _ = status_tx.send("Cut: nothing selected".to_string());
-                    } else {
-                        let _ = operation_tx.send(FileOperationRequest::Cut(paths));
-                    }
-                }
-            }),
-            paste_clipboard: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::Paste);
-                }
-            }),
-            new_folder: Arc::new({
-                let operation_tx = operation_tx.clone();
-                let navigation_path_signal = navigation_path_signal.clone();
-                move || {
-                    let parent = (*navigation_path_signal.get()).clone();
-                    let _ = operation_tx.send(FileOperationRequest::PromptCreateDirectory(parent));
-                }
-            }),
-            rename_selection: Arc::new({
-                let operation_tx = operation_tx.clone();
-                let selected_paths_signal = selected_paths_signal.clone();
-                let status_tx = status_tx.clone();
-                move || {
-                    let paths = (*selected_paths_signal.get()).clone();
-                    match paths.len() {
-                        0 => {
-                            let _ = status_tx.send("Rename: select a single item".to_string());
-                        }
-                        1 => {
-                            let _ =
-                                operation_tx.send(FileOperationRequest::PromptRename(paths[0].clone()));
-                        }
-                        _ => {
-                            let _ = status_tx.send("Rename: select only one item".to_string());
-                        }
-                    }
-                }
-            }),
-            delete_selection: Arc::new({
-                let operation_tx = operation_tx.clone();
-                let selected_paths_signal = selected_paths_signal.clone();
-                let status_tx = status_tx.clone();
-                move || {
-                    let paths = (*selected_paths_signal.get()).clone();
-                    if paths.is_empty() {
-                        let _ = status_tx.send("Move to Trash: nothing selected".to_string());
-                    } else {
-                        let _ = operation_tx.send(FileOperationRequest::Delete(paths));
-                    }
-                }
-            }),
-            delete_permanent_selection: Arc::new({
-                let operation_tx = operation_tx.clone();
-                let selected_paths_signal = selected_paths_signal.clone();
-                let status_tx = status_tx.clone();
-                move || {
-                    let paths = (*selected_paths_signal.get()).clone();
-                    if paths.is_empty() {
-                        let _ = status_tx.send("Delete permanently: nothing selected".to_string());
-                    } else {
-                        let _ = operation_tx.send(FileOperationRequest::DeletePermanent(paths));
-                    }
-                }
-            }),
-            sort_name_asc: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::Sort(0, SortOrder::Ascending));
-                }
-            }),
-            sort_name_desc: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::Sort(0, SortOrder::Descending));
-                }
-            }),
-            sort_size_asc: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::Sort(1, SortOrder::Ascending));
-                }
-            }),
-            sort_size_desc: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::Sort(1, SortOrder::Descending));
-                }
-            }),
-            sort_modified_asc: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::Sort(3, SortOrder::Ascending));
-                }
-            }),
-            sort_modified_desc: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::Sort(3, SortOrder::Descending));
-                }
-            }),
-            sort_type_asc: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::Sort(2, SortOrder::Ascending));
-                }
-            }),
-            sort_type_desc: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::Sort(2, SortOrder::Descending));
-                }
-            }),
-            set_search_current_folder: Arc::new({
-                let scope_signal = search_scope_for_menubar.clone();
-                move || {
-                    scope_signal.set(SearchScope::CurrentFolder);
-                }
-            }),
-            set_search_include_subfolders: Arc::new({
-                let scope_signal = search_scope_for_menubar.clone();
-                move || {
-                    scope_signal.set(SearchScope::FolderAndSubfolders);
-                }
-            }),
-            select_all: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::SelectAll);
-                }
-            }),
-            deselect_all: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::DeselectAll);
-                }
-            }),
-            invert_selection: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::InvertSelection);
-                }
-            }),
-            toggle_show_hidden_files: Arc::new({
-                let signal = show_hidden_files_signal.clone();
-                let status_tx = status_tx.clone();
-                move || {
-                    let next = !*signal.get();
-                    signal.set(next);
-                    let msg = if next {
-                        "Showing hidden files"
-                    } else {
-                        "Hiding hidden files"
-                    };
-                    let _ = status_tx.send(msg.to_string());
-                }
-            }),
-            new_file: Arc::new({
-                let operation_tx = operation_tx.clone();
-                let navigation_path_signal = navigation_path_signal.clone();
-                move || {
-                    let parent = (*navigation_path_signal.get()).clone();
-                    let _ = operation_tx.send(FileOperationRequest::PromptCreateFile(parent));
-                }
-            }),
-            open_selection: Arc::new({
-                let operation_tx = operation_tx.clone();
-                let selected_paths_signal = selected_paths_signal.clone();
-                let status_tx = status_tx.clone();
-                move || {
-                    let paths = (*selected_paths_signal.get()).clone();
-                    if paths.is_empty() {
-                        let _ = status_tx.send("Open: nothing selected".to_string());
-                    } else {
-                        let _ = operation_tx.send(FileOperationRequest::OpenSelection);
-                    }
-                }
-            }),
-            duplicate_selection: Arc::new({
-                let operation_tx = operation_tx.clone();
-                let selected_paths_signal = selected_paths_signal.clone();
-                let status_tx = status_tx.clone();
-                move || {
-                    let paths = (*selected_paths_signal.get()).clone();
-                    if paths.is_empty() {
-                        let _ = status_tx.send("Duplicate: nothing selected".to_string());
-                    } else {
-                        let _ = operation_tx.send(FileOperationRequest::Duplicate(paths));
-                    }
-                }
-            }),
-            add_bookmark_current_folder: Arc::new({
-                let bookmark_tx = add_bookmark_tx.clone();
-                let navigation_path_signal = navigation_path_signal.clone();
-                let status_tx = status_tx.clone();
-                move || {
-                    let path = (*navigation_path_signal.get()).clone();
-                    if !path.is_dir() {
-                        let _ = status_tx.send("Bookmarks: current path is not a folder".to_string());
-                    } else {
-                        let _ = bookmark_tx.send(path);
-                    }
-                }
-            }),
-            remove_bookmark_current_folder: Arc::new({
-                let bookmark_tx = remove_bookmark_tx.clone();
-                let navigation_path_signal = navigation_path_signal.clone();
-                let status_tx = status_tx.clone();
-                move || {
-                    let path = (*navigation_path_signal.get()).clone();
-                    if !path.is_dir() {
-                        let _ = status_tx.send("Bookmarks: current path is not a folder".to_string());
-                    } else {
-                        let _ = bookmark_tx.send(path);
-                    }
-                }
-            }),
-            open_terminal_here: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::OpenTerminalHere);
-                }
-            }),
-            show_about: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::ShowAbout);
-                }
-            }),
-            configure_fileman: Arc::new({
-                let operation_tx = operation_tx.clone();
-                move || {
-                    let _ = operation_tx.send(FileOperationRequest::ShowSettings);
-                }
-            }),
-        },
-    );
-
-    // Create FileLocationBar (shared search_query_signal for live search)
-    use nptk_fileman_widgets::location_bar::FileLocationBar;
-    
-    let nav_tx_clone = toolbar_nav_tx.clone();
-    let location_bar = FileLocationBar::new(
-        navigation_path_signal.clone(),
-        search_query_signal,
-        Some(search_tx),
-    )
-        .with_focus_receiver(focus_rx)
-        .with_activate_search_receiver(activate_search_rx)
-        .with_search_scope_signal(search_scope_signal)
-        .with_on_navigate(move |path| {
-             let _ = nav_tx_clone.send(crate::toolbar::NavigationAction::NavigateTo(path));
-             Update::DRAW
-        });
-
-    // Create FileStatusBar
-    use nptk_fileman_widgets::status_bar::FileStatusBar;
-    
-    let statusbar = FileStatusBar::new(
-        navigation_path_signal.clone(),
-        selected_paths_signal.clone(),
-        file_list_wrapper.entries_signal().clone(),
-    ).with_message_receiver(status_rx);
-
-    // Build main layout
-    Container::new(vec![
-        Box::new(menu_bar),
-        // Toolbar area
-        Box::new(Container::new(vec![
-            Box::new(toolbar_wrapper),
-            Box::new(location_bar),
-        ]).with_layout_style(LayoutStyle {
-            size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
-            flex_direction: FlexDirection::Column,
-            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(4.0)),
-            ..Default::default()
-        })),
-        // Content area (sidebar + file list)
-        Box::new(Container::new(vec![
-            Box::new(sidebar),
-            Box::new(file_list_wrapper),
-        ]).with_layout_style(LayoutStyle {
-            size: Vector2::new(Dimension::percent(1.0), Dimension::percent(1.0)),
-            flex_direction: FlexDirection::Row,
-            gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(0.0)),
-            ..Default::default()
-        })),
-        // Statusbar
-        Box::new(statusbar),
-    ]).with_layout_style(LayoutStyle {
-        size: Vector2::new(Dimension::percent(1.0), Dimension::percent(1.0)),
-        flex_direction: FlexDirection::Column,
-        ..Default::default()
-    })
 }
