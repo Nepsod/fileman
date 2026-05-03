@@ -9,7 +9,7 @@ use nptk::core::vgi::Graphics;
 use nptk::core::widget::BoxedWidget;
 use nptk::prelude::*;
 use nptk::widgets::scroll_container::{
-    ScrollContainer, ScrollDirection, VerticalScrollbarPosition,
+    ScrollContainer, ScrollDirection,
 };
 use nptk::widgets::standard_dialog::{
     open_popup_at, DialogButton, StandardModalLayout, StandardModalStyle,
@@ -170,6 +170,12 @@ pub fn open_configure_fileman_popup(
             LengthPercentage::length(0.0),
             LengthPercentage::length(STANDARD_MODAL_COLUMN_GAP_Y),
         ),
+        padding: Rect {
+            left: LengthPercentage::length(STANDARD_MODAL_PADDING),
+            right: LengthPercentage::length(STANDARD_MODAL_PADDING),
+            top: LengthPercentage::length(STANDARD_MODAL_PADDING),
+            bottom: LengthPercentage::length(STANDARD_MODAL_PADDING),
+        },
         size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
         flex_shrink: 0.0,
         ..Default::default()
@@ -177,8 +183,7 @@ pub fn open_configure_fileman_popup(
 
     let mut scroll = ScrollContainer::new()
         .with_child(settings_column)
-        .with_scroll_direction(ScrollDirection::Vertical)
-        .with_vertical_scrollbar_position(VerticalScrollbarPosition::Right);
+        .with_scroll_direction(ScrollDirection::Vertical);
     // Match ItemView path in FileList (`file_list.rs`): inner scroll fills its layout slot 100%×100%.
     scroll.set_layout_style(LayoutStyle {
         flex_direction: FlexDirection::Row,
