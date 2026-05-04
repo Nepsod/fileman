@@ -12,7 +12,9 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() {
-    //env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // `FILEMAN_PERF=1` with `RUST_LOG=info` enables extra FileList icon-queue counters in the log.
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"))
+        .try_init();
 
     let fileman_config = config::FilemanConfig::load_or_create();
 

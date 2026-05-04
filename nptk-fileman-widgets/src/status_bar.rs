@@ -32,7 +32,14 @@ impl FileStatusBar {
         let status_text_clone = status_text.clone();
         
         let container = Container::new(vec![
-            Box::new(Text::new(status_text_clone.maybe()).with_font_size(14.0)),
+            Box::new(
+                Text::new(status_text_clone.maybe())
+                    .with_font_size(14.0)
+                    .with_layout_style(LayoutStyle {
+                        size: Vector2::new(Dimension::percent(1.0), Dimension::length(20.0)),
+                        ..Default::default()
+                    }),
+            ),
         ])
         .with_layout_style(LayoutStyle {
             size: Vector2::new(Dimension::percent(1.0), Dimension::length(24.0)),
@@ -131,10 +138,13 @@ impl Widget for FileStatusBar {
         let mut has_active_temporary_message = false;
         if let Some(ref mut rx) = self.status_message_rx {
              while let Ok(msg) = rx.try_recv() {
-                self.status_text.set(msg);
+                let current_status = (*self.status_text.get()).clone();
+                if current_status != msg {
+                    self.status_text.set(msg);
+                    update.insert(Update::DRAW);
+                }
                 self.status_message_timeout = Some(std::time::Instant::now());
                 has_active_temporary_message = true;
-                update.insert(Update::DRAW);
             }
         }
         
@@ -153,8 +163,11 @@ impl Widget for FileStatusBar {
             let framework_status_text = context.status_bar.get_text();
             if !framework_status_text.is_empty() {
                 // Framework status bar has text (e.g., from button hover) - use it
-                self.status_text.set(framework_status_text);
-                update.insert(Update::DRAW);
+                let current_status = (*self.status_text.get()).clone();
+                if current_status != framework_status_text {
+                    self.status_text.set(framework_status_text);
+                    update.insert(Update::DRAW);
+                }
             } else {
                 // No framework status text - update status from navigation
                 if self.update_status_from_navigation() {

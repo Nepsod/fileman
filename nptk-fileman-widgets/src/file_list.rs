@@ -22,7 +22,10 @@ use npio::{ThumbnailService, ThumbnailEvent, ThumbnailImage, get_file_for_uri, r
 use npio::backend::local::LocalBackend;
 use nptk::services::thumbnail::npio_adapter::{uri_to_path, thumbnail_size_to_u32};
 use nptk::core::theme::ColorRole;
+use nptk::core::scroll::ScrollHandle;
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use tokio::{sync::broadcast, time::{Duration, Instant}};
 use std::time::Duration as StdDuration;
 
@@ -108,7 +111,35 @@ struct FileListPerfStats {
     visible_rows_rendered: u64,
     refresh_triggers: u64,
     search_rebuild_triggers: u64,
+    fs_invalidate_batches: u64,
+    fs_event_truncated_frames: u64,
+    fs_dirty_events_coalesced: u64,
+    update_phase_max_us: u64,
 }
+
+fn hash_path_slice(paths: &[PathBuf]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    paths.len().hash(&mut hasher);
+    for path in paths {
+        path.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn entries_fingerprint(entries: &[FileEntry]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    entries.len().hash(&mut hasher);
+    if let Some(entry) = entries.first() {
+        entry.path.hash(&mut hasher);
+    }
+    if let Some(entry) = entries.last() {
+        entry.path.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Row height used with `ItemView` default `item_height` for scroll / visibility hints.
+const ITEM_VIEW_ROW_HEIGHT_PX: f32 = 30.0;
 
 /// A widget that displays a list of files.
 pub struct FileList {
@@ -188,6 +219,8 @@ pub struct FileList {
     // Pending search query from location bar (avoids setting signal from inside TextInput update)
     search_pending_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
     perf: FileListPerfStats,
+    item_view_scroll_handle: Option<Arc<ScrollHandle>>,
+    last_index_sync_key: Option<(u64, u64)>,
 }
 
 impl FileList {
@@ -358,6 +391,8 @@ impl FileList {
             current_folder_result_rx: None,
             search_pending_rx,
             perf: FileListPerfStats::default(),
+            item_view_scroll_handle: None,
+            last_index_sync_key: None,
         }
     }
 
@@ -368,13 +403,45 @@ impl FileList {
         }
         let mode = *self.view_mode.get();
         let row_height = match mode {
-            FileListViewMode::List | FileListViewMode::Table => 24.0,
-            FileListViewMode::Compact => 24.0,
-            FileListViewMode::Icon => (*self.icon_size.get() as f32 + 20.0).max(24.0),
+            FileListViewMode::List | FileListViewMode::Table => ITEM_VIEW_ROW_HEIGHT_PX,
+            FileListViewMode::Compact => ITEM_VIEW_ROW_HEIGHT_PX,
+            FileListViewMode::Icon => (*self.icon_size.get() as f32 + 20.0).max(ITEM_VIEW_ROW_HEIGHT_PX),
         };
         let viewport_h = layout.layout.size.height.max(1.0);
         let visible = ((viewport_h / row_height).ceil() as usize).saturating_add(2);
         visible.min(total_entries)
+    }
+
+    fn push_visible_row_hint(&self, layout: &LayoutNode) {
+        let Some(model) = self.sort_model.as_ref() else {
+            return;
+        };
+        let Some(scroll_handle) = self.item_view_scroll_handle.as_ref() else {
+            model.set_visible_row_range(0, usize::MAX);
+            return;
+        };
+        let mode = *self.view_mode.get();
+        let row_h = match mode {
+            FileListViewMode::List | FileListViewMode::Table | FileListViewMode::Compact => {
+                ITEM_VIEW_ROW_HEIGHT_PX
+            }
+            FileListViewMode::Icon => (*self.icon_size.get() as f32 + 20.0).max(ITEM_VIEW_ROW_HEIGHT_PX),
+        }
+        .max(1.0);
+        let scroll_y = scroll_handle.offset().y.max(0.0);
+        let first = (scroll_y / row_h).floor() as usize;
+        let viewport_h = layout.layout.size.height.max(1.0);
+        let visible_rows = ((viewport_h / row_h).ceil() as usize).saturating_add(8);
+        let entry_count = self.entries.get().len();
+        let end_exclusive = if entry_count == 0 {
+            0usize
+        } else {
+            first
+                .saturating_add(visible_rows)
+                .min(entry_count)
+                .max(first.saturating_add(1))
+        };
+        model.set_visible_row_range(first, end_exclusive);
     }
 
     pub fn show_properties_popup(&self, paths: &[PathBuf], context: AppContext) {
@@ -632,7 +699,11 @@ impl FileList {
                 ..Default::default()
             });
 
+            let list_scroll_handle = Arc::new(ScrollHandle::new());
+            self.item_view_scroll_handle = Some(list_scroll_handle.clone());
+
             let mut scroll_container = ScrollContainer::new()
+                .with_scroll_handle(list_scroll_handle)
                 .with_child(view)
                 .with_scroll_direction(ScrollDirection::Vertical);
             
@@ -1008,10 +1079,11 @@ impl Widget for FileList {
         
         // Poll filesystem events FIRST - this must happen before ItemView handling
         // so that entries get updated even when using ItemView.
-        // Limit per-frame event processing and coalesce refreshes to keep UI responsive.
+        // Limit per-frame event processing; coalesce cache invalidations and draw signals.
         if let Ok(mut rx) = self._event_rx.try_lock() {
             const MAX_FS_EVENTS_PER_UPDATE: usize = 256;
             let mut events_processed = 0usize;
+            let mut pending_invalidates: HashSet<PathBuf> = HashSet::new();
             while events_processed < MAX_FS_EVENTS_PER_UPDATE {
                 let event = match rx.try_recv() {
                     Ok(event) => event,
@@ -1040,19 +1112,32 @@ impl Widget for FileList {
 
                             update.insert(Update::LAYOUT | Update::DRAW);
                         }
-                    },
-                    FileSystemEvent::EntryAdded { path, .. } | FileSystemEvent::EntryRemoved { path } | FileSystemEvent::EntryModified { path, .. } => {
+                    }
+                    FileSystemEvent::EntryAdded { path, .. }
+                    | FileSystemEvent::EntryRemoved { path }
+                    | FileSystemEvent::EntryModified { path, .. } => {
                         if let Some(parent) = path.parent() {
                             if parent == *self.current_path.get() {
-                                if let Err(e) = self.cache_invalidate_tx.send(path.clone()) {
-                                    log::warn!("Failed to send cache invalidation request: {}", e);
-                                }
-                                update.insert(Update::DRAW);
+                                pending_invalidates.insert(path);
                             }
                         }
-                    },
-                    _ => {},
+                    }
+                    _ => {}
                 }
+            }
+            if events_processed == MAX_FS_EVENTS_PER_UPDATE {
+                self.perf.fs_event_truncated_frames += 1;
+                update.insert(Update::DRAW);
+            }
+            if !pending_invalidates.is_empty() {
+                self.perf.fs_invalidate_batches += 1;
+                self.perf.fs_dirty_events_coalesced += pending_invalidates.len() as u64;
+                for path in pending_invalidates {
+                    if let Err(e) = self.cache_invalidate_tx.send(path) {
+                        log::warn!("Failed to send cache invalidation request: {}", e);
+                    }
+                }
+                update.insert(Update::DRAW);
             }
         }
         
@@ -1075,41 +1160,19 @@ impl Widget for FileList {
             update.insert(Update::LAYOUT | Update::DRAW);
         }
         
-        // Check if search query changed
-        // Note: We rely on signal reactivity, but we need to re-filter when it changes
-        // Since we hook the signal, this update() is called when it changes.
-        // But we need to detect *what* changed or just re-filter if needed.
-        // A simple way is to check against a stored last_query, or just re-filter if we assume efficient updates.
-        // For now, let's just re-filter based on all_entries if search_query changed? 
-        // Actually, since update() is called on signal change, we can just re-apply filter logic
-        // But we want to avoid re-setting entries if nothing changed.
-        // Let's rely on the fact that if search_query changed, *self.search_query.get() is new.
-        // We can just re-run the filter logic every time update is called? No, that's wasteful.
-        // Best practice: Use a stored previous value or just do it.
-        // Given existing pattern, let's just re-filter. It's fast for small lists.
-        // BUT wait, we don't store previous query. 
-        // Let's leave it for now - the directory load triggers the first filter.
-        // We need to handle the case where ONLY search query changes.
-        
-        // Ideally we should track last_query in struct. But for filtered list,
-        // we can just re-derive `entries` from `all_entries` + `search_query`
-        // whenever `search_query` changes.
-        // Since we don't have `last_query`, let's just add it or implement a check.
-        
-        // Actually, let's just re-filter every time for now inside the update loop if we can efficiently check change.
-        // But we can't easily check change without previous value.
-        // Let's add logic:
+        // Single snapshot for search/filter branches (after FS + selection + path mutations).
+        let snapshot_path = self.current_path.get().clone();
         let scope_is_recursive = self
             .search_scope
             .as_ref()
             .map(|s| *s.get() == SearchScope::FolderAndSubfolders)
             .unwrap_or(false);
         let query = self.search_query.get().to_lowercase();
+        let show_hid = *self.show_hidden_files.get();
         let use_current_folder_only = !scope_is_recursive || query.is_empty();
 
         if !use_current_folder_only {
-            let path = self.current_path.get().clone();
-            let show_hid = *self.show_hidden_files.get();
+            let path = snapshot_path.clone();
             let need_search = self
                 .last_recursive_search
                 .as_ref()
@@ -1152,10 +1215,10 @@ impl Widget for FileList {
         }
 
         if use_current_folder_only {
-            let path = self.current_path.get().clone();
-            let all_snapshot = self.all_entries.get().clone();
-            let show_hid = *self.show_hidden_files.get();
-            let filter_key = (path.clone(), query.clone(), all_snapshot.len(), show_hid);
+            let path = snapshot_path.clone();
+            let all_entries_snapshot = self.all_entries.get();
+            let all_entries_len = all_entries_snapshot.len();
+            let filter_key = (path.clone(), query.clone(), all_entries_len, show_hid);
             let need_filter = self
                 .last_current_folder_search
                 .as_ref()
@@ -1165,6 +1228,7 @@ impl Widget for FileList {
                 self.last_current_folder_search = Some(filter_key);
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 self.current_folder_result_rx = Some(rx);
+                let all_snapshot = all_entries_snapshot.clone();
                 let query_move = query.clone();
                 tokio::task::spawn_blocking(move || {
                     let mut filtered: Vec<FileEntry> = if query_move.is_empty() {
@@ -1185,36 +1249,47 @@ impl Widget for FileList {
             self.last_current_folder_search = None;
             self.current_folder_result_rx = None;
         }
+
+        self.push_visible_row_hint(layout);
         
         // Ensure ItemView exists if mode is Table or List
         if _mode == FileListViewMode::Table || _mode == FileListViewMode::List {
             self.ensure_item_view();
             if let Some(ref mut view) = self.item_view {
                  // Sync FileList selection (paths) -> ItemView selection (indices)
-                 {
+                 if let Some(signal) = &self.item_view_selection {
                      let current_selected_paths = self.selected_paths.get();
                      let entries = self.entries.get();
-                     let mut indices = Vec::new();
-                     
-                     for path in current_selected_paths.iter() {
-                         if let Some(idx) = entries.iter().position(|e| e.path == *path) {
-                             indices.push(idx);
+                     let sync_key = (
+                         hash_path_slice(&current_selected_paths),
+                         entries_fingerprint(&entries),
+                     );
+                     if self.last_index_sync_key != Some(sync_key) {
+                         self.last_index_sync_key = Some(sync_key);
+                         let mut indices = Vec::new();
+                         for path in current_selected_paths.iter() {
+                             if let Some(idx) = entries.iter().position(|e| e.path == *path) {
+                                 indices.push(idx);
+                             }
                          }
-                     }
-                     
-                     if let Some(signal) = &self.item_view_selection {
                          let current_indices = signal.get();
                          if current_indices.as_slice() != indices.as_slice() {
                              drop(current_indices);
                              signal.set(indices);
                          }
                      }
-                 } // entries dropped here!
+                 }
                  
                  // ItemView is a child in layout tree, use layout.children[0]
                 if !layout.children.is_empty() {
                     let mut ret = view.update(&layout.children[0], context.clone(), info).await;
                     ret |= update;
+                    let elapsed = update_start.elapsed();
+                    self.perf.update_total += elapsed;
+                    self.perf.frames += 1;
+                    self.perf.entries_processed += self.entries.get().len() as u64;
+                    self.perf.update_phase_max_us =
+                        self.perf.update_phase_max_us.max(elapsed.as_micros() as u64);
                     return ret;
                 }
             }
@@ -1230,9 +1305,11 @@ impl Widget for FileList {
                  update |= self.scroll_container.update(&layout.children[0], context.clone(), info).await;
             }
         }
-        self.perf.update_total += update_start.elapsed();
+        let elapsed = update_start.elapsed();
+        self.perf.update_total += elapsed;
         self.perf.frames += 1;
         self.perf.entries_processed += self.entries.get().len() as u64;
+        self.perf.update_phase_max_us = self.perf.update_phase_max_us.max(elapsed.as_micros() as u64);
 
         update
     }
@@ -1285,14 +1362,32 @@ impl Widget for FileList {
         if self.perf.frames % 240 == 0 && self.perf.frames > 0 {
             let frames = self.perf.frames as u128;
             log::info!(
-                "FileList perf: avg_update={}us avg_render={}us avg_entries={} avg_visible_rows={} refresh={} search_rebuilds={}",
+                "FileList perf: avg_update={}us avg_render={}us avg_entries={} avg_visible_rows={} refresh={} search_rebuilds={} fs_batches={} fs_trunc_frames={} fs_coalesced_inv={} update_max_us={}",
                 self.perf.update_total.as_micros() / frames,
                 self.perf.render_total.as_micros() / frames,
                 self.perf.entries_processed as u128 / frames,
                 self.perf.visible_rows_rendered as u128 / frames,
                 self.perf.refresh_triggers,
-                self.perf.search_rebuild_triggers
+                self.perf.search_rebuild_triggers,
+                self.perf.fs_invalidate_batches,
+                self.perf.fs_event_truncated_frames,
+                self.perf.fs_dirty_events_coalesced,
+                self.perf.update_phase_max_us,
             );
+            if std::env::var("FILEMAN_PERF").as_deref() == Ok("1") {
+                if let Some(model) = &self.sort_model {
+                    let p = &model.icon_perf;
+                    log::info!(
+                        "FileList icon perf: cache_try_fail={} pending_try_fail={} queue_sat={} offscreen_def={} svg_try_fail={}",
+                        p.icon_cache_try_fail.load(std::sync::atomic::Ordering::Relaxed),
+                        p.icon_pending_try_fail.load(std::sync::atomic::Ordering::Relaxed),
+                        p.icon_queue_saturated.load(std::sync::atomic::Ordering::Relaxed),
+                        p.icon_offscreen_deferred.load(std::sync::atomic::Ordering::Relaxed),
+                        p.icon_svg_cache_try_fail.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                }
+            }
+            self.perf.update_phase_max_us = 0;
         }
     }
 }

@@ -2,6 +2,7 @@ use npio::service::icon::{IconRegistry, CachedIcon};
 use npio::{ThumbnailService, ThumbnailSize as NpioThumbnailSize};
 use npio::file::local::LocalFile;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use nptk::widgets::item_view::IconData;
@@ -9,6 +10,18 @@ use nptk::core::model::{ModelData, ItemRole, Orientation, SortOrder, ItemModel};
 use nptk::prelude::{StateSignal, Signal};
 use nptk::services::filesystem::entry::FileEntry;
 use humansize::{format_size, BINARY};
+
+const MAX_PENDING_ICON_TASKS: usize = 96;
+
+/// Counters for smoothness-first icon path (read under `FILEMAN_PERF=1` from `FileList`).
+#[derive(Default)]
+pub struct FileSystemItemModelPerf {
+    pub icon_cache_try_fail: AtomicU64,
+    pub icon_pending_try_fail: AtomicU64,
+    pub icon_queue_saturated: AtomicU64,
+    pub icon_offscreen_deferred: AtomicU64,
+    pub icon_svg_cache_try_fail: AtomicU64,
+}
 
 /// Adapter to expose a StateSignal<Vec<FileEntry>> as an ItemModel
 #[derive(Clone)]
@@ -20,7 +33,11 @@ pub struct FileSystemItemModel {
     svg_scene_cache: Arc<Mutex<HashMap<String, (nptk::core::vg::Scene, f64, f64)>>>,
     icon_size: nptk::core::signal::MaybeSignal<f32>,
     pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
+    size_display_cache: Arc<Mutex<HashMap<(PathBuf, u64), String>>>,
     cache_update_tx: tokio::sync::mpsc::Sender<()>,
+    visible_row_start: Arc<AtomicUsize>,
+    visible_row_end_exclusive: Arc<AtomicUsize>,
+    pub icon_perf: Arc<FileSystemItemModelPerf>,
 }
 
 impl FileSystemItemModel {
@@ -41,13 +58,24 @@ impl FileSystemItemModel {
             svg_scene_cache,
             icon_size: nptk::core::signal::MaybeSignal::value(16.0), // Default for list view
             pending_thumbnails,
+            size_display_cache: Arc::new(Mutex::new(HashMap::new())),
             cache_update_tx,
+            visible_row_start: Arc::new(AtomicUsize::new(0)),
+            visible_row_end_exclusive: Arc::new(AtomicUsize::new(usize::MAX)),
+            icon_perf: Arc::new(FileSystemItemModelPerf::default()),
         }
     }
 
     pub fn with_icon_size(mut self, size: impl Into<nptk::core::signal::MaybeSignal<f32>>) -> Self {
         self.icon_size = size.into();
         self
+    }
+
+    /// Hint which rows are on-screen; off-screen rows skip spawning new icon/thumbnail work.
+    pub fn set_visible_row_range(&self, start: usize, end_exclusive: usize) {
+        let end = end_exclusive.max(start);
+        self.visible_row_start.store(start, Ordering::Relaxed);
+        self.visible_row_end_exclusive.store(end, Ordering::Relaxed);
     }
 }
 
@@ -74,10 +102,32 @@ impl ItemModel for FileSystemItemModel {
                      if entry.is_dir() {
                         ModelData::String("Directory".to_string())
                      } else {
-                        ModelData::String(format_size(entry.metadata.size, BINARY))
+                        let cache_key = (entry.path.clone(), entry.metadata.size);
+                        let cached_size_label = self
+                            .size_display_cache
+                            .try_lock()
+                            .ok()
+                            .and_then(|cache| cache.get(&cache_key).cloned());
+                        if let Some(label) = cached_size_label {
+                            ModelData::String(label)
+                        } else {
+                            let formatted_size = format_size(entry.metadata.size, BINARY);
+                            if let Ok(mut cache) = self.size_display_cache.try_lock() {
+                                if cache.len() > 8192 {
+                                    cache.clear();
+                                }
+                                cache.insert(cache_key, formatted_size.clone());
+                            }
+                            ModelData::String(formatted_size)
+                        }
                      }
                 },
-                2 => ModelData::String(format!("{:?}", entry.file_type)), // Simplify for now
+                2 => ModelData::String(match entry.file_type {
+                    nptk::services::filesystem::entry::FileType::File => "File",
+                    nptk::services::filesystem::entry::FileType::Directory => "Directory",
+                    nptk::services::filesystem::entry::FileType::Symlink => "Symlink",
+                    nptk::services::filesystem::entry::FileType::Other => "Other",
+                }.to_string()),
                 3 => ModelData::String("Unknown".to_string()), // Date not in FileEntry yet?
                 _ => ModelData::None,
             },
@@ -86,9 +136,21 @@ impl ItemModel for FileSystemItemModel {
                     // Check cache for icon
                     let path = &entry.path;
                     let size = *self.icon_size.get() as u32;
-                    
+                    let placeholder = || {
+                        if entry.is_dir() {
+                            ModelData::String("directory".to_string())
+                        } else {
+                            ModelData::String("file".to_string())
+                        }
+                    };
+
                     let cached = {
-                        let cache = self.icon_cache.lock().unwrap();
+                        let Ok(cache) = self.icon_cache.try_lock() else {
+                            self.icon_perf
+                                .icon_cache_try_fail
+                                .fetch_add(1, Ordering::Relaxed);
+                            return placeholder();
+                        };
                         cache.get(&(path.clone(), size)).cloned().flatten()
                     };
 
@@ -107,7 +169,12 @@ impl ItemModel for FileSystemItemModel {
                                 ModelData::Custom(Arc::new(IconData::Image(brush, width, height)))
                             },
                             CachedIcon::Svg(svg_source) => {
-                                let mut cache = self.svg_scene_cache.lock().unwrap();
+                                let Ok(mut cache) = self.svg_scene_cache.try_lock() else {
+                                    self.icon_perf
+                                        .icon_svg_cache_try_fail
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    return placeholder();
+                                };
                                 let (scene, width, height) = if let Some((s, w, h)) = cache.get(svg_source.as_str()) {
                                     (s.clone(), *w, *h)
                                 } else {
@@ -142,17 +209,47 @@ impl ItemModel for FileSystemItemModel {
                             }
                         }
                     } else {
+                        let visible_start = self.visible_row_start.load(Ordering::Relaxed);
+                        let visible_end = self.visible_row_end_exclusive.load(Ordering::Relaxed);
+                        let row_in_view = row >= visible_start && row < visible_end;
+                        if !row_in_view {
+                            self.icon_perf
+                                .icon_offscreen_deferred
+                                .fetch_add(1, Ordering::Relaxed);
+                            return placeholder();
+                        }
+
                         // Not cached, check if pending
                         let is_pending = {
-                            let pending = self.pending_thumbnails.lock().unwrap();
+                            let Ok(pending) = self.pending_thumbnails.try_lock() else {
+                                self.icon_perf
+                                    .icon_pending_try_fail
+                                    .fetch_add(1, Ordering::Relaxed);
+                                return placeholder();
+                            };
                             pending.contains(path)
                         };
 
                         if !is_pending {
-                            // Mark as pending
-                            {
-                                let mut pending = self.pending_thumbnails.lock().unwrap();
-                                pending.insert(path.clone());
+                            let should_queue = {
+                                let Ok(mut pending) = self.pending_thumbnails.try_lock() else {
+                                    self.icon_perf
+                                        .icon_pending_try_fail
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    return placeholder();
+                                };
+                                if pending.len() >= MAX_PENDING_ICON_TASKS {
+                                    self.icon_perf
+                                        .icon_queue_saturated
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    false
+                                } else {
+                                    pending.insert(path.clone());
+                                    true
+                                }
+                            };
+                            if !should_queue {
+                                return placeholder();
                             }
 
                             // Spawn load task
@@ -221,11 +318,7 @@ impl ItemModel for FileSystemItemModel {
                             });
                         }
 
-                         if entry.is_dir() {
-                            ModelData::String("directory".to_string())
-                        } else {
-                            ModelData::String("file".to_string())
-                        }
+                        placeholder()
                     }
                 } else {
                     ModelData::None
@@ -236,7 +329,12 @@ impl ItemModel for FileSystemItemModel {
                 match col {
                     0 => ModelData::String(entry.name.clone()),
                     1 => ModelData::Int(entry.metadata.size as i64),
-                    2 => ModelData::String(format!("{:?}", entry.file_type)),
+                    2 => ModelData::Int(match entry.file_type {
+                        nptk::services::filesystem::entry::FileType::Directory => 0,
+                        nptk::services::filesystem::entry::FileType::File => 1,
+                        nptk::services::filesystem::entry::FileType::Symlink => 2,
+                        nptk::services::filesystem::entry::FileType::Other => 3,
+                    }),
                     3 => ModelData::Int(
                         entry
                             .metadata
