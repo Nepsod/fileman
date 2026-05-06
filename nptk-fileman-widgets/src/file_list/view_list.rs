@@ -66,17 +66,7 @@ impl FileListContent {
                 (y + self.item_height) as f64,
             );
 
-            // Check for hover state
-            let is_hovered = if let Some(cursor) = info.cursor_pos {
-                let cursor_x = cursor.x as f64;
-                let cursor_y = cursor.y as f64;
-                cursor_x >= row_rect.x0
-                    && cursor_x < row_rect.x1
-                    && cursor_y >= row_rect.y0
-                    && cursor_y < row_rect.y1
-            } else {
-                false
-            };
+            let is_hovered = self.hovered_item_index == Some(i);
 
             // Draw hover background (if not selected)
             if is_hovered && !selected_set.contains(&entry.path) {

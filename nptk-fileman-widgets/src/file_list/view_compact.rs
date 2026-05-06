@@ -152,18 +152,7 @@ impl FileListContent {
             icon_rect = icon_rect + Vec2::new(x as f64, y as f64);
             label_rect = label_rect + Vec2::new(x as f64, y as f64);
 
-            // Check for hover state
-            let is_hovered = if let Some(cursor) = info.cursor_pos {
-                let cursor_x = cursor.x as f64;
-                let cursor_y = cursor.y as f64;
-                // Check against the full cell rect for hover
-                cursor_x >= x as f64
-                    && cursor_x < (x + cell_width) as f64
-                    && cursor_y >= y as f64
-                    && cursor_y < (y + cell_height) as f64
-            } else {
-                false
-            };
+            let is_hovered = self.hovered_item_index == Some(*i);
 
             // Extract layout properties for rendering
             let icon_x = icon_rect.x0;

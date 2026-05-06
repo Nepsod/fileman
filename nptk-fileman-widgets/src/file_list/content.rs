@@ -662,54 +662,75 @@ impl Widget for FileListContent {
             self.last_cursor = Some(Point::new(cursor.x, cursor.y));
         }
 
-        // Tooltip hover detection
+        // Tooltip hover detection: compute only on meaningful hover-driving events.
         let view_mode = *self.view_mode.get();
         let entries_len = self.entries.get().len();
         let icon_size = *self.icon_size.get();
-        let current_hovered_index = if let Some(cursor) = info.cursor_pos {
-            let local_y = cursor.y as f32 - layout.layout.location.y;
-            let local_x = cursor.x as f32 - layout.layout.location.x;
-            let in_bounds = local_x >= 0.0
-                && local_x < layout.layout.size.width
-                && local_y >= 0.0
-                && local_y < layout.layout.size.height;
-            
-            if in_bounds {
-                self.find_item_under_cursor(local_x, local_y, layout.layout.size.width, view_mode, icon_size, entries_len)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let should_refresh_hover = info.cursor_dirty
+            || info.mouse_scroll_delta.is_some()
+            || !info.buttons.is_empty()
+            || self.tooltip_shown;
+        if should_refresh_hover {
+            let current_hovered_index = if let Some(cursor) = info.cursor_pos {
+                let local_y = cursor.y as f32 - layout.layout.location.y;
+                let local_x = cursor.x as f32 - layout.layout.location.x;
+                let in_bounds = local_x >= 0.0
+                    && local_x < layout.layout.size.width
+                    && local_y >= 0.0
+                    && local_y < layout.layout.size.height;
 
-        // Update hover state and show/hide tooltip
-        if current_hovered_index != self.hovered_item_index {
-            // Hover state changed
-            if let Some(index) = current_hovered_index {
-                if index < entries_len {
-                    let entry_path = {
-                        let entries = self.entries.get();
-                        entries[index].path.clone()
-                    };
-                    let tooltip_text = self.format_file_size_for_tooltip(&entry_path);
-                    // Show tooltip using TooltipManager
-                    if let Some(cursor) = info.cursor_pos {
-                        context.request_tooltip_show(
-                            tooltip_text,
-                            (cursor.x, cursor.y),
-                        );
-                    }
-                    self.hovered_item_index = Some(index);
-                    self.tooltip_shown = true;
+                if in_bounds {
+                    self.find_item_under_cursor(
+                        local_x,
+                        local_y,
+                        layout.layout.size.width,
+                        view_mode,
+                        icon_size,
+                        entries_len,
+                    )
+                } else {
+                    None
                 }
             } else {
-                // Mouse left the item - hide tooltip
-                context.request_tooltip_hide();
-                self.hovered_item_index = None;
-                self.tooltip_shown = false;
+                None
+            };
+
+            // Update hover state and show/hide tooltip on transitions.
+            if current_hovered_index != self.hovered_item_index {
+                if let Some(index) = current_hovered_index {
+                    if index < entries_len {
+                        let entry_path = {
+                            let entries = self.entries.get();
+                            entries[index].path.clone()
+                        };
+                        let tooltip_text = self.format_file_size_for_tooltip(&entry_path);
+                        if let Some(cursor) = info.cursor_pos {
+                            context.request_tooltip_show(tooltip_text, (cursor.x, cursor.y));
+                        }
+                        self.hovered_item_index = Some(index);
+                        self.tooltip_shown = true;
+                    }
+                } else {
+                    context.request_tooltip_hide();
+                    self.hovered_item_index = None;
+                    self.tooltip_shown = false;
+                }
+                update.insert(Update::DRAW);
+            } else if self.tooltip_shown && info.cursor_dirty {
+                // Keep tooltip anchored to cursor position while staying on same item.
+                if let Some(index) = self.hovered_item_index {
+                    if index < entries_len {
+                        let entry_path = {
+                            let entries = self.entries.get();
+                            entries[index].path.clone()
+                        };
+                        let tooltip_text = self.format_file_size_for_tooltip(&entry_path);
+                        if let Some(cursor) = info.cursor_pos {
+                            context.request_tooltip_show(tooltip_text, (cursor.x, cursor.y));
+                        }
+                    }
+                }
             }
-            update.insert(Update::DRAW);
         }
 
         // Track viewport width changes to keep height estimation accurate and invalidate cached layouts.

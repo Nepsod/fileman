@@ -186,24 +186,7 @@ impl FileListContent {
         // Step 3: Drawing
 
         // 1. Draw Label Backgrounds (Hover/Selection) - behind text
-        // Check for hover state (check if cursor is in icon OR label area)
-        let is_hovered = if let Some(cursor) = info.cursor_pos {
-            let cursor_x = cursor.x as f64;
-            let cursor_y = cursor.y as f64;
-            // Check if cursor is in icon rectangle
-            let in_icon = cursor_x >= icon_rect.x0
-                && cursor_x < icon_rect.x1
-                && cursor_y >= icon_rect.y0
-                && cursor_y < icon_rect.y1;
-            // Check if cursor is in label rectangle
-            let in_label = cursor_x >= label_rect.x0
-                && cursor_x < label_rect.x1
-                && cursor_y >= label_rect.y0
-                && cursor_y < label_rect.y1;
-            in_icon || in_label
-        } else {
-            false
-        };
+        let is_hovered = self.hovered_item_index == Some(i);
 
         if is_hovered && !is_selected {
             let hover_color = palette.color(ColorRole::HoverHighlight);
