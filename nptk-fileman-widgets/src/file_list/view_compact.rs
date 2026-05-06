@@ -204,17 +204,8 @@ impl FileListContent {
                 let cache = self.thumbnail_cache.lock().expect("Failed to lock thumbnail_cache in view_compact");
                 cache.get(&thumbnail_cache_key).cloned()
             } {
-                use nptk::core::vg::peniko::{
-                    Blob, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
-                };
-                let image_data = ImageData {
-                    data: Blob::from(thumbnail_image.data),
-                    format: ImageFormat::Rgba8,
-                    alpha_type: ImageAlphaType::Alpha,
-                    width: thumbnail_image.width,
-                    height: thumbnail_image.height,
-                };
-                let image_brush = ImageBrush::new(image_data);
+                let image_brush =
+                    self.peniko_brush_for_thumbnail_image(&thumbnail_cache_key, &thumbnail_image);
                 let scale_x = icon_size as f64 / (thumbnail_image.width as f64);
                 let scale_y = icon_size as f64 / (thumbnail_image.height as f64);
                 let scale = scale_x.min(scale_y);
@@ -298,13 +289,18 @@ impl FileListContent {
             }
 
             if let Some(icon) = cached_icon {
+                let mut svg_guard = self
+                    .svg_scene_cache
+                    .lock()
+                    .expect("svg_scene_cache view_compact");
                 render_cached_icon(
                     graphics,
                     palette,
                     icon,
                     icon_rect,
                     &entry,
-                    &mut self.svg_scene_cache,
+                    &mut *svg_guard,
+                    Some((&self.icon_raster_peniko_cache, thumb_size)),
                 );
             } else {
                 render_fallback_icon(

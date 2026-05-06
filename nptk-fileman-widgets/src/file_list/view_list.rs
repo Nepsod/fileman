@@ -188,13 +188,18 @@ impl FileListContent {
             if let Some(icon) = cached_icon {
                 // Validate that the file still exists before using cached icon
                 if entry.path.exists() {
+                    let mut svg_guard = self
+                        .svg_scene_cache
+                        .lock()
+                        .expect("svg_scene_cache view_list");
                     render_cached_icon(
                         graphics,
                         palette,
                         icon,
                         icon_rect,
                         &entry,
-                        &mut self.svg_scene_cache,
+                        &mut *svg_guard,
+                        Some((&self.icon_raster_peniko_cache, icon_size as u32)),
                     );
                 } else {
                     // File was deleted, use fallback

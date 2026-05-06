@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use super::content::FileListContent;
 use nptk::prelude::LayoutContext;
-use nptk::widgets::file_icon::renderer::{render_image_icon, render_svg_icon_with_arc_cache};
+use nptk::widgets::file_icon::renderer::{
+    render_image_icon, render_image_icon_cached, render_svg_icon_with_arc_cache,
+};
 use nptk::widgets::tabs_container::{TabItem, TabsContainer};
 use chrono::{DateTime, Local};
 use humansize::{format_size, BINARY};
@@ -13,6 +15,7 @@ use nptk::core::layout::{Dimension, LayoutNode, LayoutStyle, StyleNode};
 use nptk::core::text_render::TextRenderContext;
 use nptk::core::vg::kurbo::{Affine, Rect, Vec2, Shape};
 use nptk::core::vg::peniko::{Blob, Brush, Fill, ImageAlphaType, ImageBrush, ImageData, ImageFormat};
+use std::collections::HashMap;
 use nptk::core::vgi::Graphics;
 use nptk::core::widget::{BoxedWidget, Widget, WidgetLayoutExt};
 use nptk::services::filesystem::entry::{FileEntry, FileMetadata, FileType};
@@ -25,6 +28,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use lru::LruCache;
+
 impl FileListContent {
     pub(super) fn build_properties_widget(
         data: PropertiesData,
@@ -36,7 +41,7 @@ impl FileListContent {
             >,
         >,
         svg_scene_cache: Arc<
-            Mutex<std::collections::HashMap<String, (nptk::core::vg::Scene, f64, f64)>>,
+            Mutex<LruCache<String, (nptk::core::vg::Scene, f64, f64)>>,
         >,
     ) -> BoxedWidget {
         let content = PropertiesContent::new(
@@ -141,13 +146,12 @@ impl FileListContent {
             rows,
             paths: paths.to_vec(),
         };
-        let svg_scene_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let props_widget = Self::build_properties_widget(
             data,
             self.icon_registry.clone(),
             self.thumbnail_service.clone(),
             self.icon_cache.clone(),
-            svg_scene_cache,
+            self.svg_scene_cache.clone(),
         );
         let pos = self
             .last_cursor
@@ -375,8 +379,10 @@ pub(super) struct PropertiesContent {
             std::collections::HashMap<(PathBuf, u32), Option<npio::service::icon::CachedIcon>>,
         >,
     >,
-    svg_scene_cache: Arc<Mutex<std::collections::HashMap<String, (nptk::core::vg::Scene, f64, f64)>>>,
+    svg_scene_cache: Arc<Mutex<LruCache<String, (nptk::core::vg::Scene, f64, f64)>>>,
     thumbnail_size: u32,
+    thumbnail_peniko_cache: Arc<Mutex<HashMap<(PathBuf, u32), ImageBrush>>>,
+    icon_raster_peniko_cache: Arc<Mutex<HashMap<(PathBuf, u32), ImageBrush>>>,
 }
 
 impl PropertiesContent {
@@ -390,7 +396,7 @@ impl PropertiesContent {
             >,
         >,
         svg_scene_cache: Arc<
-            Mutex<std::collections::HashMap<String, (nptk::core::vg::Scene, f64, f64)>>,
+            Mutex<LruCache<String, (nptk::core::vg::Scene, f64, f64)>>,
         >,
     ) -> Self {
         Self {
@@ -401,6 +407,8 @@ impl PropertiesContent {
             _icon_cache: icon_cache,
             svg_scene_cache,
             thumbnail_size: 64,
+            thumbnail_peniko_cache: Arc::new(Mutex::new(HashMap::new())),
+            icon_raster_peniko_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -555,14 +563,26 @@ impl Widget for PropertiesContent {
                                 .await
                         })
                     }) {
-                        let image_data = ImageData {
-                            data: Blob::from(thumbnail_image.data),
-                            format: ImageFormat::Rgba8,
-                            alpha_type: ImageAlphaType::Alpha,
-                            width: thumbnail_image.width,
-                            height: thumbnail_image.height,
+                        let peniko_key = (path.clone(), self.thumbnail_size);
+                        let image_brush = {
+                            let mut m = self
+                                .thumbnail_peniko_cache
+                                .lock()
+                                .expect("thumbnail_peniko_cache properties");
+                            if let Some(b) = m.get(&peniko_key) {
+                                b.clone()
+                            } else {
+                                let b = ImageBrush::new(ImageData {
+                                    data: Blob::from(thumbnail_image.data.clone()),
+                                    format: ImageFormat::Rgba8,
+                                    alpha_type: ImageAlphaType::Alpha,
+                                    width: thumbnail_image.width,
+                                    height: thumbnail_image.height,
+                                });
+                                m.insert(peniko_key.clone(), b.clone());
+                                b
+                            }
                         };
-                        let image_brush = ImageBrush::new(image_data);
                         let icon_x = icon_rect.x0;
                         let icon_y = icon_rect.y0;
                         let icon_size_f64 = icon_rect.width().min(icon_rect.height());
@@ -591,7 +611,16 @@ impl Widget for PropertiesContent {
                                 width,
                                 height,
                             } => {
-                                render_image_icon(graphics, data.as_ref(), width, height, icon_rect);
+                                let px_key = (entry.path.clone(), icon_size as u32);
+                                render_image_icon_cached(
+                                    graphics,
+                                    &px_key,
+                                    data.as_ref(),
+                                    width,
+                                    height,
+                                    icon_rect,
+                                    &self.icon_raster_peniko_cache,
+                                );
                                 icon_rendered = true;
                             },
                             npio::service::icon::CachedIcon::Svg(svg_source) => {

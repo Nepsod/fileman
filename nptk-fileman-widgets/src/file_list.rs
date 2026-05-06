@@ -40,6 +40,8 @@ pub mod types;
 mod content;
 
 use content::FileListContent;
+use lru::LruCache;
+use nptk::widgets::file_icon::renderer::new_svg_scene_lru;
 pub use types::*;
 
 /// Empty-area context menu (Paste, New Folder, New File, Refresh). Shared by `ItemView` and `FileListContent`.
@@ -200,7 +202,7 @@ pub struct FileList {
     pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
     cache_update_tx: tokio::sync::mpsc::Sender<()>,
     // cache_update_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
-    svg_scene_cache: Arc<Mutex<std::collections::HashMap<String, (nptk::core::vg::Scene, f64, f64)>>>,
+    svg_scene_cache: Arc<Mutex<LruCache<String, (nptk::core::vg::Scene, f64, f64)>>>,
     
     // Operation channel for keyboard shortcuts
     operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
@@ -317,8 +319,8 @@ impl FileList {
         // Create icon cache to be shared between FileList and properties dialog
         let icon_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
         
-        // Create SVG scene cache
-        let svg_scene_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        // Create SVG scene cache (shared LRU across list, item model, properties)
+        let svg_scene_cache = Arc::new(Mutex::new(new_svg_scene_lru()));
         
         // Create content widget
         let content = FileListContent::new(
@@ -336,6 +338,7 @@ impl FileList {
             cache_update_rx.clone(),
             pending_thumbnails.clone(),
             pending_icon_loads.clone(),
+            svg_scene_cache.clone(),
             cache_invalidate_rx,
             operation_tx.clone(),
             selection_change_tx_arc.clone(),
@@ -544,15 +547,13 @@ impl FileList {
             paths: paths.to_vec(),
         };
 
-        let svg_scene_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        
         // Create Properties Widget using FileListContent's static builder
         let props_widget = FileListContent::build_properties_widget(
             data,
             self.icon_registry.clone(),
             self.thumbnail_service.clone(),
             self.icon_cache.clone(),
-            svg_scene_cache,
+            self.svg_scene_cache.clone(),
         );
         
         let pos = (100, 100);

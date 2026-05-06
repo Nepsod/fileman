@@ -26,6 +26,10 @@ use nptk::widgets::scroll_container::{ScrollContainer, ScrollDirection};
 use npio::service::filesystem::mime_registry::MimeRegistry;
 use std::path::PathBuf;
 use humansize::{format_size, BINARY};
+use nptk::core::vg::peniko::{
+    Blob, ImageAlphaType, ImageBrush, ImageData, ImageFormat,
+};
+use lru::LruCache;
 use std::fs;
 
 use super::types::*;
@@ -63,6 +67,13 @@ pub(super) struct FileListContent {
     // Thumbnail cache: (path, size) -> ThumbnailImage
     pub(super) thumbnail_cache: Arc<Mutex<std::collections::HashMap<(PathBuf, u32), ThumbnailImage>>>,
 
+    /// Reusable GPU brush handles for thumbnails (avoid rebuilding Blob/ImageData each frame).
+    pub(super) thumbnail_peniko_cache: Arc<Mutex<std::collections::HashMap<(PathBuf, u32), ImageBrush>>>,
+
+    /// Reusable GPU brushes for raster file icons keyed by `(path, icon_px)`.
+    pub(super) icon_raster_peniko_cache:
+        Arc<Mutex<std::collections::HashMap<(PathBuf, u32), ImageBrush>>>,
+
     // Thumbnail event receiver
     pub(super) thumbnail_event_rx: Arc<Mutex<tokio::sync::broadcast::Receiver<ThumbnailEvent>>>,
 
@@ -94,10 +105,8 @@ pub(super) struct FileListContent {
     pub(super) icon_view_padding: f32,
     pub(super) icon_view_spacing: f32,
 
-    // SVG Scene cache to avoid re-parsing SVGs every frame
-    // Key: SVG source string (or hash of it)
-    // Value: (Scene, width, height)
-    pub(super) svg_scene_cache: std::collections::HashMap<String, (nptk::core::vg::Scene, f64, f64)>,
+    /// Shared LRU of parsed SVG scenes (same `Arc` as [`FileList`](crate::file_list::FileList) / item model).
+    pub(super) svg_scene_cache: Arc<Mutex<LruCache<String, (nptk::core::vg::Scene, f64, f64)>>>,
     pub(super) mime_registry: MimeRegistry,
     pub(super) pending_action: Arc<Mutex<Option<PendingAction>>>,
     pub(super) operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
@@ -123,8 +132,6 @@ impl FileListContent {
     const MAX_ICON_CACHE_SIZE: usize = 1000;
     const MAX_THUMBNAIL_CACHE_SIZE: usize = 500;
     const MAX_LAYOUT_CACHE_SIZE: usize = 2000;
-    const MAX_SVG_SCENE_CACHE_SIZE: usize = 500;
-
     // Maximum number of concurrent async tasks (icon/thumbnail loading)
     const MAX_CONCURRENT_ASYNC_TASKS: usize = 50;
 
@@ -143,6 +150,7 @@ impl FileListContent {
         cache_update_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
         pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
         pending_icon_loads: Arc<Mutex<HashSet<(PathBuf, u32)>>>,
+        svg_scene_cache: Arc<Mutex<LruCache<String, (nptk::core::vg::Scene, f64, f64)>>>,
         cache_invalidate_rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
         operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
         selection_change_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
@@ -166,6 +174,8 @@ impl FileListContent {
             pending_thumbnails,
             pending_icon_loads,
             thumbnail_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            thumbnail_peniko_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            icon_raster_peniko_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             thumbnail_event_rx: Arc::new(Mutex::new(thumbnail_event_rx)),
             update_manager: Arc::new(Mutex::new(None)),
             cache_update_tx,
@@ -178,7 +188,7 @@ impl FileListContent {
             last_layout_width: 1000.0,
             icon_view_padding: 2.0,
             icon_view_spacing: 22.0,
-            svg_scene_cache: std::collections::HashMap::new(),
+            svg_scene_cache,
             mime_registry: MimeRegistry::load_default(),
             pending_action: Arc::new(Mutex::new(None)),
             operation_tx,
@@ -198,6 +208,29 @@ impl FileListContent {
         self
     }
 
+    pub(super) fn peniko_brush_for_thumbnail_image(
+        &self,
+        key: &(PathBuf, u32),
+        img: &ThumbnailImage,
+    ) -> ImageBrush {
+        let mut cache = self
+            .thumbnail_peniko_cache
+            .lock()
+            .expect("Failed to lock thumbnail_peniko_cache");
+        if let Some(b) = cache.get(key) {
+            return b.clone();
+        }
+        let brush = ImageBrush::new(ImageData {
+            data: Blob::from(img.data.clone()),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width: img.width,
+            height: img.height,
+        });
+        cache.insert(key.clone(), brush.clone());
+        brush
+    }
+
     /// Evict entries from icon cache if it exceeds the limit
     /// 
     /// NOTE: This is NOT a true LRU (Least Recently Used) eviction strategy.
@@ -211,8 +244,14 @@ impl FileListContent {
             // NOTE: HashMap iteration order is not guaranteed, so this is not true LRU
             let to_remove = cache.len() - Self::MAX_ICON_CACHE_SIZE;
             let keys: Vec<_> = cache.keys().take(to_remove).cloned().collect();
-            for key in keys {
-                cache.remove(&key);
+            for key in &keys {
+                cache.remove(key);
+            }
+            drop(cache);
+            if let Ok(mut peniko) = self.icon_raster_peniko_cache.lock() {
+                for key in &keys {
+                    peniko.remove(key);
+                }
             }
             log::debug!("Evicted {} entries from icon cache", to_remove);
         }
@@ -229,8 +268,14 @@ impl FileListContent {
             // NOTE: HashMap iteration order is not guaranteed, so this is not true LRU
             let to_remove = cache.len() - Self::MAX_THUMBNAIL_CACHE_SIZE;
             let keys: Vec<_> = cache.keys().take(to_remove).cloned().collect();
-            for key in keys {
-                cache.remove(&key);
+            for key in &keys {
+                cache.remove(key);
+            }
+            drop(cache);
+            if let Ok(mut peniko) = self.thumbnail_peniko_cache.lock() {
+                for key in &keys {
+                    peniko.remove(key);
+                }
             }
             log::debug!("Evicted {} entries from thumbnail cache", to_remove);
         }
@@ -257,23 +302,6 @@ impl FileListContent {
         }
     }
 
-    /// Evict entries from SVG scene cache if it exceeds the limit
-    /// 
-    /// NOTE: This is NOT a true LRU (Least Recently Used) eviction strategy.
-    /// See evict_icon_cache_if_needed() for details.
-    fn evict_svg_scene_cache_if_needed(&mut self) {
-        if self.svg_scene_cache.len() > Self::MAX_SVG_SCENE_CACHE_SIZE {
-            // Simple eviction: remove oldest entries (first N entries)
-            // NOTE: HashMap iteration order is not guaranteed, so this is not true LRU
-            let to_remove = self.svg_scene_cache.len() - Self::MAX_SVG_SCENE_CACHE_SIZE;
-            let keys: Vec<_> = self.svg_scene_cache.keys().take(to_remove).cloned().collect();
-            for key in keys {
-                self.svg_scene_cache.remove(&key);
-            }
-            log::debug!("Evicted {} entries from SVG scene cache", to_remove);
-        }
-    }
-
     /// Invalidate all caches for a given path (used when files are deleted or moved)
     /// 
     /// This method is called automatically when FileSystemEvent::EntryRemoved is received,
@@ -296,6 +324,22 @@ impl FileListContent {
         // Remove from thumbnail_cache
         {
             let mut cache = self.thumbnail_cache.lock().expect("Failed to lock thumbnail_cache for invalidation");
+            cache.retain(|(key_path, _), _| key_path != path);
+        }
+
+        {
+            let mut cache = self
+                .thumbnail_peniko_cache
+                .lock()
+                .expect("Failed to lock thumbnail_peniko_cache for invalidation");
+            cache.retain(|(key_path, _), _| key_path != path);
+        }
+
+        {
+            let mut cache = self
+                .icon_raster_peniko_cache
+                .lock()
+                .expect("Failed to lock icon_raster_peniko_cache for invalidation");
             cache.retain(|(key_path, _), _| key_path != path);
         }
         
@@ -682,7 +726,6 @@ impl Widget for FileListContent {
             self.evict_icon_cache_if_needed();
             self.evict_thumbnail_cache_if_needed();
             self.evict_layout_cache_if_needed();
-            self.evict_svg_scene_cache_if_needed();
         }
 
         // Poll thumbnail events

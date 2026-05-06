@@ -4,6 +4,8 @@ use npio::file::local::LocalFile;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::collections::{HashMap, HashSet};
+
+use lru::LruCache;
 use std::path::PathBuf;
 use nptk::widgets::item_view::IconData;
 use nptk::core::model::{ModelData, ItemRole, Orientation, SortOrder, ItemModel};
@@ -30,7 +32,7 @@ pub struct FileSystemItemModel {
     icon_registry: Arc<IconRegistry>,
     thumbnail_service: Arc<ThumbnailService>,
     icon_cache: Arc<Mutex<HashMap<(PathBuf, u32), Option<CachedIcon>>>>,
-    svg_scene_cache: Arc<Mutex<HashMap<String, (nptk::core::vg::Scene, f64, f64)>>>,
+    svg_scene_cache: Arc<Mutex<LruCache<String, (nptk::core::vg::Scene, f64, f64)>>>,
     icon_size: nptk::core::signal::MaybeSignal<f32>,
     pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
     size_display_cache: Arc<Mutex<HashMap<(PathBuf, u64), String>>>,
@@ -46,7 +48,7 @@ impl FileSystemItemModel {
         icon_registry: Arc<IconRegistry>,
         thumbnail_service: Arc<ThumbnailService>,
         icon_cache: Arc<Mutex<HashMap<(PathBuf, u32), Option<CachedIcon>>>>,
-        svg_scene_cache: Arc<Mutex<HashMap<String, (nptk::core::vg::Scene, f64, f64)>>>,
+        svg_scene_cache: Arc<Mutex<LruCache<String, (nptk::core::vg::Scene, f64, f64)>>>,
         pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
         cache_update_tx: tokio::sync::mpsc::Sender<()>,
     ) -> Self {
@@ -175,32 +177,32 @@ impl ItemModel for FileSystemItemModel {
                                         .fetch_add(1, Ordering::Relaxed);
                                     return placeholder();
                                 };
-                                let (scene, width, height) = if let Some((s, w, h)) = cache.get(svg_source.as_str()) {
-                                    (s.clone(), *w, *h)
-                                } else {
-                                    use vello_svg::usvg::{
-                                        ImageRendering, Options, ShapeRendering, TextRendering, Tree,
-                                    };
-                                    if let Ok(tree) = Tree::from_str(
-                                        &svg_source,
-                                        &Options {
-                                            shape_rendering: ShapeRendering::GeometricPrecision,
-                                            text_rendering: TextRendering::OptimizeLegibility,
-                                            image_rendering: ImageRendering::OptimizeSpeed,
-                                            ..Default::default()
-                                        },
-                                    ) {
-                                        let scene = vello_svg::render_tree(&tree);
-                                        let size = tree.size();
-                                        let w = size.width() as f64;
-                                        let h = size.height() as f64;
-                                        cache.insert(svg_source.to_string(), (scene.clone(), w, h));
-                                        (scene, w, h)
+                                let (scene, width, height) =
+                                    if let Some((s, w, h)) = cache.get(svg_source.as_str()) {
+                                        (s.clone(), *w, *h)
                                     } else {
-                                        // Invalid SVG
-                                        return ModelData::None;
-                                    }
-                                };
+                                        use vello_svg::usvg::{
+                                            ImageRendering, Options, ShapeRendering, TextRendering, Tree,
+                                        };
+                                        if let Ok(tree) = Tree::from_str(
+                                            &svg_source,
+                                            &Options {
+                                                shape_rendering: ShapeRendering::GeometricPrecision,
+                                                text_rendering: TextRendering::OptimizeLegibility,
+                                                image_rendering: ImageRendering::OptimizeSpeed,
+                                                ..Default::default()
+                                            },
+                                        ) {
+                                            let scene = vello_svg::render_tree(&tree);
+                                            let size = tree.size();
+                                            let w = size.width() as f64;
+                                            let h = size.height() as f64;
+                                            cache.put(svg_source.to_string(), (scene.clone(), w, h));
+                                            (scene, w, h)
+                                        } else {
+                                            return ModelData::None;
+                                        }
+                                    };
                                 ModelData::Custom(Arc::new(IconData::Scene(scene, width, height)))
                             },
                             CachedIcon::Path(_) => {
