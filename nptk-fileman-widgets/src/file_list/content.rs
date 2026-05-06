@@ -57,6 +57,9 @@ pub(super) struct FileListContent {
     // Track pending thumbnail requests to avoid duplicate requests
     pub(super) pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
 
+    /// In-flight icon loads keyed by `(path, icon_px)` to avoid duplicate spawns per frame.
+    pub(super) pending_icon_loads: Arc<Mutex<HashSet<(PathBuf, u32)>>>,
+
     // Thumbnail cache: (path, size) -> ThumbnailImage
     pub(super) thumbnail_cache: Arc<Mutex<std::collections::HashMap<(PathBuf, u32), ThumbnailImage>>>,
 
@@ -139,6 +142,7 @@ impl FileListContent {
         cache_update_tx: tokio::sync::mpsc::Sender<()>,
         cache_update_rx: Arc<Mutex<tokio::sync::mpsc::Receiver<()>>>,
         pending_thumbnails: Arc<Mutex<HashSet<PathBuf>>>,
+        pending_icon_loads: Arc<Mutex<HashSet<(PathBuf, u32)>>>,
         cache_invalidate_rx: tokio::sync::mpsc::UnboundedReceiver<PathBuf>,
         operation_tx: Option<tokio::sync::mpsc::UnboundedSender<FileListOperation>>,
         selection_change_tx: Option<Arc<tokio::sync::mpsc::UnboundedSender<Vec<PathBuf>>>>,
@@ -160,6 +164,7 @@ impl FileListContent {
             anchor_index: None,
             icon_cache,
             pending_thumbnails,
+            pending_icon_loads,
             thumbnail_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             thumbnail_event_rx: Arc::new(Mutex::new(thumbnail_event_rx)),
             update_manager: Arc::new(Mutex::new(None)),

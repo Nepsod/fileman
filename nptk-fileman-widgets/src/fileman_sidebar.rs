@@ -79,6 +79,7 @@ pub struct FilemanSidebar {
     layout_style: MaybeSignal<LayoutStyle>,
     current_path: StateSignal<PathBuf>,
     last_path: Option<PathBuf>,
+    signals_hooked: bool,
 }
 
 impl FilemanSidebar {
@@ -128,6 +129,7 @@ impl FilemanSidebar {
             .into(),
             current_path: StateSignal::new(PathBuf::new()),
             last_path: None,
+            signals_hooked: false,
         }
     }
 
@@ -608,8 +610,10 @@ impl Widget for FilemanSidebar {
         context: AppContext,
         info: &mut AppInfo,
     ) -> Update {
-        // Hook signals
-        context.hook_signal(&mut self.current_path);
+        if !self.signals_hooked {
+            context.hook_signal(&mut self.current_path);
+            self.signals_hooked = true;
+        }
 
         // Handle navigation events from channel
         // Note: The receiver should be taken and polled externally, but we can check here too

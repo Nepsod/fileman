@@ -301,6 +301,7 @@ impl FileList {
 
         // Create pending thumbnails set
         let pending_thumbnails = Arc::new(Mutex::new(HashSet::new()));
+        let pending_icon_loads = Arc::new(Mutex::new(HashSet::new()));
         
         // Create channel for cache invalidation requests
         let (cache_invalidate_tx, cache_invalidate_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -334,6 +335,7 @@ impl FileList {
             cache_update_tx.clone(),
             cache_update_rx.clone(),
             pending_thumbnails.clone(),
+            pending_icon_loads.clone(),
             cache_invalidate_rx,
             operation_tx.clone(),
             selection_change_tx_arc.clone(),

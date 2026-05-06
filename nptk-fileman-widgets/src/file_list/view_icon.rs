@@ -313,27 +313,40 @@ impl FileListContent {
         
         // If icon not cached, request it asynchronously (non-blocking)
         if cached_icon.is_none() {
-            let cache_clone = self.icon_cache.clone();
-            let registry_clone = self.icon_registry.clone();
-            let entry_clone = entry.clone();
-            let cache_key_clone = cache_key.clone();
-            let cache_update_tx_clone = self.cache_update_tx.clone();
-            let semaphore_clone = self.async_task_semaphore.clone();
-            tokio::spawn(async move {
-                // Acquire semaphore permit to limit concurrent tasks
-                let _permit = semaphore_clone.acquire().await.ok();
+            let spawn_icon_load = {
+                let mut pending = self
+                    .pending_icon_loads
+                    .lock()
+                    .expect("Failed to lock pending_icon_loads in view_icon");
+                pending.insert(cache_key.clone())
+            };
+            if spawn_icon_load {
+                let pending_icon_loads = self.pending_icon_loads.clone();
+                let cache_clone = self.icon_cache.clone();
+                let registry_clone = self.icon_registry.clone();
+                let entry_clone = entry.clone();
+                let cache_key_clone = cache_key.clone();
+                let cache_update_tx_clone = self.cache_update_tx.clone();
+                let semaphore_clone = self.async_task_semaphore.clone();
+                tokio::spawn(async move {
+                    let _permit = semaphore_clone.acquire().await.ok();
                     let uri = file_entry_to_uri(&entry_clone);
                     if let Ok(file) = get_file_for_uri(&uri) {
                         let icon = registry_clone.get_file_icon(&*file, icon_size).await;
-                        let mut cache = cache_clone.lock().expect("Failed to lock icon_cache in async task (view_icon)");
-                    cache.insert(cache_key_clone, icon);
-                    // Notify that cache was updated to trigger redraw
-                    if cache_update_tx_clone.try_send(()).is_err() {
-                        log::debug!("Cache update channel full, skipping notification");
+                        let mut cache = cache_clone.lock().expect(
+                            "Failed to lock icon_cache in async task (view_icon)",
+                        );
+                        cache.insert(cache_key_clone.clone(), icon);
+                        if cache_update_tx_clone.try_send(()).is_err() {
+                            log::debug!("Cache update channel full, skipping notification");
+                        }
                     }
-                }
-                // Permit is automatically released when dropped
-            });
+                    pending_icon_loads
+                        .lock()
+                        .expect("pending_icon_loads unlock (view_icon)")
+                        .remove(&cache_key_clone);
+                });
+            }
         }
 
         if let Some(icon) = cached_icon {

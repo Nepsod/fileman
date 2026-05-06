@@ -509,15 +509,23 @@ impl Widget for ToolbarWrapper {
 
 
 
-        // Update button states reactively from navigation
+        // Update button states reactively from navigation (avoid notifying hooks every frame)
         if let Ok(nav) = self.navigation.lock() {
-            self.can_go_back.set(nav.can_go_back());
-            self.can_go_forward.set(nav.can_go_forward());
+            let back_ok = nav.can_go_back();
+            if *self.can_go_back.get() != back_ok {
+                self.can_go_back.set(back_ok);
+            }
+            let fwd_ok = nav.can_go_forward();
+            if *self.can_go_forward.get() != fwd_ok {
+                self.can_go_forward.set(fwd_ok);
+            }
         }
 
-        // Update has_selection signal reactively from selected_paths_signal
         let selected_paths = (*self.selected_paths_signal.get()).clone();
-        self.has_selection.set(!selected_paths.is_empty());
+        let selection_nonempty = !selected_paths.is_empty();
+        if *self.has_selection.get() != selection_nonempty {
+            self.has_selection.set(selection_nonempty);
+        }
 
         // Update inner toolbar
         update |= self.inner.update(layout, context, info).await;
