@@ -129,6 +129,7 @@ impl FileListContent {
                                 app_id: Some(app_id_cloned.clone()),
                                 properties: false,
                                 delete: false,
+                                                    delete_permanent: false,
                             });
                         }
                         Update::DRAW

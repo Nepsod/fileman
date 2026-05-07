@@ -1054,6 +1054,7 @@ impl Widget for FileListContent {
                                                     app_id: None,
                                                     properties: false,
                                                     delete: false,
+                                                    delete_permanent: false,
                                                 });
                                             }
                                             Update::DRAW
@@ -1087,8 +1088,29 @@ impl Widget for FileListContent {
                                                 app_id: None,
                                                 properties: false,
                                                 delete: true,
+                                                delete_permanent: false,
                                             });
                                             log::warn!("====== pending_action.delete set to true ======");
+                                        }
+                                        Update::DRAW
+                                    }),
+                            );
+
+                            let pending_delete_permanent = self.pending_action.clone();
+                            let delete_permanent_paths = paths_for_action.clone();
+                            core_items.push(
+                                MenuItem::new(MenuCommand::Custom(0x2007), "Delete Permanently")
+                                    .with_action(move || {
+                                        if let Ok(mut pending_lock) =
+                                            pending_delete_permanent.lock()
+                                        {
+                                            *pending_lock = Some(PendingAction {
+                                                paths: delete_permanent_paths.clone(),
+                                                app_id: None,
+                                                properties: false,
+                                                delete: false,
+                                                delete_permanent: true,
+                                            });
                                         }
                                         Update::DRAW
                                     }),
@@ -1107,6 +1129,7 @@ impl Widget for FileListContent {
                                                 app_id: None,
                                                 properties: true,
                                                 delete: false,
+                                                delete_permanent: false,
                                             });
                                             println!("DEBUG: Properties action set in pending_action");
                                         }
@@ -1177,6 +1200,12 @@ impl Widget for FileListContent {
                                                 // Clear selection state when navigating to new directory
                                                 self.clear_selection_state(&context);
                                                 update.insert(Update::LAYOUT);
+                                            } else {
+                                                FileListContent::launch_path(
+                                                    self.mime_registry.clone(),
+                                                    target_path.clone(),
+                                                );
+                                                update.insert(Update::DRAW);
                                             }
                                         }
                                     }
@@ -1279,12 +1308,27 @@ impl Widget for FileListContent {
             if let Ok(mut pending) = self.pending_action.lock() {
                 if let Some(action) = pending.take() {
                     // Action was set by a menu item click during this menu session
-                    println!("DEBUG: Processing pending action - properties: {}, delete: {}, paths: {}", 
-                             action.properties, action.delete, action.paths.len());
-                    log::warn!("====== MENU CLOSED - PROCESSING PENDING ACTION: delete={}, properties={}, paths={} ======", 
-                              action.delete, action.properties, action.paths.len());
+                    println!(
+                        "DEBUG: Processing pending action - properties: {}, delete: {}, delete_permanent: {}, paths: {}",
+                        action.properties,
+                        action.delete,
+                        action.delete_permanent,
+                        action.paths.len()
+                    );
+                    log::warn!(
+                        "====== MENU CLOSED - PROCESSING PENDING ACTION: delete={}, delete_permanent={}, properties={}, paths={} ======",
+                        action.delete,
+                        action.delete_permanent,
+                        action.properties,
+                        action.paths.len()
+                    );
                     // Action was set - process it immediately
-                    if action.delete {
+                    if action.delete_permanent {
+                        if let Some(ref op_tx) = self.operation_tx {
+                            let _ = op_tx.send(FileListOperation::DeletePermanent(action.paths.clone()));
+                        }
+                        update.insert(Update::DRAW);
+                    } else if action.delete {
                         if let Some(ref op_tx) = self.operation_tx {
                             let _ = op_tx.send(FileListOperation::DeleteToTrash(action.paths.clone()));
                         }

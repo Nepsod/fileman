@@ -616,6 +616,7 @@ impl FileList {
             // Activation handling
             let entries_act = self.entries.clone();
             let current_path = self.current_path.clone();
+            let mime_registry = self.mime_registry.clone();
             let _fs_model = self.fs_model.clone();
             
             // Clone entries signal for callbacks
@@ -636,6 +637,9 @@ impl FileList {
                              // Just set the path - the signal change will trigger refresh elsewhere
                              current_path.set(entry.path.clone());
                              return Update::LAYOUT | Update::DRAW;
+                        } else {
+                            launch_default_app(mime_registry.clone(), entry.path.clone());
+                            return Update::DRAW;
                         }
                     }
                     Update::empty()
@@ -1395,7 +1399,7 @@ impl Widget for FileList {
     }
 }
 
-const MAX_RECURSIVE_SEARCH_DEPTH: u32 = 4;
+const MAX_RECURSIVE_SEARCH_DEPTH: u32 = u32::MAX;
 
 fn recursive_search_entries(
     root: PathBuf,

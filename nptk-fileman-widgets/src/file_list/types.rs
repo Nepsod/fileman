@@ -62,5 +62,6 @@ pub(crate) struct PendingAction {
     pub paths: Vec<PathBuf>,
     pub app_id: Option<String>,
     pub properties: bool,
-    pub delete: bool, // If true, this is a delete action
+    pub delete: bool, // If true, this is a trash action
+    pub delete_permanent: bool, // If true, this is a permanent delete action
 }

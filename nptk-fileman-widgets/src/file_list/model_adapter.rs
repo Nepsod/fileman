@@ -1,4 +1,5 @@
-use npio::service::icon::{IconRegistry, CachedIcon};
+use super::content::FileListContent;
+use npio::service::icon::{CachedIcon, IconRegistry};
 use npio::{ThumbnailService, ThumbnailSize as NpioThumbnailSize};
 use npio::file::local::LocalFile;
 use std::sync::{Arc, Mutex};
@@ -130,7 +131,9 @@ impl ItemModel for FileSystemItemModel {
                     nptk::services::filesystem::entry::FileType::Symlink => "Symlink",
                     nptk::services::filesystem::entry::FileType::Other => "Other",
                 }.to_string()),
-                3 => ModelData::String("Unknown".to_string()), // Date not in FileEntry yet?
+                3 => ModelData::String(FileListContent::format_system_time(
+                    entry.metadata.modified,
+                )),
                 _ => ModelData::None,
             },
             ItemRole::Icon => {
