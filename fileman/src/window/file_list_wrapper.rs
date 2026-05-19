@@ -2,6 +2,12 @@ use super::file_operation::FileOperationRequest;
 use async_trait::async_trait;
 use crate::config::DeletePolicy;
 use crate::operations;
+use crate::operations::jobs::{
+    self, ConflictResolution, PasteJobSettings,
+};
+use crate::operations::undo::UndoStack;
+use crate::window::tabs::TabModel;
+use std::sync::atomic::AtomicBool;
 use nalgebra::Vector2;
 use nptk::core::menu::unified::{MenuItem, MenuTemplate};
 use nptk::core::menu::MenuCommand;
@@ -49,6 +55,10 @@ pub(crate) struct FileListWrapper {
     terminal_command: Arc<Mutex<Option<String>>>,
     config_path: Option<PathBuf>,
     show_hidden_files_signal: StateSignal<bool>,
+    /// Reversible cut/paste moves in this window.
+    undo_stack: Arc<Mutex<UndoStack>>,
+    /// Multi-tab folder roots (see [`TabModel`]).
+    tabs: Arc<Mutex<TabModel>>,
 }
 
 impl FileListWrapper {
@@ -69,7 +79,9 @@ impl FileListWrapper {
         delete_policy: Arc<Mutex<DeletePolicy>>,
         terminal_command: Arc<Mutex<Option<String>>>,
         config_path: Option<PathBuf>,
+        tabs: Arc<Mutex<TabModel>>,
     ) -> Self {
+        let undo_stack = Arc::new(Mutex::new(UndoStack::new(256)));
         // Create channel for FileList operations
         let (file_list_op_tx, file_list_op_rx) = mpsc::unbounded_channel::<FileListOperation>();
         
@@ -297,6 +309,8 @@ impl FileListWrapper {
             terminal_command,
             config_path,
             show_hidden_files_signal,
+            undo_stack,
+            tabs,
         }
     }
 
@@ -307,6 +321,25 @@ impl FileListWrapper {
         if let Some(sz) = fileman.initial_icon_size() {
             self.file_list.set_icon_size(sz);
         }
+    }
+
+    fn zoom_in(&mut self) -> Update {
+        let current = *self.file_list.icon_size_signal().get();
+        let next = current.saturating_add(16).min(256);
+        self.file_list.set_icon_size(next);
+        Update::DRAW
+    }
+
+    fn zoom_out(&mut self) -> Update {
+        let current = *self.file_list.icon_size_signal().get();
+        let next = current.saturating_sub(16).max(16);
+        self.file_list.set_icon_size(next);
+        Update::DRAW
+    }
+
+    fn zoom_reset(&mut self) -> Update {
+        self.file_list.set_icon_size(48);
+        Update::DRAW
     }
 
     /// Paste files from clipboard to current directory
@@ -335,100 +368,52 @@ impl FileListWrapper {
         };
 
         if let Some((custom_paths, is_cut)) = clipboard_content {
-             // Perform Paste Operation
-             // For now, we'll implement a simple copy/move logic here or delegate to a background task
-             // Since file operations can be slow, ideally we should spawn a task.
-             // But FileListWrapper update is sync.
-             // We can use tokio::spawn if we are in async context, but Widget::update is async, so we can spawn.
-             // Wait, Widget::update is async in our codebase? Yes.
-             
-             let status_tx = self.status_tx.clone();
-             
-             tokio::spawn(async move {
-                 let action = if is_cut { "Moving" } else { "Copying" };
-                 if let Some(tx) = &status_tx {
-                     let _ = tx.send(format!("{} {} files...", action, custom_paths.len()));
-                 }
-                 
-                 for from_path in custom_paths {
-                     if let Some(file_name) = from_path.file_name() {
-                         let mut to_path = current_path.join(file_name);
-                         
-                         // Simple collision avoidance: append _copy if exists
-                         if to_path.exists() {
-                             // Basic logic: stem + _copy + ext
-                             // This is a naive implementation
-                             let file_stem = to_path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
-                             let extension = to_path.extension().map(|s| s.to_string_lossy()).unwrap_or_default();
-                             
-                             let new_name = if extension.is_empty() {
-                                 format!("{}_copy", file_stem)
-                             } else {
-                                 format!("{}_copy.{}", file_stem, extension)
-                             };
-                             to_path = current_path.join(new_name);
-                         }
-                         
-                         let result = if is_cut {
-                             match tokio::fs::rename(&from_path, &to_path).await {
-                                 Ok(_) => Ok(()),
-                                 Err(e) => {
-                                     // Fallback to copy + delete for cross-device moves or other rename failures
-                                     // 18 = EXDEV (Cross-device link)
-                                     if e.raw_os_error() == Some(18) {
-                                         log::info!("Cross-device move detected, falling back to copy+delete");
-                                         if from_path.is_dir() {
-                                             match operations::copy_recursive(from_path.clone(), to_path.clone()).await {
-                                                 Ok(_) => operations::delete_path(from_path.clone()).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-                                                 Err(copy_err) => Err(copy_err),
-                                             }
-                                         } else {
-                                             match tokio::fs::copy(&from_path, &to_path).await {
-                                                 Ok(_) => operations::delete_path(from_path.clone()).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)),
-                                                 Err(copy_err) => Err(copy_err),
-                                             }
-                                         }
-                                     } else {
-                                         Err(e)
-                                     }
-                                 }
-                             }
-                         } else {
-                             // tokio::fs::copy only copies contents, not recursively for dirs.
-                             // For text entries (files), copy works. For dirs, we need recursive copy.
-                             // For MVP validation, we'll support files only or use a simple recursive copy helper later.
-                             // Let's assume files for now or use `fs_extra` if available.
-                             // Implementing simple file copy:
-                              if from_path.is_dir() {
-                                  operations::copy_recursive(from_path.clone(), to_path.clone()).await
-                              } else {
-                                 tokio::fs::copy(&from_path, &to_path).await.map(|_| ())
-                             }
-                         };
-                         
-                         match result {
-                             Ok(_) => {
-                                 log::info!("{} {:?} to {:?}", action, from_path, to_path);
-                             }
-                             Err(e) => {
-                                 log::error!("Failed to {} {:?}: {}", action.to_lowercase(), from_path, e);
-                             }
-                         }
-                     }
-                 }
-                 
-                 if let Some(tx) = &status_tx {
-                     let _ = tx.send(format!("{} complete", action));
-                 }
-             });
-             
-             // We spawned a task, but we might want to refresh the file list eventually.
-             // The file list watches basic changes via notify (if implemented) or we can manually refresh using FileListOperation::Refresh
-             // We don't have direct access to send Refresh command here easily without self.file_list_operation_rx (which is receiver).
-             // Actually we have `file_list` struct, we can call methods on it if exposed.
-             // For now, let's rely on manual refresh or file system watcher if present.
-             // Wait, `FileList` has `refresh()` method but it's internal logic mostly.
-             // We can trigger a layout update which might not re-read files unless we force it.
+            let status_tx = self.status_tx.clone();
+            let undo_stack = self.undo_stack.clone();
+            let job_id = jobs::next_job_id();
+            let cancel = Arc::new(AtomicBool::new(false));
+
+            tokio::spawn(async move {
+                let action = if is_cut { "Moving" } else { "Copying" };
+                if let Some(tx) = &status_tx {
+                    let _ = tx.send(format!(
+                        "{} {} files (job {})...",
+                        action,
+                        custom_paths.len(),
+                        job_id
+                    ));
+                }
+
+                let undo_sink = if is_cut { Some(undo_stack) } else { None };
+
+                let result = jobs::run_paste_batch(
+                    job_id,
+                    custom_paths,
+                    current_path,
+                    is_cut,
+                    PasteJobSettings {
+                        conflict: ConflictResolution::KeepBoth,
+                    },
+                    cancel,
+                    None,
+                    undo_sink,
+                )
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        if let Some(tx) = &status_tx {
+                            let _ = tx.send(format!("{} complete (job {})", action, job_id));
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("Paste job {}: {}", job_id, e);
+                        if let Some(tx) = &status_tx {
+                            let _ = tx.send(format!("Paste failed: {}", e));
+                        }
+                    }
+                }
+            });
         }
         
         Update::empty()
@@ -809,6 +794,9 @@ impl FileListWrapper {
         let file_list_path = (*self.file_list_path_signal.get()).clone();
         if nav_path != file_list_path {
             self.file_list.set_path(nav_path.clone());
+            if let Ok(mut t) = self.tabs.lock() {
+                t.replace_active_path(nav_path.clone());
+            }
             update.insert(Update::LAYOUT | Update::DRAW);
         }
         update
@@ -1146,6 +1134,153 @@ impl FileListWrapper {
                     }
                     FileOperationRequest::ShowSettings => {
                         pending_show_settings = true;
+                    }
+                    FileOperationRequest::Undo => {
+                        let r: Result<(), String> = match self.undo_stack.lock() {
+                            Ok(mut g) => g.undo_one(),
+                            Err(_) => Err("Undo: lock poisoned".to_string()),
+                        };
+                        match r {
+                            Ok(()) => {
+                                if let Some(ref tx) = self.status_tx {
+                                    let _ = tx.send("Undo: done".to_string());
+                                }
+                                update.insert(self.refresh_file_list_at_current_path());
+                            }
+                            Err(e) => {
+                                if let Some(ref tx) = self.status_tx {
+                                    let _ = tx.send(format!("Undo: {}", e));
+                                }
+                            }
+                        }
+                    }
+                    FileOperationRequest::Redo => {
+                        let r: Result<(), String> = match self.undo_stack.lock() {
+                            Ok(mut g) => g.redo_one(),
+                            Err(_) => Err("Redo: lock poisoned".to_string()),
+                        };
+                        match r {
+                            Ok(()) => {
+                                if let Some(ref tx) = self.status_tx {
+                                    let _ = tx.send("Redo: done".to_string());
+                                }
+                                update.insert(self.refresh_file_list_at_current_path());
+                            }
+                            Err(e) => {
+                                if let Some(ref tx) = self.status_tx {
+                                    let _ = tx.send(format!("Redo: {}", e));
+                                }
+                            }
+                        }
+                    }
+                    FileOperationRequest::NewTab => {
+                        let home = std::env::var("HOME")
+                            .ok()
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| PathBuf::from("/"));
+                        if let Ok(mut t) = self.tabs.lock() {
+                            t.new_tab(home.clone());
+                        }
+                        if let Ok(mut nav) = self.navigation.lock() {
+                            nav.navigate_to(home);
+                        }
+                        update.insert(Update::LAYOUT | Update::DRAW);
+                    }
+                    FileOperationRequest::NewWindow => {
+                        let cwd = self.file_list.get_current_path();
+                        let exe = std::env::current_exe();
+                        match exe {
+                            Ok(exe_path) => {
+                                let spawn_res = std::process::Command::new(exe_path)
+                                    .arg(cwd.to_string_lossy().to_string())
+                                    .spawn();
+                                match spawn_res {
+                                    Ok(_) => {
+                                        if let Some(ref tx) = self.status_tx {
+                                            let _ = tx.send("Opened a new window".to_string());
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if let Some(ref tx) = self.status_tx {
+                                            let _ = tx.send(format!("New window failed: {}", e));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(ref tx) = self.status_tx {
+                                    let _ = tx.send(format!("New window failed: {}", e));
+                                }
+                            }
+                        }
+                    }
+                    FileOperationRequest::CloseTab => {
+                        let next_path = match self.tabs.lock() {
+                            Ok(mut t) => {
+                                if t.close_active() {
+                                    t.active_path()
+                                } else {
+                                    if let Some(ref tx) = self.status_tx {
+                                        let _ = tx.send("Cannot close the last tab".to_string());
+                                    }
+                                    None
+                                }
+                            }
+                            Err(_) => None,
+                        };
+                        if let Some(p) = next_path {
+                            if let Ok(mut nav) = self.navigation.lock() {
+                                nav.navigate_to(p);
+                            }
+                            update.insert(Update::LAYOUT | Update::DRAW);
+                        }
+                    }
+                    FileOperationRequest::SwitchTab(index) => {
+                        let next_path = match self.tabs.lock() {
+                            Ok(mut t) => {
+                                if t.set_active(index) {
+                                    t.active_path()
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(_) => None,
+                        };
+                        if let Some(p) = next_path {
+                            if let Ok(mut nav) = self.navigation.lock() {
+                                nav.navigate_to(p);
+                            }
+                            update.insert(Update::LAYOUT | Update::DRAW);
+                        }
+                    }
+                    FileOperationRequest::CloseTabAt(index) => {
+                        let next_path = match self.tabs.lock() {
+                            Ok(mut t) => {
+                                if t.paths.len() > 1 && index < t.paths.len() {
+                                    t.set_active(index);
+                                    t.close_active();
+                                    t.active_path()
+                                } else {
+                                    None
+                                }
+                            }
+                            Err(_) => None,
+                        };
+                        if let Some(p) = next_path {
+                            if let Ok(mut nav) = self.navigation.lock() {
+                                nav.navigate_to(p);
+                            }
+                            update.insert(Update::LAYOUT | Update::DRAW);
+                        }
+                    }
+                    FileOperationRequest::ZoomIn => {
+                        update.insert(self.zoom_in());
+                    }
+                    FileOperationRequest::ZoomOut => {
+                        update.insert(self.zoom_out());
+                    }
+                    FileOperationRequest::ZoomReset => {
+                        update.insert(self.zoom_reset());
                     }
                     FileOperationRequest::Duplicate(paths) => {
                         let mut need_sync_refresh = false;

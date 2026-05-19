@@ -38,4 +38,24 @@ pub enum FileOperationRequest {
     ShowAbout,
     /// Open Settings → Configure Fileman.
     ShowSettings,
+    /// Undo last reversible operation (cut/paste move).
+    Undo,
+    /// Redo last undone operation.
+    Redo,
+    /// Open a new tab (starts at `$HOME` when available).
+    NewTab,
+    /// Spawn a new window process.
+    NewWindow,
+    /// Close the current tab (ignored when only one tab remains).
+    CloseTab,
+    /// Activate a tab by index.
+    SwitchTab(usize),
+    /// Close a tab by index.
+    CloseTabAt(usize),
+    /// Increase icon size in icon/compact views.
+    ZoomIn,
+    /// Decrease icon size in icon/compact views.
+    ZoomOut,
+    /// Reset icon size to the default.
+    ZoomReset,
 }

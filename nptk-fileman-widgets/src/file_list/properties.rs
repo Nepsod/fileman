@@ -530,14 +530,18 @@ impl Widget for PropertiesContent {
                 };
 
                 if let Ok(modified) = metadata.modified() {
-                    let file_metadata = FileMetadata {
-                        size: metadata.len(),
+                    #[cfg(unix)]
+                    let perms = std::os::unix::fs::MetadataExt::mode(&metadata);
+                    #[cfg(not(unix))]
+                    let perms: u32 = 0o644;
+                    let file_metadata = FileMetadata::basic(
+                        metadata.len(),
                         modified,
-                        created: metadata.created().ok(),
-                        permissions: 0,
+                        metadata.created().ok(),
+                        perms,
                         mime_type,
-                        is_hidden: name.starts_with('.'),
-                    };
+                        name.starts_with('.'),
+                    );
 
                     Some(FileEntry::new(
                         path.clone(),

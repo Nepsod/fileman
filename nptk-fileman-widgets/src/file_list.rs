@@ -38,6 +38,7 @@ mod view_list;
 mod model_adapter;
 pub mod types;
 mod content;
+pub mod dnd;
 
 use content::FileListContent;
 use lru::LruCache;
@@ -1129,7 +1130,25 @@ impl Widget for FileList {
                             }
                         }
                     }
-                    _ => {}
+                    FileSystemEvent::EntryRenamed { old_path, new_path }
+                    | FileSystemEvent::EntryMoved { old_path, new_path, .. } => {
+                        let cur = self.current_path.get().clone();
+                        let cur = cur.as_path();
+                        for p in [old_path, new_path] {
+                            if let Some(parent) = p.parent() {
+                                if parent == cur {
+                                    pending_invalidates.insert(p.clone());
+                                }
+                            }
+                        }
+                    }
+                    FileSystemEvent::Error { path, message } => {
+                        log::warn!(
+                            "Filesystem error {:?}: {}",
+                            path.as_ref().map(|p| p.display().to_string()),
+                            message
+                        );
+                    }
                 }
             }
             if events_processed == MAX_FS_EVENTS_PER_UPDATE {
@@ -1238,12 +1257,13 @@ impl Widget for FileList {
                 let all_snapshot = all_entries_snapshot.clone();
                 let query_move = query.clone();
                 tokio::task::spawn_blocking(move || {
+                    let parsed = parse_search_query(&query_move);
                     let mut filtered: Vec<FileEntry> = if query_move.is_empty() {
                         all_snapshot
                     } else {
                         all_snapshot
                             .into_iter()
-                            .filter(|e| e.name.to_lowercase().contains(&query_move))
+                            .filter(|e| entry_matches_query(e, &parsed))
                             .collect()
                     };
                     if !show_hid {
@@ -1401,6 +1421,102 @@ impl Widget for FileList {
 
 const MAX_RECURSIVE_SEARCH_DEPTH: u32 = u32::MAX;
 
+#[derive(Debug, Clone)]
+struct ParsedSearchQuery {
+    name_contains: Option<String>,
+    extension: Option<String>,
+    type_filter: Option<FileType>,
+    min_size_bytes: Option<u64>,
+}
+
+fn parse_size_bytes(input: &str) -> Option<u64> {
+    let t = input.trim().to_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    let num_part = t.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let unit_part = &t[num_part.len()..];
+    let n: f64 = num_part.parse().ok()?;
+    let mul = match unit_part {
+        "" | "b" => 1.0,
+        "k" | "kb" => 1024.0,
+        "m" | "mb" => 1024.0 * 1024.0,
+        "g" | "gb" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((n * mul) as u64)
+}
+
+fn parse_search_query(raw: &str) -> ParsedSearchQuery {
+    let mut parsed = ParsedSearchQuery {
+        name_contains: None,
+        extension: None,
+        type_filter: None,
+        min_size_bytes: None,
+    };
+
+    for token in raw.to_lowercase().split_whitespace() {
+        if let Some(rest) = token.strip_prefix("ext:") {
+            let ext = rest.trim_start_matches('.');
+            if !ext.is_empty() {
+                parsed.extension = Some(ext.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix("type:") {
+            parsed.type_filter = match rest {
+                "file" | "f" => Some(FileType::File),
+                "dir" | "directory" | "folder" | "d" => Some(FileType::Directory),
+                "symlink" | "link" => Some(FileType::Symlink),
+                _ => parsed.type_filter,
+            };
+            continue;
+        }
+        if let Some(rest) = token.strip_prefix("size>") {
+            if let Some(v) = parse_size_bytes(rest) {
+                parsed.min_size_bytes = Some(v);
+            }
+            continue;
+        }
+        let current = parsed.name_contains.get_or_insert_with(String::new);
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(token);
+    }
+
+    parsed
+}
+
+fn entry_matches_query(entry: &FileEntry, parsed: &ParsedSearchQuery) -> bool {
+    if let Some(name_part) = &parsed.name_contains {
+        if !entry.name.to_lowercase().contains(name_part) {
+            return false;
+        }
+    }
+    if let Some(ext) = &parsed.extension {
+        let entry_ext = entry
+            .path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_lowercase());
+        if entry_ext.as_deref() != Some(ext.as_str()) {
+            return false;
+        }
+    }
+    if let Some(ty) = parsed.type_filter {
+        if entry.file_type != ty {
+            return false;
+        }
+    }
+    if let Some(min) = parsed.min_size_bytes {
+        if entry.metadata.size < min {
+            return false;
+        }
+    }
+    true
+}
+
 fn recursive_search_entries(
     root: PathBuf,
     query_lower: &str,
@@ -1411,10 +1527,11 @@ fn recursive_search_entries(
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    let parsed = parse_search_query(query_lower);
     let mut out = Vec::new();
     fn go(
         path: &std::path::Path,
-        query: &str,
+        parsed: &ParsedSearchQuery,
         depth: u32,
         out: &mut Vec<FileEntry>,
     ) {
@@ -1451,30 +1568,31 @@ fn recursive_search_entries(
             let permissions = meta.permissions().mode();
             #[cfg(not(unix))]
             let permissions = 0o644;
-            let metadata = FileMetadata {
-                size: meta.len(),
-                modified: meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                created: meta.created().ok(),
+            let metadata = FileMetadata::basic(
+                meta.len(),
+                meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                meta.created().ok(),
                 permissions,
-                mime_type: None,
-                is_hidden: name.starts_with('.'),
-            };
+                None,
+                name.starts_with('.'),
+            );
             let parent = path.parent().map(PathBuf::from);
-            if name.to_lowercase().contains(query) {
-                out.push(FileEntry::new(
-                    path.clone(),
-                    name,
-                    file_type,
-                    metadata,
-                    parent,
-                ));
+            let candidate = FileEntry::new(
+                path.clone(),
+                name,
+                file_type,
+                metadata,
+                parent,
+            );
+            if entry_matches_query(&candidate, parsed) {
+                out.push(candidate);
             }
             if meta.is_dir() && !meta.is_symlink() {
-                go(&path, query, depth.saturating_sub(1), out);
+                go(&path, parsed, depth.saturating_sub(1), out);
             }
         }
     }
-    go(&root, query_lower, max_depth, &mut out);
+    go(&root, &parsed, max_depth, &mut out);
     out
 }
 

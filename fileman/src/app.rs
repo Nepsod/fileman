@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use crate::config::FilemanConfig;
 use crate::navigation::NavigationState;
 use crate::window::build_window;
+use crate::window::tabs::TabModel;
 
 pub struct FilemanApp {
     may_config: MayConfig,
@@ -42,9 +43,11 @@ impl FilemanApp {
         let window_config_path = FilemanConfig::config_file_path();
         let persist_window_size = fileman.window.remember_window_size.unwrap_or(true);
         let may_config = fileman.may_config();
-        let navigation = Arc::new(Mutex::new(NavigationState::new(initial_path)));
+        let navigation = Arc::new(Mutex::new(NavigationState::new(initial_path.clone())));
+        let tabs = Arc::new(Mutex::new(TabModel::new(initial_path)));
         let state = AppState {
             navigation: navigation.clone(),
+            tabs,
             fileman,
         };
         FilemanApp {
@@ -100,5 +103,6 @@ impl Plugin for WindowGeometryPersistPlugin {
 
 pub struct AppState {
     pub navigation: Arc<Mutex<NavigationState>>,
+    pub tabs: Arc<Mutex<TabModel>>,
     pub fileman: FilemanConfig,
 }

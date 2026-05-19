@@ -12,6 +12,9 @@ pub struct ReferenceMenubarActions {
     pub navigate_back: Arc<dyn Fn() + Send + Sync>,
     pub navigate_forward: Arc<dyn Fn() + Send + Sync>,
     pub navigate_up: Arc<dyn Fn() + Send + Sync>,
+    pub new_tab: Arc<dyn Fn() + Send + Sync>,
+    pub new_window: Arc<dyn Fn() + Send + Sync>,
+    pub close_tab: Arc<dyn Fn() + Send + Sync>,
     pub set_view_list: Arc<dyn Fn() + Send + Sync>,
     pub set_view_icon: Arc<dyn Fn() + Send + Sync>,
     pub set_view_compact: Arc<dyn Fn() + Send + Sync>,
@@ -42,6 +45,8 @@ pub struct ReferenceMenubarActions {
     pub new_file: Arc<dyn Fn() + Send + Sync>,
     pub open_selection: Arc<dyn Fn() + Send + Sync>,
     pub duplicate_selection: Arc<dyn Fn() + Send + Sync>,
+    pub undo_action: Arc<dyn Fn() + Send + Sync>,
+    pub redo_action: Arc<dyn Fn() + Send + Sync>,
     pub add_bookmark_current_folder: Arc<dyn Fn() + Send + Sync>,
     pub remove_bookmark_current_folder: Arc<dyn Fn() + Send + Sync>,
     pub open_terminal_here: Arc<dyn Fn() + Send + Sync>,
@@ -59,6 +64,9 @@ pub fn build_reference_menubar(
     let navigate_back = actions.navigate_back.clone();
     let navigate_forward = actions.navigate_forward.clone();
     let navigate_up = actions.navigate_up.clone();
+    let new_tab = actions.new_tab.clone();
+    let new_window = actions.new_window.clone();
+    let close_tab = actions.close_tab.clone();
     let focus_location = actions.focus_location.clone();
     let activate_search = actions.activate_search.clone();
     let set_view_list = actions.set_view_list.clone();
@@ -91,6 +99,8 @@ pub fn build_reference_menubar(
     let new_file = actions.new_file.clone();
     let open_selection = actions.open_selection.clone();
     let duplicate_selection = actions.duplicate_selection.clone();
+    let undo_action = actions.undo_action.clone();
+    let redo_action = actions.redo_action.clone();
     let add_bookmark_current_folder = actions.add_bookmark_current_folder.clone();
     let remove_bookmark_current_folder = actions.remove_bookmark_current_folder.clone();
     let open_terminal_here = actions.open_terminal_here.clone();
@@ -106,6 +116,39 @@ pub fn build_reference_menubar(
                     (navigate_home)();
                     let _ = status_tx_file_home.send("Menu: File -> Home".to_string());
                     Update::DRAW
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1020), "New Tab")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (new_tab)();
+                        let _ = status_tx.send("Menu: File -> New Tab".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1022), "New Window")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (new_window)();
+                        let _ = status_tx.send("Menu: File -> New Window".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1021), "Close Tab")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (close_tab)();
+                        let _ = status_tx.send("Menu: File -> Close Tab".to_string());
+                        Update::DRAW
+                    }
                 }),
         )
         .add_item(MenuItem::separator())
@@ -275,6 +318,28 @@ pub fn build_reference_menubar(
                     move || {
                         (paste_clipboard)();
                         let _ = status_tx.send("Menu: Edit -> Paste".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1113), "Undo")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (undo_action)();
+                        let _ = status_tx.send("Menu: Edit -> Undo".to_string());
+                        Update::DRAW
+                    }
+                }),
+        )
+        .add_item(
+            MenuItem::new(MenuCommand::Custom(1114), "Redo")
+                .with_action({
+                    let status_tx = status_tx.clone();
+                    move || {
+                        (redo_action)();
+                        let _ = status_tx.send("Menu: Edit -> Redo".to_string());
                         Update::DRAW
                     }
                 }),

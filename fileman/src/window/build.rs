@@ -1,5 +1,6 @@
 use nptk::prelude::*;
 use nptk::core::shortcut::Shortcut;
+use nptk::core::signal::eval::EvalSignal;
 use nptk::core::window::KeyCode;
 use nptk_fileman_widgets::file_list::FileListViewMode;
 use nptk_fileman_widgets::file_list::SearchScope;
@@ -14,6 +15,7 @@ use tokio::sync::mpsc;
 
 use super::file_list_wrapper::FileListWrapper;
 use super::file_operation::FileOperationRequest;
+use super::tab_strip::TabStrip;
 
 pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     let navigation = state.navigation.lock().unwrap();
@@ -61,6 +63,47 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
             Update::DRAW
         },
     );
+
+    let operation_tx_undo = operation_tx.clone();
+    context.shortcut_registry.register(Shortcut::ctrl(KeyCode::KeyZ), move || {
+        let _ = operation_tx_undo.send(FileOperationRequest::Undo);
+        Update::DRAW
+    });
+    let operation_tx_redo = operation_tx.clone();
+    context.shortcut_registry.register(Shortcut::ctrl_shift(KeyCode::KeyZ), move || {
+        let _ = operation_tx_redo.send(FileOperationRequest::Redo);
+        Update::DRAW
+    });
+    let operation_tx_new_tab = operation_tx.clone();
+    context.shortcut_registry.register(Shortcut::ctrl(KeyCode::KeyT), move || {
+        let _ = operation_tx_new_tab.send(FileOperationRequest::NewTab);
+        Update::DRAW
+    });
+    let operation_tx_close_tab = operation_tx.clone();
+    context.shortcut_registry.register(Shortcut::ctrl(KeyCode::KeyW), move || {
+        let _ = operation_tx_close_tab.send(FileOperationRequest::CloseTab);
+        Update::DRAW
+    });
+    let operation_tx_new_window = operation_tx.clone();
+    context.shortcut_registry.register(Shortcut::ctrl(KeyCode::KeyN), move || {
+        let _ = operation_tx_new_window.send(FileOperationRequest::NewWindow);
+        Update::DRAW
+    });
+    let operation_tx_zoom_in = operation_tx.clone();
+    context.shortcut_registry.register(Shortcut::ctrl(KeyCode::Equal), move || {
+        let _ = operation_tx_zoom_in.send(FileOperationRequest::ZoomIn);
+        Update::DRAW
+    });
+    let operation_tx_zoom_out = operation_tx.clone();
+    context.shortcut_registry.register(Shortcut::ctrl(KeyCode::Minus), move || {
+        let _ = operation_tx_zoom_out.send(FileOperationRequest::ZoomOut);
+        Update::DRAW
+    });
+    let operation_tx_zoom_reset = operation_tx.clone();
+    context.shortcut_registry.register(Shortcut::ctrl(KeyCode::Digit0), move || {
+        let _ = operation_tx_zoom_reset.send(FileOperationRequest::ZoomReset);
+        Update::DRAW
+    });
 
     let (add_bookmark_tx, add_bookmark_rx) = mpsc::unbounded_channel::<PathBuf>();
     let (remove_bookmark_tx, remove_bookmark_rx) = mpsc::unbounded_channel::<PathBuf>();
@@ -111,6 +154,7 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
         delete_policy,
         terminal_command,
         config_path,
+        state.tabs.clone(),
     );
 
     if let Some(mode) = state.fileman.default_view_mode() {
@@ -177,6 +221,24 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
                 let tx = toolbar_nav_tx.clone();
                 move || {
                     let _ = tx.send(crate::toolbar::NavigationAction::Up);
+                }
+            }),
+            new_tab: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::NewTab);
+                }
+            }),
+            new_window: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::NewWindow);
+                }
+            }),
+            close_tab: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::CloseTab);
                 }
             }),
             set_view_list: Arc::new({
@@ -434,6 +496,18 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
                     }
                 }
             }),
+            undo_action: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Undo);
+                }
+            }),
+            redo_action: Arc::new({
+                let operation_tx = operation_tx.clone();
+                move || {
+                    let _ = operation_tx.send(FileOperationRequest::Redo);
+                }
+            }),
             add_bookmark_current_folder: Arc::new({
                 let bookmark_tx = add_bookmark_tx.clone();
                 let navigation_path_signal = navigation_path_signal.clone();
@@ -509,12 +583,57 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
     .with_message_receiver(status_rx);
 
     // Build main layout
+    let tab_strip = TabStrip::new(state.tabs.clone(), operation_tx.clone());
+    let zoom_controls = Container::new(vec![
+        Box::new(
+            ToolbarButton::new(Text::new("Zoom -".to_string()).with_font_size(13.0)).with_on_pressed(
+                nptk::core::signal::MaybeSignal::signal(Box::new({
+                    let tx = operation_tx.clone();
+                    EvalSignal::new(move || {
+                        let _ = tx.send(FileOperationRequest::ZoomOut);
+                        Update::DRAW
+                    })
+                })),
+            ),
+        ),
+        Box::new(
+            ToolbarButton::new(Text::new("Zoom +".to_string()).with_font_size(13.0)).with_on_pressed(
+                nptk::core::signal::MaybeSignal::signal(Box::new({
+                    let tx = operation_tx.clone();
+                    EvalSignal::new(move || {
+                        let _ = tx.send(FileOperationRequest::ZoomIn);
+                        Update::DRAW
+                    })
+                })),
+            ),
+        ),
+        Box::new(
+            ToolbarButton::new(Text::new("100%".to_string()).with_font_size(13.0)).with_on_pressed(
+                nptk::core::signal::MaybeSignal::signal(Box::new({
+                    let tx = operation_tx.clone();
+                    EvalSignal::new(move || {
+                        let _ = tx.send(FileOperationRequest::ZoomReset);
+                        Update::DRAW
+                    })
+                })),
+            ),
+        ),
+    ])
+    .with_layout_style(LayoutStyle {
+        size: Vector2::new(Dimension::auto(), Dimension::length(24.0)),
+        flex_direction: FlexDirection::Row,
+        align_items: Some(AlignItems::Center),
+        gap: Vector2::new(LengthPercentage::length(4.0), LengthPercentage::length(0.0)),
+        ..Default::default()
+    });
+
     Container::new(vec![
         Box::new(menu_bar),
-        // Toolbar area
+        // Toolbar + location + tabs
         Box::new(Container::new(vec![
             Box::new(toolbar_wrapper),
             Box::new(location_bar),
+            Box::new(tab_strip),
         ])
         .with_layout_style(LayoutStyle {
             size: Vector2::new(Dimension::percent(1.0), Dimension::auto()),
@@ -533,8 +652,27 @@ pub fn build_window(context: AppContext, state: AppState) -> impl Widget {
             gap: Vector2::new(LengthPercentage::length(0.0), LengthPercentage::length(0.0)),
             ..Default::default()
         })),
-        // Statusbar
-        Box::new(statusbar),
+        // Statusbar + zoom controls (right-bottom corner)
+        Box::new(
+            Container::new(vec![
+                Box::new(
+                    Container::new(vec![Box::new(statusbar)]).with_layout_style(LayoutStyle {
+                        size: Vector2::new(Dimension::auto(), Dimension::length(24.0)),
+                        flex_grow: 1.0,
+                        flex_shrink: 1.0,
+                        ..Default::default()
+                    }),
+                ),
+                Box::new(zoom_controls),
+            ])
+            .with_layout_style(LayoutStyle {
+                size: Vector2::new(Dimension::percent(1.0), Dimension::length(24.0)),
+                flex_direction: FlexDirection::Row,
+                align_items: Some(AlignItems::Center),
+                gap: Vector2::new(LengthPercentage::length(6.0), LengthPercentage::length(0.0)),
+                ..Default::default()
+            }),
+        ),
     ])
     .with_layout_style(LayoutStyle {
         size: Vector2::new(Dimension::percent(1.0), Dimension::percent(1.0)),

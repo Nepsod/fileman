@@ -86,6 +86,7 @@ impl FileStatusBar {
         let path_str = nav_path.to_string_lossy().to_string();
         let selection_count = (*self.selected_paths.get()).len();
         
+        let entry_count = (*self.entries.get()).len();
         let status_msg = if selection_count > 0 {
             // Calculate total size
             let selected = self.selected_paths.get();
@@ -96,9 +97,12 @@ impl FileStatusBar {
                 .sum();
                 
             let size_str = format_size(total_size, BINARY);
-            format!("{} - {} item(s) selected ({})", path_str, selection_count, size_str)
+            format!(
+                "{} — {} listed — {} item(s) selected ({})",
+                path_str, entry_count, selection_count, size_str
+            )
         } else {
-            path_str
+            format!("{} — {} items", path_str, entry_count)
         };
         
         // Only update if status actually changed to avoid unnecessary updates

@@ -14,3 +14,4 @@ pub mod fileman_sidebar;
 pub use fileman_sidebar::FilemanSidebar;
 pub mod location_bar;
 pub mod status_bar;
+pub mod preview_pane;
