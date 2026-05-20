@@ -1,5 +1,9 @@
 use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
+
+use serde::{Deserialize, Serialize};
+
+use crate::sort::{SortColumn, SortOrder};
+use crate::view_mode::ViewMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilemanConfig {
@@ -43,6 +47,12 @@ pub struct FolderViewSection {
     pub show_hidden: bool,
     #[serde(rename = "DefaultPath")]
     pub default_path: Option<PathBuf>,
+    #[serde(rename = "SortColumn", default = "default_sort_column")]
+    pub sort_column: String,
+    #[serde(rename = "SortOrder", default = "default_sort_order")]
+    pub sort_order: String,
+    #[serde(rename = "Mode", default = "default_view_mode")]
+    pub mode: String,
 }
 
 impl Default for FolderViewSection {
@@ -50,44 +60,67 @@ impl Default for FolderViewSection {
         Self {
             show_hidden: default_false(),
             default_path: None,
+            sort_column: default_sort_column(),
+            sort_order: default_sort_order(),
+            mode: default_view_mode(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BehaviorSection {
     #[serde(rename = "ConfirmDelete", default = "default_true")]
     pub confirm_delete: bool,
+    #[serde(rename = "ConfirmTrash", default = "default_true")]
+    pub confirm_trash: bool,
     #[serde(rename = "UseTrash", default = "default_true")]
     pub use_trash: bool,
 }
 
-fn default_title() -> String { "Fileman".to_string() }
-fn default_true() -> bool { true }
+impl Default for BehaviorSection {
+    fn default() -> Self {
+        Self {
+            confirm_delete: default_true(),
+            confirm_trash: default_true(),
+            use_trash: default_true(),
+        }
+    }
+}
 
-fn default_false() -> bool { false }
-fn default_width() -> u32 { 1000 }
-fn default_height() -> u32 { 700 }
-fn default_splitter() -> u32 { 220 }
+fn default_title() -> String {
+    "Fileman".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_false() -> bool {
+    false
+}
+fn default_width() -> u32 {
+    1000
+}
+fn default_height() -> u32 {
+    700
+}
+fn default_splitter() -> u32 {
+    220
+}
+fn default_sort_column() -> String {
+    "name".to_string()
+}
+fn default_sort_order() -> String {
+    "ascending".to_string()
+}
+fn default_view_mode() -> String {
+    "list".to_string()
+}
 
 impl Default for FilemanConfig {
     fn default() -> Self {
         Self {
-            window: WindowSection {
-                window_title: default_title(),
-                remember_window_size: default_true(),
-                last_window_width: default_width(),
-                last_window_height: default_height(),
-                splitter_pos: default_splitter(),
-            },
-            folder_view: FolderViewSection {
-                show_hidden: default_false(),
-                default_path: None,
-            },
-            behavior: BehaviorSection {
-                confirm_delete: default_true(),
-                use_trash: default_true(),
-            },
+            window: WindowSection::default(),
+            folder_view: FolderViewSection::default(),
+            behavior: BehaviorSection::default(),
         }
     }
 }
@@ -97,29 +130,54 @@ impl FilemanConfig {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("fileman");
-        let _ = std::fs::create_dir_all(&config_dir);
-        let config_path = config_dir.join("config.toml");
+        if let Err(error) = std::fs::create_dir_all(&config_dir) {
+            log::warn!("failed to create config directory {}: {error}", config_dir.display());
+        }
 
+        let config_path = config_dir.join("config.toml");
         if !config_path.exists() {
-            let default_cfg = Self::default();
-            if let Ok(toml_str) = toml::to_string_pretty(&default_cfg) {
-                let _ = std::fs::write(&config_path, toml_str);
+            let default_config = Self::default();
+            if let Ok(toml_string) = toml::to_string_pretty(&default_config) {
+                if let Err(error) = std::fs::write(&config_path, toml_string) {
+                    log::warn!("failed to write default config {}: {error}", config_path.display());
+                }
             }
-            default_cfg
-        } else {
-            match std::fs::read_to_string(&config_path) {
-                Ok(content) => toml::from_str(&content).unwrap_or_default(),
-                Err(_) => Self::default(),
+            return default_config;
+        }
+
+        match std::fs::read_to_string(&config_path) {
+            Ok(content) => toml::from_str(&content).unwrap_or_else(|error| {
+                log::warn!("failed to parse config {}: {error}", config_path.display());
+                Self::default()
+            }),
+            Err(error) => {
+                log::warn!("failed to read config {}: {error}", config_path.display());
+                Self::default()
             }
         }
     }
 
     pub fn save(&self) {
-        if let Some(config_dir) = dirs::config_dir() {
-            let config_path = config_dir.join("fileman").join("config.toml");
-            if let Ok(toml_str) = toml::to_string_pretty(self) {
-                let _ = std::fs::write(config_path, toml_str);
+        let Some(config_dir) = dirs::config_dir() else {
+            return;
+        };
+        let config_path = config_dir.join("fileman").join("config.toml");
+        if let Ok(toml_string) = toml::to_string_pretty(self) {
+            if let Err(error) = std::fs::write(&config_path, toml_string) {
+                log::warn!("failed to save config {}: {error}", config_path.display());
             }
         }
+    }
+
+    pub fn sort_column(&self) -> SortColumn {
+        SortColumn::from_config(&self.folder_view.sort_column)
+    }
+
+    pub fn sort_order(&self) -> SortOrder {
+        SortOrder::from_config(&self.folder_view.sort_order)
+    }
+
+    pub fn view_mode(&self) -> ViewMode {
+        ViewMode::from_config(&self.folder_view.mode)
     }
 }
