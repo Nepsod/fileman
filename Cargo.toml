@@ -1,0 +1,23 @@
+[package]
+name = "fileman"
+version = "0.6.0"
+description = "Modern GPUI-powered file manager for the Nepsod Desktop."
+edition = "2024"
+authors = ["Dominik Adrian Grzywak <starterx4@gmail.com>"]
+license = "GPL-3.0"
+
+[dependencies]
+npio = { path = "../npio" }
+nptk = { path = "../nptk" }
+gpui = { path = "../nptk/crates/gpui" }
+gpui_platform = { path = "../nptk/crates/gpui_platform", features = ["font-kit", "wayland", "x11"] }
+gpui_tokio = { path = "../nptk/crates/gpui_tokio" }
+
+log = "0.4"
+env_logger = "0.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+anyhow = "1.0"
+image = "0.25"
+dirs = "5.0"
