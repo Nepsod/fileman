@@ -1928,7 +1928,6 @@ dependencies = [
  "anyhow",
  "dirs 5.0.1",
  "env_logger",
- "file_icons",
  "log",
  "npio",
  "nptk",
@@ -4077,6 +4076,7 @@ name = "nptk"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "file_icons",
  "fs",
  "gpui",
  "gpui-rsx",

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use nptk::std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 

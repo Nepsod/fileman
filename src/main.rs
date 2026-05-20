@@ -8,9 +8,9 @@ mod sort;
 mod tabs;
 mod view_mode;
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use nptk::std::collections::HashSet;
+use nptk::std::path::{Path, PathBuf};
+use nptk::std::sync::Arc;
 
 use nptk::gpui::{self as gpui, *};
 use nptk::gpui_tokio::Tokio;
@@ -21,7 +21,7 @@ use npio::{get_file_for_uri, register_backend, FileInfo, FileType};
 use sort::{SortColumn, SortOrder};
 use view_mode::ViewMode;
 
-use file_icons::FileIconPresentation;
+use nptk::file_icons::FileIconPresentation;
 
 use crate::clipboard::FileClipboard;
 use crate::config::FilemanConfig;
@@ -719,7 +719,7 @@ impl FilemanWindow {
             return;
         }
 
-        let Some(icon_service) = file_icons::FileIconService::global(cx).cloned() else {
+        let Some(icon_service) = nptk::file_icons::FileIconService::global(cx).cloned() else {
             return;
         };
 

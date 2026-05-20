@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use nptk::std::path::PathBuf;
 
 #[derive(Debug, Clone, Default)]
 pub struct FileClipboard {

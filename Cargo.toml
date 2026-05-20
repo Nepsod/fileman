@@ -9,7 +9,6 @@ license = "GPL-3.0"
 [dependencies]
 npio = { path = "../npio" }
 nptk = { path = "../nptk" }
-file_icons = { path = "../nptk/crates/file_icons" }
 
 log = "0.4"
 env_logger = "0.11"

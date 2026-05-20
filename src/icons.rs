@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use file_icons::{icon_presentation_from_cached, FileIconPresentation, FileIconService};
+use nptk::file_icons::{icon_presentation_from_cached, FileIconPresentation, FileIconService};
 use npio::FileType;
 
 pub struct FileIconCache {

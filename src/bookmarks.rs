@@ -1,5 +1,5 @@
-use std::fs;
-use std::path::{Path, PathBuf};
+use nptk::std::fs;
+use nptk::std::path::{Path, PathBuf};
 
 pub fn gtk_bookmarks_path() -> Option<PathBuf> {
     if let Some(config_directory) = dirs::config_dir() {
