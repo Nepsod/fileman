@@ -4,16 +4,17 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gpui::*;
-use gpui_tokio::Tokio;
-
-type ViewContext<'a, T> = gpui::Context<'a, T>;
+use nptk::gpui::{self as gpui, *};
+use nptk::gpui_tokio::Tokio;
+use nptk::theme::ActiveTheme;
+use nptk::ui::{ListItem, prelude::*};
 use npio::backend::local::LocalBackend;
 use npio::{get_file_for_uri, register_backend, FileInfo, FileType};
 
 use crate::config::FilemanConfig;
 
-// Define Actions for menus and shortcut keys
+type ViewContext<'a, T> = gpui::Context<'a, T>;
+
 gpui::actions!(
     fileman,
     [
@@ -28,7 +29,6 @@ gpui::actions!(
     ]
 );
 
-
 struct FilemanWindow {
     current_path: PathBuf,
     history_back: Vec<PathBuf>,
@@ -36,9 +36,7 @@ struct FilemanWindow {
     show_hidden: bool,
     selected_files: HashSet<String>,
     files: Vec<FileInfo>,
-    search_query: String,
     config: FilemanConfig,
-    editing_path: bool,
     path_input_text: String,
     focus_handle: FocusHandle,
 }
@@ -50,7 +48,7 @@ impl FilemanWindow {
             .folder_view
             .default_path
             .clone()
-            .or_else(|| dirs::home_dir())
+            .or_else(dirs::home_dir)
             .unwrap_or_else(|| PathBuf::from("/"));
 
         let mut this = Self {
@@ -60,9 +58,7 @@ impl FilemanWindow {
             show_hidden: config.folder_view.show_hidden,
             selected_files: HashSet::new(),
             files: Vec::new(),
-            search_query: String::new(),
             config,
-            editing_path: false,
             path_input_text: initial_path.to_string_lossy().to_string(),
             focus_handle: cx.focus_handle(),
         };
@@ -95,7 +91,6 @@ impl FilemanWindow {
         self.current_path = path.clone();
         self.path_input_text = path.to_string_lossy().to_string();
         self.selected_files.clear();
-        self.editing_path = false;
 
         let path_str = path.to_string_lossy().to_string();
         cx.spawn(async move |this, cx| {
@@ -171,11 +166,12 @@ impl FilemanWindow {
 
         // Perform deletion asynchronously
         cx.spawn(async move |this, cx| {
-            let _ = cx.background_executor().spawn(async move {
-                for p in paths_to_delete {
-                    let _ = std::fs::remove_file(&p).or_else(|_| std::fs::remove_dir_all(&p));
+            let _ = Tokio::spawn(cx, async move {
+                for path in paths_to_delete {
+                    let _ = std::fs::remove_file(&path).or_else(|_| std::fs::remove_dir_all(&path));
                 }
-            }).await;
+            })
+            .await;
 
             // Trigger reload of the current folder
             let _ = this.update(cx, |this, cx| {
@@ -187,25 +183,28 @@ impl FilemanWindow {
     }
 }
 
-// Implement action listeners
 impl Render for FilemanWindow {
     fn render(&mut self, window: &mut Window, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        // Setup listener shortcuts
+        let colors = cx.theme().colors().clone();
+
         div()
             .id("fileman-root")
             .track_focus(&self.focus_handle)
-            .on_action(cx.listener(|this, _action: &Quit, _, cx| cx.quit()))
+            .on_action(cx.listener(|_this, _action: &Quit, _, cx| cx.quit()))
             .on_action(cx.listener(|this, _action: &GoBack, _, cx| this.go_back(cx)))
             .on_action(cx.listener(|this, _action: &GoForward, _, cx| this.go_forward(cx)))
             .on_action(cx.listener(|this, _action: &GoUp, _, cx| this.go_up(cx)))
-            .on_action(cx.listener(|this, _action: &ToggleHidden, _, cx| this.toggle_hidden(cx)))
-            .on_action(cx.listener(|this, _action: &DeleteSelected, _, cx| this.delete_selected(cx)))
+            .on_action(cx.listener(|this, _action: &ToggleHidden, _, cx| {
+                this.toggle_hidden(cx)
+            }))
+            .on_action(cx.listener(|this, _action: &DeleteSelected, _, cx| {
+                this.delete_selected(cx)
+            }))
             .flex()
             .h_full()
             .w_full()
-            .bg(rgb(0x121214))
-            .text_color(rgb(0xe2e8f0))
-            .font_family("Inter")
+            .bg(colors.background)
+            .text_color(colors.text)
             .child(self.render_sidebar(window, cx))
             .child(self.render_main_panel(window, cx))
     }
@@ -214,68 +213,56 @@ impl Render for FilemanWindow {
 impl FilemanWindow {
     fn render_sidebar(&mut self, _window: &mut Window, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let sidebar_width = self.config.window.splitter_pos;
-        let mut places = vec![
-            ("Root", PathBuf::from("/")),
-        ];
+        let colors = cx.theme().colors().clone();
+
+        let mut places = vec![("Root", PathBuf::from("/"))];
         if let Some(home) = dirs::home_dir() {
             places.push(("Home", home.clone()));
             places.push(("Documents", home.join("Documents")));
             places.push(("Downloads", home.join("Downloads")));
         }
 
-        div()
-            .flex()
-            .flex_col()
+        v_flex()
+            .id("fileman-sidebar")
             .w(px(sidebar_width as f32))
             .h_full()
-            .bg(rgb(0x18181b))
+            .bg(colors.panel_background)
             .border_r_1()
-            .border_color(rgb(0x2d2d30))
-            .p_4()
-            .gap_4()
+            .border_color(colors.border)
+            .p_3()
+            .gap_2()
+            .child(Headline::new("Quick Access").size(HeadlineSize::XSmall))
             .child(
-                div()
-                    .text_size(px(14.0))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0xa78bfa))
-                    .child("Quick Access")
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
+                v_flex()
+                    .gap_0p5()
                     .children(places.into_iter().map(|(label, path)| {
                         let is_active = self.current_path == path;
                         let path_clone = path.clone();
                         let label_str = label.to_string();
-                        div()
-                            .id(SharedString::from(format!("sidebar-{}", label_str)))
-                            .flex()
-                            .items_center()
-                            .p_2()
-                            .rounded_md()
-                            .text_size(px(13.0))
-                            .cursor_pointer()
-                            .bg(if is_active { rgb(0x2d2b38) } else { rgba(0) })
-                            .hover(|s| s.bg(if is_active { rgb(0x2d2b38) } else { rgb(0x27272a) }))
+                        let icon = quick_access_icon(label);
+
+                        ListItem::new(SharedString::from(format!("sidebar-{label_str}")))
+                            .toggle_state(is_active)
+                            .rounded()
+                            .start_slot(
+                                Icon::new(icon)
+                                    .size(IconSize::Small)
+                                    .color(if is_active {
+                                        Color::Selected
+                                    } else {
+                                        Color::Muted
+                                    }),
+                            )
+                            .child(Label::new(label_str))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.navigate_to(path_clone.clone(), true, cx);
                             }))
-                            .child(
-                                div()
-                                    .mr(px(8.0))
-                                    .child(if label == "Home" { "🏠" } else if label == "Downloads" { "📥" } else if label == "Documents" { "📂" } else { "📁" })
-                            )
-                            .child(label_str)
-                    }))
+                    })),
             )
     }
 
     fn render_main_panel(&mut self, window: &mut Window, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .flex_col()
+        v_flex()
             .flex_1()
             .h_full()
             .child(self.render_toolbar(window, cx))
@@ -283,103 +270,59 @@ impl FilemanWindow {
     }
 
     fn render_toolbar(&mut self, _window: &mut Window, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        let path_str = self.current_path.to_string_lossy().to_string();
+        let path_str = self.path_input_text.clone();
         let show_hidden = self.show_hidden;
+        let colors = cx.theme().colors().clone();
 
-        div()
-            .flex()
+        h_flex()
+            .id("fileman-toolbar")
+            .h(px(52.0))
+            .flex_shrink_0()
             .items_center()
             .justify_between()
-            .h(px(52.0))
             .border_b_1()
-            .border_color(rgb(0x2d2d30))
-            .px_4()
-            .gap_4()
+            .border_color(colors.border)
+            .px_3()
+            .gap_2()
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    // Back
+                h_flex()
+                    .gap_1()
                     .child(
-                        div()
-                            .id("go-back")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(28.0))
-                            .h(px(28.0))
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x27272a)))
-                            .on_click(cx.listener(|this, _, _, cx| this.go_back(cx)))
-                            .child("⬅️")
+                        IconButton::new("go-back", IconName::ArrowLeft)
+                            .on_click(cx.listener(|this, _, _, cx| this.go_back(cx))),
                     )
-                    // Forward
                     .child(
-                        div()
-                            .id("go-forward")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(28.0))
-                            .h(px(28.0))
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x27272a)))
-                            .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx)))
-                            .child("➡️")
+                        IconButton::new("go-forward", IconName::ArrowRight)
+                            .on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))),
                     )
-                    // Parent Up
                     .child(
-                        div()
-                            .id("go-up")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(28.0))
-                            .h(px(28.0))
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x27272a)))
-                            .on_click(cx.listener(|this, _, _, cx| this.go_up(cx)))
-                            .child("⬆️")
-                    )
+                        IconButton::new("go-up", IconName::ArrowUp)
+                            .on_click(cx.listener(|this, _, _, cx| this.go_up(cx))),
+                    ),
             )
-            // Path Input Bar
             .child(
-                div()
-                    .flex()
+                h_flex()
                     .flex_1()
+                    .min_w_0()
                     .items_center()
-                    .bg(rgb(0x18181b))
+                    .bg(colors.elevated_surface_background)
                     .border_1()
-                    .border_color(rgb(0x2d2d30))
+                    .border_color(colors.border_variant)
                     .rounded_md()
                     .px_3()
                     .py_1()
-                    .text_size(px(13.0))
-                    .child(path_str)
+                    .child(Label::new(path_str).truncate()),
             )
-            // Search & Show Hidden Control
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("toggle-hidden")
-                            .flex()
-                            .items_center()
-                            .p_2()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .bg(if show_hidden { rgb(0x2d2b38) } else { rgba(0) })
-                            .hover(|s| s.bg(rgb(0x27272a)))
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_hidden(cx)))
-                            .child("👁️ Hidden")
-                    )
+                Button::new("toggle-hidden", "Hidden")
+                    .style(ButtonStyle::Outlined)
+                    .toggle_state(show_hidden)
+                    .start_icon(Icon::new(if show_hidden {
+                        IconName::Eye
+                    } else {
+                        IconName::EyeOff
+                    }))
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_hidden(cx))),
             )
     }
 
@@ -388,127 +331,108 @@ impl FilemanWindow {
         let mut visible_files: Vec<&FileInfo> = self
             .files
             .iter()
-            .filter(|f| {
-                let name = f.get_name().unwrap_or("");
+            .filter(|file_info| {
+                let name = file_info.get_name().unwrap_or("");
                 if name.is_empty() {
                     return false;
                 }
-                if !show_hidden && name.starts_with('.') {
-                    return false;
-                }
-                true
+                !(!show_hidden && name.starts_with('.'))
             })
             .collect();
 
-        // Sort files: folders first, then alphabetically
-        visible_files.sort_by(|a, b| {
-            let a_is_dir = a.get_file_type() == FileType::Directory;
-            let b_is_dir = b.get_file_type() == FileType::Directory;
-            if a_is_dir != b_is_dir {
-                b_is_dir.cmp(&a_is_dir)
+        visible_files.sort_by(|left, right| {
+            let left_is_dir = left.get_file_type() == FileType::Directory;
+            let right_is_dir = right.get_file_type() == FileType::Directory;
+            if left_is_dir != right_is_dir {
+                right_is_dir.cmp(&left_is_dir)
             } else {
-                a.get_name().unwrap_or("").cmp(b.get_name().unwrap_or(""))
+                left.get_name()
+                    .unwrap_or("")
+                    .cmp(right.get_name().unwrap_or(""))
             }
         });
 
-        if visible_files.is_empty() {
-            return div()
-                .id("empty-folder")
-                .flex()
-                .flex_col()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_size(px(32.0))
-                        .child("📁")
-                )
-                .child(
-                    div()
-                        .text_size(px(14.0))
-                        .text_color(rgb(0x71717a))
-                        .child("This folder is empty")
-                );
-        }
-
-        div()
+        v_flex()
             .id("files-scroll-area")
-            .flex()
-            .flex_col()
             .flex_1()
             .overflow_y_scroll()
-            .p_4()
-            .gap_1()
-            .children(visible_files.into_iter().map(|f| {
-                let name = f.get_name().unwrap_or("").to_string();
-                let is_dir = f.get_file_type() == FileType::Directory;
-                let size = f.get_size();
+            .p_2()
+            .gap_0p5()
+            .when(visible_files.is_empty(), |panel| {
+                panel.child(
+                    v_flex()
+                        .flex_1()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(Icon::new(IconName::Folder).size(IconSize::XLarge).color(Color::Muted))
+                        .child(
+                            Label::new("This folder is empty").color(Color::Muted).size(LabelSize::Small),
+                        ),
+                )
+            })
+            .children(visible_files.into_iter().map(|file_info| {
+                let name = file_info.get_name().unwrap_or("").to_string();
+                let is_directory = file_info.get_file_type() == FileType::Directory;
                 let is_selected = self.selected_files.contains(&name);
-
-                let name_clone = name.clone();
-                let name_clone2 = name.clone();
-                let size_str = if is_dir {
+                let size_str = if is_directory {
                     "--".to_string()
                 } else {
-                    format_size(size)
+                    format_size(file_info.get_size())
                 };
 
-                div()
-                    .id(SharedString::from(format!("file-row-{}", name_clone)))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .p_3()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .bg(if is_selected { rgb(0x2d2b38) } else { rgba(0) })
-                    .border_1()
-                    .border_color(if is_selected { rgb(0x8b5cf6) } else { rgba(0) })
-                    .hover(|s| s.bg(if is_selected { rgb(0x2d2b38) } else { rgb(0x18181b) }))
+                let name_for_click = name.clone();
+                let name_for_open = name.clone();
+                let file_icon = if is_directory {
+                    IconName::Folder
+                } else {
+                    IconName::File
+                };
+
+                ListItem::new(SharedString::from(format!("file-row-{name}")))
+                    .toggle_state(is_selected)
+                    .rounded()
+                    .start_slot(
+                        Icon::new(file_icon)
+                            .size(IconSize::Small)
+                            .color(if is_directory {
+                                Color::Accent
+                            } else {
+                                Color::Default
+                            }),
+                    )
+                    .child(Label::new(name))
+                    .end_slot(Label::new(size_str).color(Color::Muted).size(LabelSize::XSmall))
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         if event.click_count() == 2 {
-                            let full_path = this.current_path.join(&name_clone2);
-                            if is_dir {
+                            let full_path = this.current_path.join(&name_for_open);
+                            if is_directory {
                                 this.navigate_to(full_path, true, cx);
                             } else {
                                 cx.open_with_system(&full_path);
                             }
                         } else {
                             this.selected_files.clear();
-                            this.selected_files.insert(name_clone.clone());
+                            this.selected_files.insert(name_for_click.clone());
                             cx.notify();
                         }
                     }))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .mr(px(10.0))
-                                    .child(if is_dir { "📁" } else { "📄" })
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.0))
-                                    .child(name)
-                            )
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x71717a))
-                            .child(size_str)
-                    )
             }))
+    }
+}
+
+fn quick_access_icon(label: &str) -> IconName {
+    match label {
+        "Home" => IconName::OpenFolder,
+        "Documents" => IconName::FileDoc,
+        "Downloads" => IconName::ArrowDown,
+        _ => IconName::Folder,
     }
 }
 
 fn format_size(bytes: i64) -> String {
     if bytes < 1024 {
-        format!("{} B", bytes)
+        format!("{bytes} B")
     } else if bytes < 1024 * 1024 {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     } else if bytes < 1024 * 1024 * 1024 {
@@ -521,15 +445,15 @@ fn format_size(bytes: i64) -> String {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Register local filesystem backend
     let backend = Arc::new(LocalBackend::new());
     register_backend(backend);
 
-    gpui_platform::application().run(|cx: &mut App| {
-        gpui_tokio::init(cx);
+    nptk::gpui_platform::application().run(|cx: &mut App| {
+        nptk::init(cx);
 
         cx.open_window(WindowOptions::default(), |_, cx| {
             cx.new(|cx| FilemanWindow::new(cx))
-        }).expect("Failed to open file manager window");
+        })
+        .expect("Failed to open file manager window");
     });
 }

@@ -9,9 +9,6 @@ license = "GPL-3.0"
 [dependencies]
 npio = { path = "../npio" }
 nptk = { path = "../nptk" }
-gpui = { path = "../nptk/crates/gpui" }
-gpui_platform = { path = "../nptk/crates/gpui_platform", features = ["font-kit", "wayland", "x11"] }
-gpui_tokio = { path = "../nptk/crates/gpui_tokio" }
 
 log = "0.4"
 env_logger = "0.11"
