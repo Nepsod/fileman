@@ -80,45 +80,54 @@ pub fn copy_path(from: PathBuf, to: PathBuf) -> Result<(), String> {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct PasteResult {
+    pub errors: Vec<String>,
+    pub recorded_moves: Vec<(PathBuf, PathBuf)>,
+}
+
+pub fn paste_single(
+    source: PathBuf,
+    destination_directory: &Path,
+    is_cut: bool,
+) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| format!("Invalid source path {}", source.display()))?
+        .to_owned();
+
+    let mut destination = destination_directory.join(&file_name);
+    if destination.exists() {
+        destination = unique_copy_name_in_parent(&destination)?;
+    }
+
+    let source_for_undo = source.clone();
+    let destination_for_undo = destination.clone();
+    if is_cut {
+        move_path(source, destination)?;
+        Ok(Some((source_for_undo, destination_for_undo)))
+    } else {
+        copy_path(source, destination)?;
+        Ok(None)
+    }
+}
+
 pub fn paste_files(
     sources: Vec<PathBuf>,
     destination_directory: PathBuf,
     is_cut: bool,
-) -> Vec<String> {
-    let mut errors = Vec::new();
+) -> PasteResult {
+    let mut result = PasteResult::default();
 
     for source in sources {
-        let file_name = match source.file_name() {
-            Some(name) => name.to_owned(),
-            None => {
-                errors.push(format!("Invalid source path {}", source.display()));
-                continue;
-            }
-        };
-
-        let mut destination = destination_directory.join(&file_name);
-        if destination.exists() {
-            match unique_copy_name_in_parent(&destination) {
-                Ok(unique_destination) => destination = unique_destination,
-                Err(error) => {
-                    errors.push(error);
-                    continue;
-                }
-            }
-        }
-
-        let result = if is_cut {
-            move_path(source, destination)
-        } else {
-            copy_path(source, destination)
-        };
-
-        if let Err(error) = result {
-            errors.push(error);
+        match paste_single(source, &destination_directory, is_cut) {
+            Ok(Some(move_record)) => result.recorded_moves.push(move_record),
+            Ok(None) => {}
+            Err(error) => result.errors.push(error),
         }
     }
 
-    errors
+    result
 }
 
 pub fn move_path(from: PathBuf, to: PathBuf) -> Result<(), String> {

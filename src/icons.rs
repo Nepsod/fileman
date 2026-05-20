@@ -6,12 +6,14 @@ use npio::FileType;
 
 pub struct FileIconCache {
     icons: HashMap<(PathBuf, u32), FileIconPresentation>,
+    theme_icons: HashMap<(String, u32), FileIconPresentation>,
 }
 
 impl FileIconCache {
     pub fn new() -> Self {
         Self {
             icons: HashMap::new(),
+            theme_icons: HashMap::new(),
         }
     }
 
@@ -19,12 +21,39 @@ impl FileIconCache {
         self.icons.get(&(path.to_path_buf(), size)).cloned()
     }
 
+    pub fn cached_theme_icon(&self, icon_name: &str, size: u32) -> Option<FileIconPresentation> {
+        self.theme_icons
+            .get(&(icon_name.to_string(), size))
+            .cloned()
+    }
+
     pub fn store_icon(&mut self, path: PathBuf, size: u32, icon: FileIconPresentation) {
         self.icons.insert((path, size), icon);
     }
 
+    pub fn store_theme_icon(&mut self, icon_name: String, size: u32, icon: FileIconPresentation) {
+        self.theme_icons.insert((icon_name, size), icon);
+    }
+
     pub fn clear(&mut self) {
         self.icons.clear();
+        self.theme_icons.clear();
+    }
+
+    pub async fn load_theme_icon(
+        service: &FileIconService,
+        icon_name: &str,
+        size: u32,
+    ) -> Option<FileIconPresentation> {
+        service.resolve_theme_icon(icon_name, size).await
+    }
+
+    pub async fn load_path_icon(
+        service: &FileIconService,
+        path: PathBuf,
+        size: u32,
+    ) -> Option<FileIconPresentation> {
+        service.resolve_path_icon(&path, size).await
     }
 
     pub async fn load_icon(

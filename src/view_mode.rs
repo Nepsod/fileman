@@ -41,4 +41,16 @@ impl ViewMode {
             Self::List | Self::Table => 20,
         }
     }
+
+    pub fn default_icon_size(self) -> u32 {
+        self.icon_size()
+    }
+}
+
+pub const MIN_ICON_SIZE: u32 = 16;
+pub const MAX_ICON_SIZE: u32 = 256;
+pub const ICON_ZOOM_STEP: u32 = 8;
+
+pub fn clamp_icon_size(size: u32) -> u32 {
+    size.clamp(MIN_ICON_SIZE, MAX_ICON_SIZE)
 }

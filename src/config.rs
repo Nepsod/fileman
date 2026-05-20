@@ -3,7 +3,7 @@ use nptk::std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::sort::{SortColumn, SortOrder};
-use crate::view_mode::ViewMode;
+use crate::view_mode::{self, ViewMode};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilemanConfig {
@@ -13,6 +13,8 @@ pub struct FilemanConfig {
     pub folder_view: FolderViewSection,
     #[serde(rename = "Behavior", default)]
     pub behavior: BehaviorSection,
+    #[serde(rename = "System", default)]
+    pub system: SystemSection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +55,8 @@ pub struct FolderViewSection {
     pub sort_order: String,
     #[serde(rename = "Mode", default = "default_view_mode")]
     pub mode: String,
+    #[serde(rename = "IconSize")]
+    pub icon_size: Option<u32>,
 }
 
 impl Default for FolderViewSection {
@@ -63,6 +67,7 @@ impl Default for FolderViewSection {
             sort_column: default_sort_column(),
             sort_order: default_sort_order(),
             mode: default_view_mode(),
+            icon_size: None,
         }
     }
 }
@@ -84,6 +89,18 @@ impl Default for BehaviorSection {
             confirm_trash: default_true(),
             use_trash: default_true(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemSection {
+    #[serde(rename = "Terminal")]
+    pub terminal: Option<String>,
+}
+
+impl Default for SystemSection {
+    fn default() -> Self {
+        Self { terminal: None }
     }
 }
 
@@ -121,11 +138,16 @@ impl Default for FilemanConfig {
             window: WindowSection::default(),
             folder_view: FolderViewSection::default(),
             behavior: BehaviorSection::default(),
+            system: SystemSection::default(),
         }
     }
 }
 
 impl FilemanConfig {
+    pub fn terminal_command(&self) -> Option<&str> {
+        self.system.terminal.as_deref()
+    }
+
     pub fn load_or_create() -> Self {
         let config_dir = dirs::config_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -179,5 +201,12 @@ impl FilemanConfig {
 
     pub fn view_mode(&self) -> ViewMode {
         ViewMode::from_config(&self.folder_view.mode)
+    }
+
+    pub fn icon_size_for_mode(&self, mode: ViewMode) -> u32 {
+        self.folder_view
+            .icon_size
+            .map(view_mode::clamp_icon_size)
+            .unwrap_or_else(|| mode.default_icon_size())
     }
 }
