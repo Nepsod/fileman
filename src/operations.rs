@@ -84,6 +84,7 @@ pub fn copy_path(from: PathBuf, to: PathBuf) -> Result<(), String> {
 pub struct PasteResult {
     pub errors: Vec<String>,
     pub recorded_moves: Vec<(PathBuf, PathBuf)>,
+    pub cancelled: bool,
 }
 
 pub fn paste_single(

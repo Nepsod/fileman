@@ -61,10 +61,11 @@ impl FileIconCache {
         path: PathBuf,
         size: u32,
         file_type: FileType,
+        use_thumbnails: bool,
     ) -> Option<FileIconPresentation> {
         let is_directory = file_type == FileType::Directory;
         let cached = service
-            .resolve_icon(&path, size, is_directory)
+            .resolve_icon(&path, size, is_directory, use_thumbnails)
             .await?;
         icon_presentation_from_cached(&cached)
     }

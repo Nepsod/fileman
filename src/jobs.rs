@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use nptk::std::path::{Path, PathBuf};
 
 use crate::operations::PasteResult;
@@ -39,10 +42,19 @@ pub fn run_paste_batch(
     destination_directory: PathBuf,
     is_cut: bool,
     settings: PasteJobSettings,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> PasteResult {
     let mut result = PasteResult::default();
 
     for source in sources {
+        if cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            result.cancelled = true;
+            break;
+        }
+
         let file_name = match source.file_name() {
             Some(name) => name.to_owned(),
             None => {
@@ -63,14 +75,15 @@ pub fn run_paste_batch(
                         continue;
                     }
                 }
-                ConflictResolution::KeepBoth => match crate::operations::unique_copy_name_in_parent(&destination)
-                {
-                    Ok(unique_destination) => destination = unique_destination,
-                    Err(error) => {
-                        result.errors.push(error);
-                        continue;
+                ConflictResolution::KeepBoth => {
+                    match crate::operations::unique_copy_name_in_parent(&destination) {
+                        Ok(unique_destination) => destination = unique_destination,
+                        Err(error) => {
+                            result.errors.push(error);
+                            continue;
+                        }
                     }
-                },
+                }
             }
         }
 

@@ -18,6 +18,9 @@ pub const HIDE_HIDDEN: &str = "view-conceal";
 pub const TAB_CLOSE: &str = "window-close";
 pub const TAB_NEW: &str = "tab-new";
 pub const FOLDER: &str = "folder";
+pub const DELETE: &str = "edit-delete";
+pub const PROPERTIES: &str = "document-properties";
+pub const VIEW_MODE: &str = "view-list-details";
 
 pub const TOOLBAR_THEME_ICONS: &[&str] = &[
     GO_BACK,
@@ -33,6 +36,9 @@ pub const TOOLBAR_THEME_ICONS: &[&str] = &[
     TAB_CLOSE,
     TAB_NEW,
     FOLDER,
+    DELETE,
+    PROPERTIES,
+    VIEW_MODE,
 ];
 
 pub fn quick_access_theme_icon(label: &str) -> Option<&'static str> {

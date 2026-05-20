@@ -1,5 +1,11 @@
+use nptk::file_icons::FileIconPresentation;
 use nptk::std::fs;
 use nptk::std::path::{Path, PathBuf};
+
+use npio::service::filesystem::mime_detector::MimeDetector;
+use npio::service::filesystem::mime_registry::MimeRegistry;
+
+pub const PROPERTIES_ICON_SIZE: u32 = 64;
 
 #[derive(Debug, Clone)]
 pub struct PropertyRow {
@@ -11,6 +17,7 @@ pub struct PropertyRow {
 pub struct PropertiesDialog {
     pub title: String,
     pub rows: Vec<PropertyRow>,
+    pub icon: Option<FileIconPresentation>,
 }
 
 pub fn properties_for_paths(paths: &[PathBuf]) -> Option<PropertiesDialog> {
@@ -54,7 +61,7 @@ fn single_path_properties(path: &Path) -> PropertiesDialog {
         };
         rows.push(PropertyRow {
             label: "Size".to_string(),
-            value: format_size(size),
+            value: format!("{} ({size} bytes)", format_size(size)),
         });
         if let Ok(modified) = metadata.modified() {
             rows.push(PropertyRow {
@@ -83,7 +90,38 @@ fn single_path_properties(path: &Path) -> PropertiesDialog {
     PropertiesDialog {
         title: format!("Properties — {name}"),
         rows,
+        icon: None,
     }
+}
+
+pub async fn mime_kind_row(path: &Path) -> Option<PropertyRow> {
+    let mime = MimeDetector::detect_mime_type(path).await?;
+    let registry = MimeRegistry::load_default();
+    let description = crate::open::mime_variants(&mime)
+        .into_iter()
+        .find_map(|variant| registry.description(&variant));
+    let value = if let Some(description) = description {
+        format!("{description} ({mime})")
+    } else {
+        mime
+    };
+    Some(PropertyRow {
+        label: "Kind".to_string(),
+        value,
+    })
+}
+
+pub fn insert_kind_row(dialog: &mut PropertiesDialog, kind_row: PropertyRow) {
+    if dialog.rows.iter().any(|row| row.label == "Kind") {
+        return;
+    }
+    let insert_at = dialog
+        .rows
+        .iter()
+        .position(|row| row.label == "Name")
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    dialog.rows.insert(insert_at, kind_row);
 }
 
 fn multi_path_properties(paths: &[PathBuf]) -> PropertiesDialog {
@@ -119,13 +157,14 @@ fn multi_path_properties(paths: &[PathBuf]) -> PropertiesDialog {
         },
         PropertyRow {
             label: "Total size".to_string(),
-            value: format_size(total_size),
+            value: format!("{} ({total_size} bytes)", format_size(total_size)),
         },
     ];
 
     PropertiesDialog {
         title: format!("Properties — {} items", paths.len()),
         rows,
+        icon: None,
     }
 }
 

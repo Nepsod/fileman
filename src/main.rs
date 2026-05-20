@@ -8,6 +8,7 @@ mod icons;
 mod jobs;
 mod location_bar;
 mod navigation;
+mod open;
 mod operations;
 mod properties;
 mod search;
@@ -22,15 +23,20 @@ mod view_mode;
 mod watch;
 
 use nptk::std::collections::HashSet;
+use nptk::std::ops::Range;
 use nptk::std::path::{Path, PathBuf};
+use nptk::std::sync::atomic::{AtomicBool, Ordering};
 use nptk::std::sync::mpsc;
 use nptk::std::sync::Arc;
 use nptk::std::time::Duration;
 
-use nptk::gpui::{self as gpui, *};
+use nptk::gpui::{self as gpui, uniform_list, ScrollStrategy, UniformListScrollHandle, *};
 use nptk::gpui_tokio::Tokio;
 use nptk::theme::ActiveTheme;
-use nptk::ui::{Checkbox, ContextMenu, ListItem, ToggleState, prelude::*};
+use nptk::ui::{
+    Checkbox, ContextMenu, DropdownMenu, DropdownStyle, ListItem, ToggleState, WithScrollbar,
+    prelude::*,
+};
 use npio::backend::local::LocalBackend;
 use npio::{get_file_for_uri, register_backend, FileInfo, FileType};
 use sort::{SortColumn, SortOrder};
@@ -41,7 +47,7 @@ use nptk::file_icons::FileIconPresentation;
 use crate::clipboard::FileClipboard;
 use crate::config::FilemanConfig;
 use crate::devices::VolumeMount;
-use crate::drag::DraggedFilePaths;
+use crate::drag::{drop_target_style, DraggedFilePaths, MarqueeDrag};
 use crate::search::{SearchMatch, SearchScope};
 use crate::jobs::{
     count_paste_conflicts, ConflictResolution, PasteJobSettings, run_paste_batch,
@@ -92,6 +98,7 @@ struct FilemanWindow {
     current_path: PathBuf,
     show_hidden: bool,
     selected_files: HashSet<String>,
+    selection_anchor: Option<usize>,
     files: Vec<FileInfo>,
     config: FilemanConfig,
     path_input_text: String,
@@ -109,6 +116,8 @@ struct FilemanWindow {
     search_scope: SearchScope,
     search_matches: Vec<SearchMatch>,
     search_in_progress: bool,
+    search_history: Vec<String>,
+    list_focus_index: Option<usize>,
     path_edit_active: bool,
     directory_watcher: Option<notify::RecommendedWatcher>,
     directory_reload_generation: u64,
@@ -123,6 +132,13 @@ struct FilemanWindow {
     pending_settings: Option<SettingsDraft>,
     settings_terminal_focus: bool,
     pending_paste_choice: Option<PendingPasteChoice>,
+    paste_cancel: Option<Arc<AtomicBool>>,
+    files_scroll_handle: UniformListScrollHandle,
+    uniform_list_row_height: Option<Pixels>,
+    marquee_drag: Option<MarqueeDrag>,
+    marquee_cancel_subscription: Option<Subscription>,
+    marquee_autoscroll_task: Option<Task<()>>,
+    list_visible_range: Option<Range<usize>>,
     show_about: bool,
     path_line_input: Entity<ToolbarLineInput>,
     search_line_input: Entity<ToolbarLineInput>,
@@ -155,6 +171,7 @@ gpui::actions!(
         FocusPathBar,
         GoHome,
         NewTab,
+        NewWindow,
         CloseTab,
         AddBookmark,
         RemoveBookmark,
@@ -167,6 +184,7 @@ gpui::actions!(
         Redo,
         OpenTerminal,
         OpenSelection,
+        OpenWithSystem,
         ShowProperties,
         ShowSettings,
         ShowAbout,
@@ -214,6 +232,7 @@ impl FilemanWindow {
             current_path: initial_path.clone(),
             show_hidden: config.folder_view.show_hidden,
             selected_files: HashSet::new(),
+            selection_anchor: None,
             files: Vec::new(),
             config,
             path_input_text: initial_path.to_string_lossy().to_string(),
@@ -231,6 +250,8 @@ impl FilemanWindow {
             search_scope: SearchScope::CurrentFolder,
             search_matches: Vec::new(),
             search_in_progress: false,
+            search_history: Vec::new(),
+            list_focus_index: None,
             path_edit_active: false,
             directory_watcher: None,
             directory_reload_generation: 0,
@@ -245,6 +266,13 @@ impl FilemanWindow {
             pending_settings: None,
             settings_terminal_focus: false,
             pending_paste_choice: None,
+            paste_cancel: None,
+            files_scroll_handle: UniformListScrollHandle::new(),
+            uniform_list_row_height: None,
+            marquee_drag: None,
+            marquee_cancel_subscription: None,
+            marquee_autoscroll_task: None,
+            list_visible_range: None,
             show_about: false,
             path_line_input,
             search_line_input,
@@ -271,6 +299,7 @@ impl FilemanWindow {
             Menu::new("File").items(vec![
                 MenuItem::action("New Folder", CreateFolder),
                 MenuItem::action("New File", CreateFile),
+                MenuItem::action("New Window", NewWindow),
                 MenuItem::separator(),
                 MenuItem::action("Go Up", GoUp),
                 MenuItem::action("Refresh", Refresh),
@@ -298,6 +327,9 @@ impl FilemanWindow {
                 MenuItem::action("Rename", Rename),
                 MenuItem::action("Properties", ShowProperties),
                 MenuItem::action("Go to Parent Folder", GoToParent),
+                MenuItem::separator(),
+                MenuItem::action("Open Selection", OpenSelection),
+                MenuItem::action("Open With System", OpenWithSystem),
             ]),
             Menu::new("View").items(vec![
                 MenuItem::action("Toggle Hidden Files", ToggleHidden),
@@ -351,9 +383,11 @@ impl FilemanWindow {
             KeyBinding::new("ctrl-equal", ZoomIn, None),
             KeyBinding::new("ctrl-minus", ZoomOut, None),
             KeyBinding::new("ctrl-0", ZoomReset, None),
+            KeyBinding::new("ctrl-n", NewWindow, None),
             KeyBinding::new("ctrl-t", NewTab, None),
             KeyBinding::new("ctrl-w", CloseTab, None),
             KeyBinding::new("escape", ClearSelection, None),
+            KeyBinding::new("ctrl-shift-enter", OpenWithSystem, None),
         ]);
     }
 
@@ -403,6 +437,8 @@ impl FilemanWindow {
             });
         }
         self.selected_files.clear();
+        self.selection_anchor = None;
+        self.list_focus_index = None;
         self.search_matches.clear();
         self.restart_directory_watch(cx);
         self.reload_directory_entries(true, cx);
@@ -631,16 +667,181 @@ impl FilemanWindow {
         cx.notify();
     }
 
-    fn toggle_selection(&mut self, name: &str, extend: bool, cx: &mut ViewContext<Self>) {
-        if extend {
-            if !self.selected_files.remove(name) {
-                self.selected_files.insert(name.to_string());
+    fn visible_entry_names(&self) -> Vec<String> {
+        if self.using_subfolder_search() {
+            self.search_matches
+                .iter()
+                .map(|search_match| Self::selection_key_for_path(&search_match.path))
+                .collect()
+        } else {
+            self.visible_files()
+                .into_iter()
+                .filter_map(|file_info| file_info.get_name().map(str::to_string))
+                .collect()
+        }
+    }
+
+    fn select_visible_range(&mut self, anchor_index: usize, index: usize) {
+        let names = self.visible_entry_names();
+        if names.is_empty() {
+            return;
+        }
+        let start = anchor_index.min(index).min(names.len() - 1);
+        let end = anchor_index.max(index).min(names.len() - 1);
+        self.selected_files.clear();
+        for name in &names[start..=end] {
+            self.selected_files.insert(name.clone());
+        }
+    }
+
+    fn apply_list_selection_click(
+        &mut self,
+        entry_index: usize,
+        entry_name: &str,
+        shift: bool,
+        control: bool,
+        cx: &mut ViewContext<Self>,
+    ) {
+        if control {
+            if !self.selected_files.remove(entry_name) {
+                self.selected_files.insert(entry_name.to_string());
+            }
+            self.selection_anchor = Some(entry_index);
+        } else if shift {
+            if let Some(anchor) = self.selection_anchor {
+                self.select_visible_range(anchor, entry_index);
+            } else {
+                self.selected_files.clear();
+                self.selected_files.insert(entry_name.to_string());
+                self.selection_anchor = Some(entry_index);
             }
         } else {
             self.selected_files.clear();
-            self.selected_files.insert(name.to_string());
+            self.selected_files.insert(entry_name.to_string());
+            self.selection_anchor = Some(entry_index);
+        }
+        self.list_focus_index = Some(entry_index);
+        cx.notify();
+    }
+
+    fn move_list_focus(&mut self, delta: isize, extend: bool, cx: &mut ViewContext<Self>) {
+        let names = self.visible_entry_names();
+        if names.is_empty() {
+            return;
+        }
+
+        let current_index = self
+            .list_focus_index
+            .unwrap_or_else(|| names.len().saturating_sub(1));
+        let next_index = if delta < 0 {
+            current_index.saturating_sub(delta.unsigned_abs() as usize)
+        } else {
+            (current_index + delta as usize).min(names.len() - 1)
+        };
+
+        self.list_focus_index = Some(next_index);
+        self.files_scroll_handle
+            .scroll_to_item(next_index, ScrollStrategy::Nearest);
+
+        if extend {
+            let anchor = self.selection_anchor.unwrap_or(current_index);
+            self.select_visible_range(anchor, next_index);
+        } else {
+            self.selected_files.clear();
+            self.selected_files.insert(names[next_index].clone());
+            self.selection_anchor = Some(next_index);
         }
         cx.notify();
+    }
+
+    fn open_focused_or_selection(&mut self, cx: &mut ViewContext<Self>) {
+        if !self.selected_files.is_empty() {
+            self.open_primary_selection(cx);
+            return;
+        }
+
+        let names = self.visible_entry_names();
+        let Some(index) = self.list_focus_index else {
+            return;
+        };
+        let Some(name) = names.get(index) else {
+            return;
+        };
+
+        if self.using_subfolder_search() {
+            let path = PathBuf::from(name);
+            if path.is_dir() {
+                self.navigate_to(path, true, cx);
+            } else {
+                self.launch_file(&path, cx);
+            }
+            return;
+        }
+
+        let full_path = self.current_path.join(name);
+        if full_path.is_dir() {
+            self.navigate_to(full_path, true, cx);
+        } else {
+            self.launch_file(&full_path, cx);
+        }
+    }
+
+    fn launch_file(&mut self, path: &Path, cx: &mut ViewContext<Self>) {
+        let path = path.to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let result = Tokio::spawn(cx, async move { open::launch_path(path).await }).await;
+            let message = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(message) = message {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_status(message, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn launch_file_with_application(
+        &mut self,
+        application_id: String,
+        path: PathBuf,
+        cx: &mut ViewContext<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let result =
+                Tokio::spawn(cx, async move { open::launch_with_application(&application_id, path).await })
+                    .await;
+            let message = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(message) = message {
+                let _ = this.update(cx, |this, cx| {
+                    this.set_status(message, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn spawn_new_window(&mut self, cx: &mut ViewContext<Self>) {
+        let current_directory = self.current_path.clone();
+        match std::env::current_exe() {
+            Ok(executable) => {
+                match std::process::Command::new(executable)
+                    .arg(current_directory.to_string_lossy().to_string())
+                    .spawn()
+                {
+                    Ok(_) => self.set_status("Opened a new window", cx),
+                    Err(error) => self.set_status(format!("New window failed: {error}"), cx),
+                }
+            }
+            Err(error) => self.set_status(format!("New window failed: {error}"), cx),
+        }
     }
 
     fn selected_paths(&self) -> Vec<PathBuf> {
@@ -660,6 +861,7 @@ impl FilemanWindow {
     fn paste_dropped_files(
         &mut self,
         sources: Vec<PathBuf>,
+        destination_directory: PathBuf,
         is_cut: bool,
         cx: &mut ViewContext<Self>,
     ) {
@@ -667,7 +869,6 @@ impl FilemanWindow {
             return;
         }
 
-        let destination_directory = self.current_path.clone();
         let conflict_count = count_paste_conflicts(&sources, &destination_directory);
         if conflict_count > 0 {
             self.pending_paste_choice = Some(PendingPasteChoice {
@@ -694,26 +895,549 @@ impl FilemanWindow {
         if sources.is_empty() {
             return;
         }
-        self.paste_dropped_files(sources, false, cx);
+        self.paste_dropped_files(sources, self.current_path.clone(), false, cx);
     }
 
     fn drop_internal_files(&mut self, dragged: &DraggedFilePaths, cx: &mut ViewContext<Self>) {
-        let sources: Vec<PathBuf> = dragged
-            .paths
-            .iter()
-            .filter(|source| {
-                source
-                    .parent()
-                    .map(|parent| parent != self.current_path.as_path())
-                    .unwrap_or(true)
-            })
-            .cloned()
-            .collect();
+        let sources = drag::filter_sources_for_destination(
+            &dragged.paths,
+            &self.current_path,
+            true,
+        );
         if sources.is_empty() {
             self.set_status("Items are already in this folder", cx);
             return;
         }
-        self.paste_dropped_files(sources, true, cx);
+        self.paste_dropped_files(sources, self.current_path.clone(), true, cx);
+    }
+
+    fn drop_external_into_directory(
+        &mut self,
+        destination_directory: &Path,
+        paths: &gpui::ExternalPaths,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let sources = drag::filter_sources_for_destination(
+            &paths.paths().to_vec(),
+            destination_directory,
+            false,
+        );
+        if sources.is_empty() {
+            self.set_status("Cannot copy into this folder", cx);
+            return;
+        }
+        self.paste_dropped_files(sources, destination_directory.to_path_buf(), false, cx);
+    }
+
+    fn drop_into_directory(
+        &mut self,
+        destination_directory: &Path,
+        dragged: &DraggedFilePaths,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let sources =
+            drag::filter_sources_for_destination(&dragged.paths, destination_directory, true);
+        if sources.is_empty() {
+            self.set_status("Cannot move into this folder", cx);
+            return;
+        }
+        self.paste_dropped_files(sources, destination_directory.to_path_buf(), true, cx);
+    }
+
+    fn files_list_item_height(&self) -> Pixels {
+        match self.view_mode {
+            ViewMode::Compact => px(40.0),
+            ViewMode::Table => px(36.0),
+            ViewMode::List => px(36.0),
+            ViewMode::Icon => px(96.0),
+        }
+    }
+
+    fn marquee_viewport_bounds(&self) -> Bounds<Pixels> {
+        self.files_scroll_handle.0.borrow().base_handle.bounds()
+    }
+
+    fn marquee_scroll_offset(&self) -> Point<Pixels> {
+        self.files_scroll_handle.0.borrow().base_handle.offset()
+    }
+
+    fn refresh_uniform_list_row_height(&mut self, item_count: usize) {
+        if item_count == 0 {
+            self.uniform_list_row_height = None;
+            return;
+        }
+
+        let state = self.files_scroll_handle.0.borrow();
+        let Some(item_size) = state.last_item_size else {
+            return;
+        };
+        let measured = px(item_size.contents.height.as_f32() / item_count as f32);
+        if measured > px(0.) {
+            self.uniform_list_row_height = Some(measured);
+        }
+    }
+
+    fn marquee_list_row_height(&self) -> Pixels {
+        self.uniform_list_row_height
+            .filter(|height| *height > px(0.))
+            .unwrap_or_else(|| self.files_list_item_height())
+    }
+
+    fn marquee_local_point(&self, window_point: Point<Pixels>) -> Point<Pixels> {
+        let bounds = self.marquee_viewport_bounds();
+        point(
+            window_point.x - bounds.origin.x,
+            window_point.y - bounds.origin.y,
+        )
+    }
+
+    fn clamp_pixels(value: Pixels, min: Pixels, max: Pixels) -> Pixels {
+        px(value.as_f32().clamp(min.as_f32(), max.as_f32()))
+    }
+
+    fn marquee_clamp_pointer_to_viewport(&self, pointer: Point<Pixels>) -> Point<Pixels> {
+        let bounds = self.marquee_viewport_bounds();
+        if bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
+            return pointer;
+        }
+
+        point(
+            Self::clamp_pixels(pointer.x, bounds.left(), bounds.right()),
+            Self::clamp_pixels(pointer.y, bounds.top(), bounds.bottom()),
+        )
+    }
+
+    fn marquee_autoscroll_axes(&self, pointer: Point<Pixels>) -> (i8, i8) {
+        let bounds = self.marquee_viewport_bounds();
+        if bounds.size.width <= px(0.) || bounds.size.height <= px(0.) {
+            return (0, 0);
+        }
+
+        let edge = px(drag::MARQUEE_EDGE_THRESHOLD);
+        let local_x = pointer.x - bounds.origin.x;
+        let local_y = pointer.y - bounds.origin.y;
+        let vertical = if local_y < edge {
+            -1
+        } else if local_y > bounds.size.height - edge {
+            1
+        } else {
+            0
+        };
+        let horizontal = if local_x < edge {
+            -1
+        } else if local_x > bounds.size.width - edge {
+            1
+        } else {
+            0
+        };
+        (vertical, horizontal)
+    }
+
+    fn marquee_scroll_by(&self, delta: Point<Pixels>) {
+        let scroll_handle = &self.files_scroll_handle.0.borrow().base_handle;
+        let mut offset = scroll_handle.offset();
+        let max_offset = scroll_handle.max_offset();
+        offset.x = Self::clamp_pixels(offset.x + delta.x, -max_offset.x, px(0.));
+        offset.y = Self::clamp_pixels(offset.y + delta.y, -max_offset.y, px(0.));
+        scroll_handle.set_offset(offset);
+    }
+
+    fn tick_marquee_autoscroll(&mut self, cx: &mut ViewContext<Self>) {
+        let (vertical, horizontal, extend_selection) = {
+            let Some(marquee) = self.marquee_drag.as_ref() else {
+                return;
+            };
+            (
+                marquee.autoscroll_vertical,
+                marquee.autoscroll_horizontal,
+                marquee.extend_selection,
+            )
+        };
+
+        if vertical == 0 && horizontal == 0 {
+            return;
+        }
+
+        let step = px(drag::MARQUEE_AUTOSCROLL_STEP);
+        self.marquee_scroll_by(point(
+            step * horizontal as f32,
+            step * -vertical as f32,
+        ));
+
+        let bounds = self.marquee_viewport_bounds();
+        let pointer = {
+            let Some(marquee) = self.marquee_drag.as_ref() else {
+                return;
+            };
+            point(
+                if horizontal > 0 {
+                    bounds.right()
+                } else if horizontal < 0 {
+                    bounds.left()
+                } else {
+                    marquee.pointer.x
+                },
+                if vertical > 0 {
+                    bounds.bottom()
+                } else if vertical < 0 {
+                    bounds.top()
+                } else {
+                    marquee.pointer.y
+                },
+            )
+        };
+
+        self.update_marquee_drag(pointer, extend_selection, cx);
+    }
+
+    fn start_marquee_autoscroll_task(&mut self, cx: &mut ViewContext<Self>) {
+        self.marquee_autoscroll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+
+                let continue_task = this
+                    .update(cx, |this, cx| {
+                        if this.marquee_drag.is_none() {
+                            return false;
+                        }
+                        this.tick_marquee_autoscroll(cx);
+                        true
+                    })
+                    .unwrap_or(false);
+
+                if !continue_task {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn marquee_list_point(&self, window_point: Point<Pixels>) -> Point<Pixels> {
+        let bounds = self.marquee_viewport_bounds();
+        let scroll = self.marquee_scroll_offset();
+        point(
+            window_point.x - bounds.origin.x - scroll.x,
+            -scroll.y + (window_point.y - bounds.origin.y),
+        )
+    }
+
+    fn marquee_list_index_for_list_y(&self, list_y: Pixels, item_count: usize) -> usize {
+        if item_count == 0 {
+            return 0;
+        }
+
+        let item_height = self.marquee_list_row_height();
+        if item_height <= px(0.) {
+            return 0;
+        }
+
+        let index = (list_y / item_height).floor().max(0.0) as usize;
+        index.min(item_count - 1)
+    }
+
+    fn attach_marquee_handlers(
+        &self,
+        layer: Stateful<Div>,
+        cx: &mut ViewContext<Self>,
+    ) -> Stateful<Div> {
+        layer
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                if event.button == MouseButton::Left {
+                    this.begin_marquee_drag(
+                        event.position,
+                        event.modifiers.control || event.modifiers.platform,
+                        window,
+                        cx,
+                    );
+                }
+            }))
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if this.marquee_drag.is_some()
+                    && event.pressed_button != Some(MouseButton::Left)
+                {
+                    this.finish_marquee_drag(cx);
+                    return;
+                }
+                if this.marquee_drag.is_some() {
+                    let extend_selection = this
+                        .marquee_drag
+                        .as_ref()
+                        .is_some_and(|marquee| marquee.extend_selection);
+                    this.update_marquee_drag(event.position, extend_selection, cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.finish_marquee_drag(cx);
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                    this.finish_marquee_drag(cx);
+                }),
+            )
+    }
+
+    fn register_marquee_window_listeners(&self, window: &mut Window, cx: &mut ViewContext<Self>) {
+        let view = cx.entity();
+        let view_for_mouse_up = view.clone();
+        window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture {
+                let _ = view_for_mouse_up.update(cx, |this, cx| {
+                    if this.marquee_drag.is_some() {
+                        this.finish_marquee_drag(cx);
+                    }
+                });
+            }
+        });
+        let view_for_mouse_move = view.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+            if phase != DispatchPhase::Capture {
+                return;
+            }
+
+            if event.pressed_button == Some(MouseButton::Left) {
+                let _ = view_for_mouse_move.update(cx, |this, cx| {
+                    if let Some(extend_selection) =
+                        this.marquee_drag.as_ref().map(|marquee| marquee.extend_selection)
+                    {
+                        this.update_marquee_drag(window.mouse_position(), extend_selection, cx);
+                    }
+                });
+            } else {
+                let _ = view_for_mouse_move.update(cx, |this, cx| {
+                    if this.marquee_drag.is_some() {
+                        this.finish_marquee_drag(cx);
+                    }
+                });
+            }
+        });
+    }
+
+    fn begin_marquee_drag(
+        &mut self,
+        origin: Point<Pixels>,
+        extend_selection: bool,
+        window: &mut Window,
+        cx: &mut ViewContext<Self>,
+    ) {
+        if self.using_subfolder_search() {
+            return;
+        }
+
+        if !extend_selection {
+            self.clear_selection(cx);
+        }
+
+        let clamped_origin = self.marquee_clamp_pointer_to_viewport(origin);
+        let origin_list = self.marquee_list_point(clamped_origin);
+        let (autoscroll_vertical, autoscroll_horizontal) =
+            self.marquee_autoscroll_axes(clamped_origin);
+        self.marquee_drag = Some(MarqueeDrag {
+            origin,
+            pointer: clamped_origin,
+            origin_list,
+            pointer_list: origin_list,
+            extend_selection,
+            active: false,
+            autoscroll_vertical,
+            autoscroll_horizontal,
+        });
+        self.start_marquee_autoscroll_task(cx);
+        self.marquee_cancel_subscription = Some(cx.observe_window_activation(
+            window,
+            |this, _, cx| {
+                if this.marquee_drag.is_some() {
+                    this.finish_marquee_drag(cx);
+                }
+            },
+        ));
+        cx.notify();
+    }
+
+    fn update_marquee_drag(
+        &mut self,
+        pointer: Point<Pixels>,
+        extend_selection: bool,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let clamped_pointer = self.marquee_clamp_pointer_to_viewport(pointer);
+        let pointer_list = self.marquee_list_point(clamped_pointer);
+        let (autoscroll_vertical, autoscroll_horizontal) =
+            self.marquee_autoscroll_axes(clamped_pointer);
+        let (origin_list, pointer_list, should_apply) = {
+            let Some(marquee) = self.marquee_drag.as_mut() else {
+                return;
+            };
+
+            marquee.pointer = clamped_pointer;
+            marquee.pointer_list = pointer_list;
+            marquee.autoscroll_vertical = autoscroll_vertical;
+            marquee.autoscroll_horizontal = autoscroll_horizontal;
+            if !marquee.active
+                && drag::marquee_exceeds_threshold(marquee.origin, clamped_pointer)
+            {
+                marquee.active = true;
+            }
+
+            (
+                marquee.origin_list,
+                marquee.pointer_list,
+                marquee.active,
+            )
+        };
+
+        if should_apply {
+            self.apply_marquee_selection(origin_list, pointer_list, extend_selection);
+        }
+        cx.notify();
+    }
+
+    fn finish_marquee_drag(&mut self, cx: &mut ViewContext<Self>) {
+        self.marquee_cancel_subscription.take();
+        self.marquee_autoscroll_task.take();
+        if self.marquee_drag.is_some() {
+            self.marquee_drag = None;
+            cx.notify();
+        }
+    }
+
+    fn apply_marquee_selection(
+        &mut self,
+        origin_list: Point<Pixels>,
+        pointer_list: Point<Pixels>,
+        extend_selection: bool,
+    ) {
+        let names = self.visible_entry_names();
+        if names.is_empty() {
+            return;
+        }
+
+        let (Some(start_index), Some(end_index)) =
+            self.marquee_index_range(origin_list, pointer_list, names.len())
+        else {
+            return;
+        };
+
+        if !extend_selection {
+            self.selected_files.clear();
+        }
+
+        for index in start_index..=end_index {
+            if let Some(name) = names.get(index) {
+                self.selected_files.insert(name.clone());
+            }
+        }
+
+        self.selection_anchor = Some(start_index);
+        self.list_focus_index = Some(end_index);
+    }
+
+    fn icon_grid_columns(&self) -> usize {
+        const ICON_CELL_WIDTH: f32 = 88.0;
+        const ICON_GRID_GAP: f32 = 8.0;
+        let panel_width: f32 = self.marquee_viewport_bounds().size.width.into();
+        let panel_width = if panel_width > 0.0 {
+            panel_width
+        } else {
+            let total_width = self.config.window.last_window_width.max(800) as f32;
+            let sidebar_width = self.config.window.splitter_pos as f32;
+            (total_width - sidebar_width - 64.0).max(200.0)
+        };
+        (panel_width / (ICON_CELL_WIDTH + ICON_GRID_GAP))
+            .floor()
+            .max(1.0) as usize
+    }
+
+    fn marquee_index_range(
+        &self,
+        origin_list: Point<Pixels>,
+        pointer_list: Point<Pixels>,
+        item_count: usize,
+    ) -> (Option<usize>, Option<usize>) {
+        if item_count == 0 {
+            return (None, None);
+        }
+
+        let clamp_index = |index: usize| index.min(item_count.saturating_sub(1));
+
+        if self.view_mode == ViewMode::Icon {
+            let columns = self.icon_grid_columns().max(1);
+            let padding = px(8.0);
+            let gap = px(8.0);
+            let cell_width = px(88.0) + gap;
+            let cell_height = self.files_list_item_height() + gap;
+
+            let index_at = |point: Point<Pixels>| -> usize {
+                let row = ((point.y - padding) / cell_height).floor().max(0.0) as usize;
+                let column = ((point.x - padding) / cell_width).floor().max(0.0) as usize;
+                row * columns + column
+            };
+
+            let top_left = Point::new(
+                origin_list.x.min(pointer_list.x),
+                origin_list.y.min(pointer_list.y),
+            );
+            let bottom_right = Point::new(
+                origin_list.x.max(pointer_list.x),
+                origin_list.y.max(pointer_list.y),
+            );
+            return (
+                Some(clamp_index(index_at(top_left))),
+                Some(clamp_index(index_at(bottom_right))),
+            );
+        }
+
+        let start_index = clamp_index(self.marquee_list_index_for_list_y(
+            origin_list.y.min(pointer_list.y),
+            item_count,
+        ));
+        let end_index = clamp_index(self.marquee_list_index_for_list_y(
+            origin_list.y.max(pointer_list.y),
+            item_count,
+        ));
+        (Some(start_index), Some(end_index))
+    }
+
+    fn apply_directory_drop_target(
+        &self,
+        row: Stateful<Div>,
+        destination: PathBuf,
+        cx: &mut ViewContext<Self>,
+    ) -> Stateful<Div> {
+        row.drag_over::<DraggedFilePaths>(|style, _, _, cx| drop_target_style(style, cx))
+            .drag_over::<ExternalPaths>(|style, _, _, cx| drop_target_style(style, cx))
+            .can_drop({
+                let destination = destination.clone();
+                move |payload, _, _| {
+                    payload
+                        .downcast_ref::<DraggedFilePaths>()
+                        .is_some_and(|dragged| {
+                            drag::is_valid_drop_destination(&dragged.paths, &destination)
+                        })
+                        || payload
+                            .downcast_ref::<ExternalPaths>()
+                            .is_some_and(|paths| {
+                                drag::is_valid_drop_destination(paths.paths(), &destination)
+                            })
+                }
+            })
+            .on_drop(cx.listener({
+                let destination = destination.clone();
+                move |this, dragged: &DraggedFilePaths, _, cx| {
+                    this.drop_into_directory(&destination, dragged, cx);
+                }
+            }))
+            .on_drop(cx.listener({
+                let destination = destination.clone();
+                move |this, paths: &ExternalPaths, _, cx| {
+                    this.drop_external_into_directory(&destination, paths, cx);
+                }
+            }))
     }
 
     fn request_delete(&mut self, permanent: bool, cx: &mut ViewContext<Self>) {
@@ -863,13 +1587,21 @@ impl FilemanWindow {
         cx: &mut ViewContext<Self>,
     ) {
         let action_label = if is_cut { "Moving" } else { "Copying" };
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.paste_cancel = Some(cancel.clone());
         self.set_status(format!("{action_label} {} items…", sources.len()), cx);
+        cx.notify();
 
         cx.spawn(async move |this, cx| {
             let total = sources.len() as u32;
             let mut combined = PasteResult::default();
             let paste_destination = destination_directory.clone();
             for (index, source) in sources.into_iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
+                    combined.cancelled = true;
+                    break;
+                }
+
                 let current = index as u32 + 1;
                 let file_name = source
                     .file_name()
@@ -883,30 +1615,56 @@ impl FilemanWindow {
                     );
                 });
                 let paste_destination = paste_destination.clone();
+                let cancel_flag = cancel.clone();
                 let partial = Tokio::spawn(cx, async move {
-                    run_paste_batch(vec![source], paste_destination, is_cut, settings)
+                    run_paste_batch(
+                        vec![source],
+                        paste_destination,
+                        is_cut,
+                        settings,
+                        Some(cancel_flag),
+                    )
                 })
                 .await
                 .unwrap_or_default();
                 combined.errors.extend(partial.errors);
                 combined.recorded_moves.extend(partial.recorded_moves);
+                if partial.cancelled {
+                    combined.cancelled = true;
+                    break;
+                }
             }
 
-            let status = if combined.errors.is_empty() {
+            let status = if combined.cancelled {
+                if combined.errors.is_empty() {
+                    "Paste cancelled".to_string()
+                } else {
+                    format!("Paste cancelled; {}", combined.errors.join("; "))
+                }
+            } else if combined.errors.is_empty() {
                 format!("{action_label} complete")
             } else {
                 combined.errors.join("; ")
             };
 
             let _ = this.update(cx, |this, cx| {
-                for (source, dest) in combined.recorded_moves {
-                    this.undo_stack.push_move(source, dest);
+                this.paste_cancel = None;
+                for (source, destination) in combined.recorded_moves {
+                    this.undo_stack.push_move(source, destination);
                 }
                 this.set_status(status, cx);
                 this.reload_current_directory(cx);
             });
         })
         .detach();
+    }
+
+    fn cancel_active_paste(&mut self, cx: &mut ViewContext<Self>) {
+        if let Some(cancel) = &self.paste_cancel {
+            cancel.store(true, Ordering::Relaxed);
+            self.set_status("Cancelling paste…", cx);
+            cx.notify();
+        }
     }
 
     fn confirm_paste_with_resolution(
@@ -1043,7 +1801,10 @@ impl FilemanWindow {
                 self.search_query = text;
                 self.schedule_subfolder_search(cx);
             }
-            ToolbarLineInputEvent::Submit => self.open_primary_selection(cx),
+            ToolbarLineInputEvent::Submit => {
+                self.record_search_history();
+                cx.notify();
+            }
             ToolbarLineInputEvent::Cancel => self.clear_search(cx),
         }
     }
@@ -1224,11 +1985,109 @@ impl FilemanWindow {
             self.set_status("Nothing selected for properties", cx);
             return;
         }
-        self.pending_properties = properties::properties_for_paths(&paths);
-        if self.pending_properties.is_none() {
-            self.set_status("Could not read properties", cx);
+        let mut dialog = match properties::properties_for_paths(&paths) {
+            Some(dialog) => dialog,
+            None => {
+                self.set_status("Could not read properties", cx);
+                return;
+            }
+        };
+
+        if paths.len() == 1 {
+            let path = &paths[0];
+            if let Some(icon) =
+                self.icon_cache
+                    .cached_icon(path, properties::PROPERTIES_ICON_SIZE)
+            {
+                dialog.icon = Some(icon);
+            }
         }
+
+        self.pending_properties = Some(dialog);
         cx.notify();
+
+        if paths.len() != 1 {
+            return;
+        }
+
+        let path = paths[0].clone();
+        let file_type = self.file_type_for_path(&path);
+        let Some(icon_service) = nptk::file_icons::FileIconService::global(cx).cloned() else {
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            let path_for_kind = path.clone();
+            let kind_row = Tokio::spawn(cx, async move {
+                properties::mime_kind_row(&path_for_kind).await
+            })
+            .await
+            .ok()
+            .flatten();
+
+            if let Some(kind_row) = kind_row {
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(dialog) = this.pending_properties.as_mut() {
+                        properties::insert_kind_row(dialog, kind_row);
+                        cx.notify();
+                    }
+                });
+            }
+
+            let icon_size = properties::PROPERTIES_ICON_SIZE;
+            let path_for_icon = path.clone();
+            let presentation = Tokio::spawn(cx, async move {
+                icons::FileIconCache::load_icon(
+                    &icon_service,
+                    path_for_icon,
+                    icon_size,
+                    file_type,
+                    true,
+                )
+                .await
+            })
+            .await
+            .ok()
+            .flatten();
+
+            let Some(presentation) = presentation else {
+                return;
+            };
+
+            let path_for_cache = path.clone();
+            let _ = this.update(cx, |this, cx| {
+                if let Some(dialog) = this.pending_properties.as_mut() {
+                    if dialog.icon.is_none() {
+                        dialog.icon = Some(presentation.clone());
+                    }
+                    this.icon_cache
+                        .store_icon(path_for_cache, icon_size, presentation);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn file_type_for_path(&self, path: &Path) -> FileType {
+        if let Some(name) = path.file_name().and_then(|segment| segment.to_str()) {
+            if let Some(file) = self.files.iter().find(|file| file.get_name() == Some(name)) {
+                if self.current_path.join(name) == path {
+                    return file.get_file_type();
+                }
+            }
+        }
+
+        let Ok(metadata) = nptk::std::fs::symlink_metadata(path) else {
+            return FileType::Regular;
+        };
+        if metadata.is_dir() {
+            FileType::Directory
+        } else if metadata.file_type().is_symlink() {
+            FileType::SymbolicLink
+        } else {
+            FileType::Regular
+        }
     }
 
     fn dismiss_properties(&mut self, cx: &mut ViewContext<Self>) {
@@ -1250,6 +2109,18 @@ impl FilemanWindow {
         self.dismiss_context_menu();
         let focus_handle = self.focus_handle.clone();
         let has_selection = !self.selected_files.is_empty();
+        let selected_paths = self.selected_paths();
+        let open_action_label = open::open_label_for_path(
+            selected_paths
+                .first()
+                .map(|path| path.as_path())
+                .unwrap_or(Path::new("")),
+        );
+        let open_with_handlers = selected_paths
+            .first()
+            .map(|path| open::handlers_for_path(path))
+            .unwrap_or_default();
+        let window_weak = cx.weak_entity();
 
         let context_menu = ContextMenu::build(window, cx, move |menu, _, _| {
             let mut menu = menu.context(focus_handle.clone());
@@ -1266,8 +2137,35 @@ impl FilemanWindow {
                         .action("Open Terminal Here", OpenTerminal.boxed_clone());
                 }
                 ContextMenuTarget::FileList => {
+                    menu = menu.action(open_action_label.as_str(), OpenSelection.boxed_clone());
+                    if !open_with_handlers.is_empty() {
+                        let handlers = open_with_handlers.clone();
+                        let paths_for_open = selected_paths.clone();
+                        let weak = window_weak.clone();
+                        menu = menu.submenu("Open With", move |submenu, _, _| {
+                            let mut submenu = submenu;
+                            for handler in &handlers {
+                                let application_id = handler.app_id.clone();
+                                let label = handler.label.clone();
+                                let path = paths_for_open
+                                    .first()
+                                    .cloned()
+                                    .unwrap_or_default();
+                                let weak = weak.clone();
+                                submenu = submenu.entry(label, None, move |_, cx| {
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.launch_file_with_application(
+                                            application_id.clone(),
+                                            path.clone(),
+                                            cx,
+                                        );
+                                    });
+                                });
+                            }
+                            submenu
+                        });
+                    }
                     menu = menu
-                        .action("Open", OpenSelection.boxed_clone())
                         .separator()
                         .action("Cut", Cut.boxed_clone())
                         .action("Copy", Copy.boxed_clone())
@@ -1307,6 +2205,21 @@ impl FilemanWindow {
         self.context_menu = Some((context_menu, position, subscription));
     }
 
+    fn open_selection_with_system(&mut self, cx: &mut ViewContext<Self>) {
+        let paths = self.selected_paths();
+        if paths.len() != 1 {
+            self.set_status("Select a single item to open with the system handler", cx);
+            return;
+        }
+        let path = paths[0].clone();
+        if path.is_dir() {
+            self.navigate_to(path, true, cx);
+        } else {
+            cx.open_with_system(&path);
+            self.set_status(format!("Opened {} with the system default", path.display()), cx);
+        }
+    }
+
     fn open_primary_selection(&mut self, cx: &mut ViewContext<Self>) {
         let paths = self.selected_paths();
         if paths.len() != 1 {
@@ -1317,7 +2230,7 @@ impl FilemanWindow {
         if path.is_dir() {
             self.navigate_to(path, true, cx);
         } else {
-            cx.open_with_system(&path);
+            self.launch_file(&path, cx);
         }
     }
 
@@ -1393,7 +2306,20 @@ impl FilemanWindow {
         }
         self.dismiss_context_menu();
         self.selected_files.clear();
+        self.selection_anchor = None;
+        self.list_focus_index = None;
         cx.notify();
+    }
+
+    fn record_search_history(&mut self) {
+        const MAX_SEARCH_HISTORY: usize = 10;
+        let query = self.search_query.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.search_history.retain(|entry| entry != &query);
+        self.search_history.insert(0, query);
+        self.search_history.truncate(MAX_SEARCH_HISTORY);
     }
 
     fn activate_search(&mut self, window: &mut Window, cx: &mut ViewContext<Self>) {
@@ -1558,6 +2484,8 @@ impl FilemanWindow {
             return;
         }
 
+        let use_thumbnails = matches!(self.view_mode, ViewMode::Icon | ViewMode::Compact);
+
         let Some(icon_service) = nptk::file_icons::FileIconService::global(cx).cloned() else {
             return;
         };
@@ -1572,6 +2500,7 @@ impl FilemanWindow {
                         path_for_load,
                         icon_size,
                         file_type,
+                        use_thumbnails,
                     )
                     .await
                 })
@@ -1797,6 +2726,83 @@ impl FilemanWindow {
         if self.path_edit_active || self.search_active {
             return;
         }
+
+        if self.paste_cancel.is_some() && event.keystroke.key == "escape" {
+            self.cancel_active_paste(cx);
+            return;
+        }
+
+        if self.pending_delete.is_some()
+            || self.pending_properties.is_some()
+            || self.pending_paste_choice.is_some()
+            || self.show_about
+        {
+            if event.keystroke.key == "escape" {
+                if self.pending_delete.is_some() {
+                    self.cancel_pending_delete(cx);
+                } else if self.pending_properties.is_some() {
+                    self.pending_properties = None;
+                    cx.notify();
+                } else if self.pending_paste_choice.is_some() {
+                    self.cancel_pending_paste(cx);
+                } else if self.show_about {
+                    self.show_about = false;
+                    cx.notify();
+                }
+            }
+            return;
+        }
+
+        self.handle_file_list_key(event, cx);
+    }
+
+    fn handle_file_list_key(&mut self, event: &KeyDownEvent, cx: &mut ViewContext<Self>) {
+        let key = event.keystroke.key.as_str();
+        let shift = event.keystroke.modifiers.shift;
+        let control = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+
+        match key {
+            "up" | "arrowup" => self.move_list_focus(-1, shift, cx),
+            "down" | "arrowdown" => self.move_list_focus(1, shift, cx),
+            "home" => {
+                let names = self.visible_entry_names();
+                if names.is_empty() {
+                    return;
+                }
+                if shift {
+                    self.select_visible_range(self.selection_anchor.unwrap_or(0), 0);
+                } else {
+                    self.selected_files.clear();
+                    self.selected_files.insert(names[0].clone());
+                    self.selection_anchor = Some(0);
+                }
+                self.list_focus_index = Some(0);
+                self.files_scroll_handle
+                    .scroll_to_item(0, ScrollStrategy::Top);
+                cx.notify();
+            }
+            "end" => {
+                let names = self.visible_entry_names();
+                if names.is_empty() {
+                    return;
+                }
+                let last = names.len() - 1;
+                if shift {
+                    self.select_visible_range(self.selection_anchor.unwrap_or(0), last);
+                } else {
+                    self.selected_files.clear();
+                    self.selected_files.insert(names[last].clone());
+                    self.selection_anchor = Some(last);
+                }
+                self.list_focus_index = Some(last);
+                self.files_scroll_handle
+                    .scroll_to_item(last, ScrollStrategy::Bottom);
+                cx.notify();
+            }
+            "enter" => self.open_focused_or_selection(cx),
+            "space" if !control => self.open_focused_or_selection(cx),
+            _ => {}
+        }
     }
 
 
@@ -1837,6 +2843,10 @@ impl FilemanWindow {
 impl Render for FilemanWindow {
     fn render(&mut self, window: &mut Window, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
+
+        if self.marquee_drag.is_some() {
+            self.register_marquee_window_listeners(window, cx);
+        }
 
         div()
             .id("fileman-root")
@@ -1904,6 +2914,9 @@ impl Render for FilemanWindow {
             .on_action(cx.listener(|this, _action: &OpenSelection, _, cx| {
                 this.open_primary_selection(cx)
             }))
+            .on_action(cx.listener(|this, _action: &OpenWithSystem, _, cx| {
+                this.open_selection_with_system(cx)
+            }))
             .on_action(cx.listener(|this, _action: &ShowProperties, _, cx| {
                 this.show_properties_for_selection(cx)
             }))
@@ -1920,6 +2933,9 @@ impl Render for FilemanWindow {
                 this.zoom_icons_reset(cx)
             }))
             .on_action(cx.listener(|this, _action: &NewTab, _, cx| this.new_tab(cx)))
+            .on_action(cx.listener(|this, _action: &NewWindow, _, cx| {
+                this.spawn_new_window(cx)
+            }))
             .on_action(cx.listener(|this, _action: &CloseTab, _, cx| this.close_tab(cx)))
             .on_action(cx.listener(|this, _action: &AddBookmark, _, cx| {
                 this.add_bookmark_for_current(cx)
@@ -1971,7 +2987,7 @@ impl Render for FilemanWindow {
                     .child(self.render_sidebar(window, cx))
                     .child(self.render_main_panel(window, cx))
             )
-            .child(self.render_status_bar(cx))
+            .child(self.render_status_bar(window, cx))
             .when_some(self.pending_delete.clone(), |root, pending| {
                 root.child(Self::render_delete_dialog(pending, cx))
             })
@@ -2008,7 +3024,7 @@ impl FilemanWindow {
         let bookmark_paths = self.bookmark_paths.clone();
         let volume_mounts = self.volume_mounts.clone();
 
-        v_flex()
+        let sidebar = v_flex()
             .id("fileman-sidebar")
             .w(px(sidebar_width as f32))
             .h_full()
@@ -2018,6 +3034,14 @@ impl FilemanWindow {
             .p_3()
             .gap_2()
             .overflow_y_scroll()
+            .drag_over::<DraggedFilePaths>(|style, _, _, cx| drop_target_style(style, cx))
+            .drag_over::<ExternalPaths>(|style, _, _, cx| drop_target_style(style, cx))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.drop_external_files(paths, cx);
+            }))
+            .on_drop(cx.listener(|this, dragged: &DraggedFilePaths, _, cx| {
+                this.drop_internal_files(dragged, cx);
+            }))
             .child(Headline::new("Quick Access").size(HeadlineSize::XSmall))
             .child(
                 v_flex()
@@ -2027,35 +3051,43 @@ impl FilemanWindow {
                         let path_clone = path.clone();
                         let label_string = label.to_string();
 
-                        ListItem::new(SharedString::from(format!("sidebar-{label_string}")))
-                            .toggle_state(is_active)
-                            .rounded()
-                            .start_slot(ui_icons::cached_icon_element(
-                                ui_icons::quick_access_theme_icon(label)
-                                    .and_then(|name| {
-                                        self.icon_cache.cached_theme_icon(
-                                            name,
-                                            ui_icons::SIDEBAR_ICON_PIXELS,
-                                        )
-                                    })
-                                    .or_else(|| {
-                                        self.icon_cache.cached_icon(
-                                            &path,
-                                            ui_icons::SIDEBAR_ICON_PIXELS,
-                                        )
-                                    }),
-                                IconSize::Small,
-                                if is_active {
-                                    Color::Selected
-                                } else {
-                                    Color::Muted
-                                },
-                                cx,
-                            ))
-                            .child(Label::new(label_string))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.navigate_to(path_clone.clone(), true, cx);
-                            }))
+                        self.apply_directory_drop_target(
+                            div()
+                                .id(SharedString::from(format!("sidebar-drop-{label_string}")))
+                                .child(
+                                ListItem::new(SharedString::from(format!("sidebar-{label_string}")))
+                                    .toggle_state(is_active)
+                                    .rounded()
+                                    .start_slot(ui_icons::cached_icon_element(
+                                        ui_icons::quick_access_theme_icon(label)
+                                            .and_then(|name| {
+                                                self.icon_cache.cached_theme_icon(
+                                                    name,
+                                                    ui_icons::SIDEBAR_ICON_PIXELS,
+                                                )
+                                            })
+                                            .or_else(|| {
+                                                self.icon_cache.cached_icon(
+                                                    &path,
+                                                    ui_icons::SIDEBAR_ICON_PIXELS,
+                                                )
+                                            }),
+                                        IconSize::Small,
+                                        if is_active {
+                                            Color::Selected
+                                        } else {
+                                            Color::Muted
+                                        },
+                                        cx,
+                                    ))
+                                    .child(Label::new(label_string))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.navigate_to(path_clone.clone(), true, cx);
+                                    })),
+                            ),
+                            path.clone(),
+                            cx,
+                        )
                     })),
             )
             .when(!volume_mounts.is_empty(), |sidebar| {
@@ -2066,32 +3098,44 @@ impl FilemanWindow {
                             |mount| {
                                 let is_active = mount.mount_point == self.current_path;
                                 let path = mount.mount_point.clone();
+                                let navigate_path = path.clone();
                                 let label = mount.label.clone();
                                 let item_id = SharedString::from(format!(
                                     "device-{}",
                                     mount.mount_point.display()
                                 ));
 
-                                ListItem::new(item_id)
-                                    .toggle_state(is_active)
-                                    .rounded()
-                                    .start_slot(ui_icons::cached_icon_element(
-                                        self.icon_cache.cached_icon(
-                                            &path,
-                                            ui_icons::SIDEBAR_ICON_PIXELS,
-                                        ),
-                                        IconSize::Small,
-                                        if is_active {
-                                            Color::Selected
-                                        } else {
-                                            Color::Muted
-                                        },
-                                        cx,
-                                    ))
-                                    .child(Label::new(label).truncate())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.navigate_to(path.clone(), true, cx);
-                                    }))
+                                self.apply_directory_drop_target(
+                                    div()
+                                        .id(item_id.clone())
+                                        .child(
+                                        ListItem::new(item_id)
+                                            .toggle_state(is_active)
+                                            .rounded()
+                                            .start_slot(ui_icons::cached_icon_element(
+                                                self.icon_cache.cached_icon(
+                                                    &path,
+                                                    ui_icons::SIDEBAR_ICON_PIXELS,
+                                                ),
+                                                IconSize::Small,
+                                                if is_active {
+                                                    Color::Selected
+                                                } else {
+                                                    Color::Muted
+                                                },
+                                                cx,
+                                            ))
+                                            .child(Label::new(label).truncate())
+                                            .on_click(cx.listener({
+                                                let navigate_path = navigate_path.clone();
+                                                move |this, _, _, cx| {
+                                                    this.navigate_to(navigate_path.clone(), true, cx);
+                                                }
+                                            })),
+                                    ),
+                                    path,
+                                    cx,
+                                )
                             },
                         )),
                     )
@@ -2112,34 +3156,47 @@ impl FilemanWindow {
                                 let item_id =
                                     SharedString::from(format!("bookmark-{}", path.display()));
 
-                                ListItem::new(item_id)
-                                    .toggle_state(is_active)
-                                    .rounded()
-                                    .start_slot(ui_icons::cached_icon_element(
-                                        self.icon_cache.cached_icon(
-                                            &path,
-                                            ui_icons::SIDEBAR_ICON_PIXELS,
-                                        ),
-                                        IconSize::Small,
-                                        if is_active {
-                                            Color::Selected
-                                        } else {
-                                            Color::Muted
-                                        },
-                                        cx,
-                                    ))
-                                    .child(Label::new(display_name.to_string()).truncate())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if path_clone.is_dir() {
-                                            this.navigate_to(path_clone.clone(), true, cx);
-                                        } else {
-                                            this.set_status("Bookmark path is not a directory", cx);
-                                        }
-                                    }))
+                                self.apply_directory_drop_target(
+                                    div()
+                                        .id(item_id.clone())
+                                        .child(
+                                        ListItem::new(item_id)
+                                            .toggle_state(is_active)
+                                            .rounded()
+                                            .start_slot(ui_icons::cached_icon_element(
+                                                self.icon_cache.cached_icon(
+                                                    &path,
+                                                    ui_icons::SIDEBAR_ICON_PIXELS,
+                                                ),
+                                                IconSize::Small,
+                                                if is_active {
+                                                    Color::Selected
+                                                } else {
+                                                    Color::Muted
+                                                },
+                                                cx,
+                                            ))
+                                            .child(Label::new(display_name.to_string()).truncate())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if path_clone.is_dir() {
+                                                    this.navigate_to(path_clone.clone(), true, cx);
+                                                } else {
+                                                    this.set_status(
+                                                        "Bookmark path is not a directory",
+                                                        cx,
+                                                    );
+                                                }
+                                            })),
+                                    ),
+                                    path.clone(),
+                                    cx,
+                                )
                             },
                         )),
                     )
-            })
+            });
+
+        sidebar
     }
 
     fn render_main_panel(&mut self, window: &mut Window, cx: &mut ViewContext<Self>) -> impl IntoElement {
@@ -2212,6 +3269,21 @@ impl FilemanWindow {
                     .icon_size(IconSize::Small)
                     .on_click(cx.listener(|this, _, _, cx| this.new_tab(cx))),
             )
+    }
+
+    fn render_toolbar_view_menu(&self, window: &mut Window, cx: &mut ViewContext<Self>) -> DropdownMenu {
+        DropdownMenu::new(
+            "toolbar-view-mode",
+            self.view_mode.menu_label(),
+            ContextMenu::build(window, cx, |menu, _, _| {
+                menu.action("List View", ViewList.boxed_clone())
+                    .action("Icon View", ViewIcon.boxed_clone())
+                    .action("Compact View", ViewCompact.boxed_clone())
+                    .action("Table View", ViewTable.boxed_clone())
+            }),
+        )
+        .style(DropdownStyle::Outlined)
+        .trigger_size(ButtonSize::Compact)
     }
 
     fn render_toolbar(&mut self, window: &mut Window, cx: &mut ViewContext<Self>) -> impl IntoElement {
@@ -2299,7 +3371,28 @@ impl FilemanWindow {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.paste_clipboard(cx)
                                     })),
-                            ),
+                            )
+                            .child(
+                                ThemeIconButton::new("toolbar-delete")
+                                    .cached(self.icon_cache.cached_theme_icon(
+                                        ui_icons::DELETE,
+                                        ui_icons::TOOLBAR_ICON_PIXELS,
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.delete_selected(cx)
+                                    })),
+                            )
+                            .child(
+                                ThemeIconButton::new("toolbar-properties")
+                                    .cached(self.icon_cache.cached_theme_icon(
+                                        ui_icons::PROPERTIES,
+                                        ui_icons::TOOLBAR_ICON_PIXELS,
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_properties_for_selection(cx)
+                                    })),
+                            )
+                            .child(self.render_toolbar_view_menu(window, cx)),
                     )
                     .child(self.render_location_bar(window, cx, center_border))
                     .child(
@@ -2348,18 +3441,24 @@ impl FilemanWindow {
         border_color: Hsla,
     ) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
+        let search_history = self.search_history.clone();
+        let search_active = self.search_active;
 
-        h_flex()
+        v_flex()
             .flex_1()
             .min_w_0()
-            .items_center()
-            .bg(colors.elevated_surface_background)
-            .border_1()
-            .border_color(border_color)
-            .rounded_md()
-            .px_2()
-            .py_1()
             .gap_1()
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .bg(colors.elevated_surface_background)
+                    .border_1()
+                    .border_color(border_color)
+                    .rounded_md()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
             .when(self.path_edit_active, |bar| {
                 bar.child(self.path_line_input.clone())
             })
@@ -2419,16 +3518,84 @@ impl FilemanWindow {
                         breadcrumb_button.into_any_element()
                     }
                 }))
+            }),
+            )
+            .when(search_active && !search_history.is_empty(), |column| {
+                column.child(
+                    h_flex()
+                        .w_full()
+                        .flex_wrap()
+                        .gap_1()
+                        .children(search_history.into_iter().enumerate().map(
+                            |(index, query)| {
+                                let query_for_click = query.clone();
+                                Button::new(
+                                    SharedString::from(format!("search-history-{index}")),
+                                    query,
+                                )
+                                .style(ButtonStyle::Transparent)
+                                .size(ButtonSize::Compact)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let query = query_for_click.clone();
+                                    this.search_query = query.clone();
+                                    this.search_line_input.update(cx, |input, cx| {
+                                        input.set_text(query, cx);
+                                    });
+                                    this.schedule_subfolder_search(cx);
+                                    cx.notify();
+                                }))
+                            },
+                        )),
+                )
             })
+    }
+
+    fn render_file_entry_range(
+        &mut self,
+        range: Range<usize>,
+        view_mode: ViewMode,
+        window: &mut Window,
+        cx: &mut ViewContext<Self>,
+    ) -> Vec<AnyElement> {
+        self.list_visible_range = Some(range.clone());
+        self.refresh_uniform_list_row_height(self.visible_files().len());
+        let visible_files = self.visible_files();
+        range
+            .filter_map(|entry_index| {
+                visible_files.get(entry_index).map(|file_info| {
+                    self.render_file_entry(file_info, entry_index, view_mode, window, cx)
+                })
+            })
+            .collect()
+    }
+
+    fn render_search_match_range(
+        &mut self,
+        range: Range<usize>,
+        window: &mut Window,
+        cx: &mut ViewContext<Self>,
+    ) -> Vec<AnyElement> {
+        self.list_visible_range = Some(range.clone());
+        self.refresh_uniform_list_row_height(self.search_matches.len());
+        range
+            .filter_map(|entry_index| {
+                self.search_matches.get(entry_index).map(|search_match| {
+                    self.render_search_match(search_match, entry_index, window, cx)
+                })
+            })
+            .collect()
     }
 
     fn render_files_area(&mut self, window: &mut Window, cx: &mut ViewContext<Self>) -> impl IntoElement {
         let subfolder_search = self.using_subfolder_search();
-        let visible_files = self.visible_files();
         let view_mode = self.view_mode;
         let colors = cx.theme().colors().clone();
         let search_in_progress = self.search_in_progress;
-
+        let item_count = if subfolder_search {
+            self.search_matches.len()
+        } else {
+            self.visible_files().len()
+        };
         let empty_state = v_flex()
             .flex_1()
             .items_center()
@@ -2465,28 +3632,31 @@ impl FilemanWindow {
                 .size(LabelSize::Small),
             );
 
-        let search_rows: Vec<_> = if subfolder_search {
-            self.search_matches
-                .iter()
-                .map(|search_match| self.render_search_match(search_match, window, cx))
+        let icon_rows: Vec<_> = if view_mode == ViewMode::Icon
+            && !self.loading_directory
+            && !search_in_progress
+            && item_count > 0
+        {
+            self.visible_files()
+                .into_iter()
+                .enumerate()
+                .map(|(index, file_info)| {
+                    self.render_file_entry(file_info, index, view_mode, window, cx)
+                })
                 .collect()
         } else {
             Vec::new()
         };
 
-        let file_rows: Vec<_> = if subfolder_search {
-            search_rows
-        } else {
-            visible_files
-                .into_iter()
-                .map(|file_info| self.render_file_entry(file_info, view_mode, window, cx))
-                .collect()
-        };
-
         let scroll = div()
             .id("files-scroll-area")
             .flex_1()
-            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .relative()
+            .drag_over::<DraggedFilePaths>(|style, _, _, cx| drop_target_style(style, cx))
+            .drag_over::<ExternalPaths>(|style, _, _, cx| drop_target_style(style, cx))
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 this.drop_external_files(paths, cx);
             }))
@@ -2507,52 +3677,124 @@ impl FilemanWindow {
             )
             .when(self.loading_directory || search_in_progress, |panel| panel.child(loading_state))
             .when(
-                !self.loading_directory && !search_in_progress && file_rows.is_empty(),
+                !self.loading_directory && !search_in_progress && item_count == 0,
                 |panel| panel.child(empty_state),
             );
 
-        match view_mode {
-            ViewMode::Icon => scroll
-                .p_2()
-                .flex()
-                .flex_wrap()
-                .gap_2()
-                .children(file_rows),
-            ViewMode::List | ViewMode::Compact | ViewMode::Table => {
-                let mut panel = scroll.p_2().flex().flex_col().gap_0p5();
-                if view_mode == ViewMode::Table && !self.loading_directory && !file_rows.is_empty() {
-                    panel = panel.child(
-                        h_flex()
-                            .px_2()
-                            .py_1()
-                            .gap_2()
-                            .border_b_1()
-                            .border_color(colors.border_variant)
-                            .child(
-                                Label::new("Name")
+        if view_mode == ViewMode::Icon {
+            let icon_scroll_handle = self.files_scroll_handle.0.borrow().base_handle.clone();
+            scroll.child(
+                self.attach_marquee_handlers(
+                    div()
+                        .id("fileman-marquee-layer")
+                        .flex_1()
+                        .min_h_0()
+                        .relative(),
+                    cx,
+                )
+                .child(
+                    div()
+                        .id("fileman-icon-scroll")
+                        .overflow_y_scroll()
+                        .size_full()
+                        .track_scroll(&icon_scroll_handle)
+                        .p_2()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .children(icon_rows),
+                )
+                .child(self.render_marquee_overlay(cx)),
+            )
+        } else {
+            let table_header = (view_mode == ViewMode::Table
+                && !self.loading_directory
+                && item_count > 0)
+                .then(|| {
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(colors.border_variant)
+                        .child(
+                            Label::new("Name")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .flex_1(),
+                        )
+                        .child(
+                            div().w(px(72.0)).child(
+                                Label::new("Size")
                                     .size(LabelSize::XSmall)
-                                    .color(Color::Muted)
-                                    .flex_1(),
-                            )
-                            .child(
-                                div().w(px(72.0)).child(
-                                    Label::new("Size")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
-                            )
-                            .child(
-                                div().w(px(120.0)).child(
-                                    Label::new("Modified")
-                                        .size(LabelSize::XSmall)
-                                        .color(Color::Muted),
-                                ),
+                                    .color(Color::Muted),
                             ),
-                    );
-                }
-                panel.children(file_rows)
-            }
+                        )
+                        .child(
+                            div().w(px(120.0)).child(
+                                Label::new("Modified")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                });
+
+            scroll
+                .when_some(table_header, |panel, header| panel.child(header))
+                .child(
+                    self.attach_marquee_handlers(
+                        div()
+                            .id("fileman-marquee-layer")
+                            .flex_1()
+                            .min_h_0()
+                            .relative(),
+                        cx,
+                    )
+                    .child(
+                        uniform_list(
+                            "fileman-file-list",
+                            item_count,
+                            cx.processor(move |this, range: Range<usize>, window, cx| {
+                                if subfolder_search {
+                                    this.render_search_match_range(range, window, cx)
+                                } else {
+                                    this.render_file_entry_range(range, view_mode, window, cx)
+                                }
+                            }),
+                        )
+                        .size_full()
+                        .track_scroll(&self.files_scroll_handle),
+                    )
+                    .vertical_scrollbar_for(&self.files_scroll_handle, window, cx)
+                    .child(self.render_marquee_overlay(cx)),
+                )
         }
+    }
+
+    fn render_marquee_overlay(&self, cx: &mut ViewContext<Self>) -> AnyElement {
+        let Some(marquee) = self.marquee_drag.as_ref().filter(|marquee| marquee.active) else {
+            return div().into_any_element();
+        };
+
+        let colors = cx.theme().colors();
+        let origin = self.marquee_local_point(marquee.origin);
+        let pointer = self.marquee_local_point(marquee.pointer);
+        let left = origin.x.min(pointer.x);
+        let top = origin.y.min(pointer.y);
+        let width = (pointer.x - origin.x).abs();
+        let height = (pointer.y - origin.y).abs();
+
+        div()
+            .absolute()
+            .left(left)
+            .top(top)
+            .w(width)
+            .h(height)
+            .border_1()
+            .border_dashed()
+            .border_color(colors.border_selected)
+            .bg(colors.element_selection_background.opacity(0.35))
+            .into_any_element()
     }
 
     fn render_file_icon(
@@ -2602,13 +3844,15 @@ impl FilemanWindow {
     fn render_file_entry(
         &self,
         file_info: &FileInfo,
+        entry_index: usize,
         view_mode: ViewMode,
         _window: &mut Window,
         cx: &mut ViewContext<Self>,
     ) -> AnyElement {
         let name = file_info.get_name().unwrap_or("").to_string();
         let is_directory = file_info.get_file_type() == FileType::Directory;
-        let is_selected = self.selected_files.contains(&name);
+        let is_selected = self.selected_files.contains(&name)
+            || self.list_focus_index == Some(entry_index);
         let size_string = if is_directory {
             "--".to_string()
         } else {
@@ -2639,7 +3883,15 @@ impl FilemanWindow {
         };
 
         let click_handler = cx.listener(move |this, event: &ClickEvent, _, cx| {
-            Self::handle_file_item_click(this, event, &name_for_open, is_directory, &name_for_click, cx);
+            Self::handle_file_item_click(
+                this,
+                event,
+                entry_index,
+                &name_for_open,
+                is_directory,
+                &name_for_click,
+                cx,
+            );
         });
         let context_name = name.clone();
         let context_handler = cx.listener(
@@ -2655,6 +3907,7 @@ impl FilemanWindow {
             },
         );
         let drag_row_id = SharedString::from(format!("file-drag-{name}"));
+        let row_height = self.files_list_item_height();
 
         let list_item = match view_mode {
             ViewMode::Icon => ListItem::new(item_id)
@@ -2673,6 +3926,7 @@ impl FilemanWindow {
             ViewMode::Compact => ListItem::new(item_id)
                 .toggle_state(is_selected)
                 .rounded()
+                .height(row_height)
                 .start_slot(icon_element)
                 .child(Label::new(name).size(LabelSize::Small).truncate())
                 .on_click(click_handler)
@@ -2681,6 +3935,7 @@ impl FilemanWindow {
             ViewMode::Table => ListItem::new(item_id)
                 .toggle_state(is_selected)
                 .rounded()
+                .height(row_height)
                 .start_slot(icon_element)
                 .child(Label::new(name).truncate().flex_1())
                 .end_slot(
@@ -2707,6 +3962,7 @@ impl FilemanWindow {
             ViewMode::List => ListItem::new(item_id)
                 .toggle_state(is_selected)
                 .rounded()
+                .height(row_height)
                 .start_slot(icon_element)
                 .child(Label::new(name))
                 .end_slot(Label::new(size_string).color(Color::Muted).size(LabelSize::XSmall))
@@ -2717,6 +3973,7 @@ impl FilemanWindow {
 
         let mut row = div()
             .id(drag_row_id)
+            .h(row_height)
             .on_drag(drag_payload, |payload: &DraggedFilePaths, _, _, cx| {
                 cx.new(|_| payload.clone())
             })
@@ -2724,18 +3981,23 @@ impl FilemanWindow {
         if view_mode == ViewMode::Icon {
             row = row.w(px(88.0));
         }
+        if is_directory {
+            row = self.apply_directory_drop_target(row, file_path, cx);
+        }
         row.into_any_element()
     }
 
     fn render_search_match(
         &self,
         search_match: &SearchMatch,
+        entry_index: usize,
         _window: &mut Window,
         cx: &mut ViewContext<Self>,
     ) -> AnyElement {
         let path = search_match.path.clone();
         let selection_key = Self::selection_key_for_path(&path);
-        let is_selected = self.selected_files.contains(&selection_key);
+        let is_selected = self.selected_files.contains(&selection_key)
+            || self.list_focus_index == Some(entry_index);
         let is_directory = search_match.is_directory;
         let file_icon = if is_directory {
             IconName::Folder
@@ -2766,6 +4028,7 @@ impl FilemanWindow {
             Self::handle_search_item_click(
                 this,
                 event,
+                entry_index,
                 &path_for_open,
                 is_directory,
                 &selection_key_for_click,
@@ -2787,8 +4050,10 @@ impl FilemanWindow {
             cx.notify();
         });
 
-        div()
+        let row_height = self.marquee_list_row_height();
+        let mut row = div()
             .id(SharedString::from(format!("search-drag-{}", path.display())))
+            .h(row_height)
             .on_drag(drag_payload, |payload: &DraggedFilePaths, _, _, cx| {
                 cx.new(|_| payload.clone())
             })
@@ -2796,6 +4061,7 @@ impl FilemanWindow {
                 ListItem::new(item_id)
                     .toggle_state(is_selected)
                     .rounded()
+                    .height(row_height)
                     .start_slot(icon_element)
                     .child(
                         v_flex()
@@ -2810,13 +4076,17 @@ impl FilemanWindow {
                     )
                     .on_click(click_handler)
                     .on_secondary_mouse_down(context_handler),
-            )
-            .into_any_element()
+            );
+        if is_directory {
+            row = self.apply_directory_drop_target(row, path, cx);
+        }
+        row.into_any_element()
     }
 
     fn handle_search_item_click(
         this: &mut Self,
         event: &ClickEvent,
+        entry_index: usize,
         path: &Path,
         is_directory: bool,
         selection_key: &str,
@@ -2826,20 +4096,25 @@ impl FilemanWindow {
             if is_directory {
                 this.navigate_to(path.to_path_buf(), true, cx);
             } else {
-                cx.open_with_system(path);
+                this.launch_file(path, cx);
             }
             return;
         }
 
-        let extend = event.modifiers().shift
-            || event.modifiers().control
-            || event.modifiers().platform;
-        this.toggle_selection(selection_key, extend, cx);
+        let modifiers = event.modifiers();
+        this.apply_list_selection_click(
+            entry_index,
+            selection_key,
+            modifiers.shift,
+            modifiers.control || modifiers.platform,
+            cx,
+        );
     }
 
     fn handle_file_item_click(
         this: &mut Self,
         event: &ClickEvent,
+        entry_index: usize,
         name_for_open: &str,
         is_directory: bool,
         name_for_click: &str,
@@ -2850,18 +4125,26 @@ impl FilemanWindow {
             if is_directory {
                 this.navigate_to(full_path, true, cx);
             } else {
-                cx.open_with_system(&full_path);
+                this.launch_file(&full_path, cx);
             }
             return;
         }
 
-        let extend = event.modifiers().shift
-            || event.modifiers().control
-            || event.modifiers().platform;
-        this.toggle_selection(name_for_click, extend, cx);
+        let modifiers = event.modifiers();
+        this.apply_list_selection_click(
+            entry_index,
+            name_for_click,
+            modifiers.shift,
+            modifiers.control || modifiers.platform,
+            cx,
+        );
     }
 
-    fn render_status_bar(&self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+    fn render_status_bar(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut ViewContext<Self>,
+    ) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let selection_count = self.selected_files.len();
         let item_count = if self.using_subfolder_search() {
@@ -2874,6 +4157,7 @@ impl FilemanWindow {
         } else {
             format!("{selection_count} selected · {item_count} items")
         };
+        let paste_in_progress = self.paste_cancel.is_some();
 
         h_flex()
             .id("fileman-status-bar")
@@ -2885,7 +4169,29 @@ impl FilemanWindow {
             .border_color(colors.border)
             .px_3()
             .bg(colors.panel_background)
-            .child(Label::new(self.status_message.clone()).size(LabelSize::Small).truncate())
+            .gap_2()
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        Label::new(self.status_message.clone())
+                            .size(LabelSize::Small)
+                            .truncate(),
+                    )
+                    .when(paste_in_progress, |row| {
+                        row.child(
+                            Button::new("paste-job-cancel", "Cancel")
+                                .style(ButtonStyle::Outlined)
+                                .size(ButtonSize::Compact)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel_active_paste(cx);
+                                })),
+                        )
+                    }),
+            )
             .child(
                 Label::new(selection_summary)
                     .size(LabelSize::XSmall)
@@ -3180,6 +4486,8 @@ impl FilemanWindow {
         cx: &mut ViewContext<Self>,
     ) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
+        let icon_color = Color::Muted;
+        let properties_icon = dialog.icon.clone();
 
         div()
             .absolute()
@@ -3199,6 +4507,19 @@ impl FilemanWindow {
                     .border_color(colors.border)
                     .rounded_lg()
                     .child(Headline::new(dialog.title).size(HeadlineSize::Small))
+                    .when_some(properties_icon, |column, icon| {
+                        column.child(
+                            h_flex()
+                                .justify_center()
+                                .pb_2()
+                                .child(Self::file_icon_element(
+                                    icon,
+                                    ViewMode::Icon,
+                                    icon_color,
+                                    cx,
+                                )),
+                        )
+                    })
                     .child(
                         v_flex()
                             .gap_2()
