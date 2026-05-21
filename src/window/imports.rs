@@ -22,10 +22,17 @@ pub(crate) use crate::toolbar_input::{ToolbarLineInput, ToolbarLineInputEvent};
 pub(crate) use crate::ui_icons::ThemeIconButton;
 pub(crate) use crate::undo::UndoStack;
 pub(crate) use crate::view_mode::{
-    clamp_icon_size, ViewMode, ICON_ZOOM_STEP, MAX_ICON_SIZE, MIN_ICON_SIZE,
+    clamp_icon_size, compact_view_layout, icon_view_layout, IconViewLayout, ViewMode,
+    COMPACT_TILE_HEIGHT_PX,
+    COMPACT_TILE_ICON_PX, COMPACT_TILE_SPACING_PX,
+    COMPACT_TILE_WIDTH_PX, ICON_ICON_LABEL_GAP_PX, ICON_VIEW_PADDING_PX, ICON_ZOOM_STEP,
+    LIST_ROW_HEIGHT_PX,
+    MAX_ICON_SIZE, MIN_ICON_SIZE, TABLE_COLUMN_MODIFIED_PX, TABLE_COLUMN_SIZE_PX,
+    TABLE_COLUMN_TYPE_PX, TABLE_HEADER_HEIGHT_PX, TABLE_ROW_HEIGHT_PX,
 };
 pub(crate) use crate::window::format::{
-    delete_confirmation_message, format_modified, format_size, path_to_file_uri, quick_access_places,
+    delete_confirmation_message, format_file_type, format_modified, format_size, path_to_file_uri,
+    quick_access_places,
 };
 pub(crate) use crate::window::{
     ContextMenuTarget, FilemanWindow, PendingDelete, PendingPasteChoice, PendingRename,
@@ -44,7 +51,8 @@ pub(crate) use nptk::std::sync::Arc;
 pub(crate) use nptk::std::time::Duration;
 pub(crate) use nptk::theme::ActiveTheme;
 pub(crate) use nptk::ui::{
-    Checkbox, ContextMenu, DropdownMenu, DropdownStyle, ListItem, ToggleState, WithScrollbar,
+    Checkbox, ContextMenu, DropdownMenu, DropdownStyle, ListItem, ListItemSpacing, ToggleState,
+    WithScrollbar,
     prelude::*,
 };
 pub(crate) use npio::{get_file_for_uri, FileInfo, FileType};

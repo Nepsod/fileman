@@ -260,8 +260,15 @@ impl FilemanWindow {
         }
     }
 
+    pub(crate) fn file_icon_cache_size(&self) -> u32 {
+        match self.view_mode {
+            ViewMode::Compact => COMPACT_TILE_ICON_PX,
+            _ => self.icon_size,
+        }
+    }
+
     pub(crate) fn queue_icon_loads(&mut self, cx: &mut ViewContext<Self>) {
-        let icon_size = self.icon_size;
+        let icon_size = self.file_icon_cache_size();
         let mut pending: Vec<(PathBuf, FileType)> = Vec::new();
 
         for file_info in &self.files {

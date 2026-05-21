@@ -221,7 +221,7 @@ impl FilemanWindow {
                                 .pb_2()
                                 .child(Self::file_icon_element(
                                     icon,
-                                    ViewMode::Icon,
+                                    crate::properties::PROPERTIES_ICON_SIZE as f32,
                                     icon_color,
                                     cx,
                                 )),

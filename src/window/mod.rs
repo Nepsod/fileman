@@ -33,8 +33,8 @@ use crate::undo::UndoStack;
 use crate::view_mode::ViewMode;
 
 pub(crate) use format::{
-    days_in_month, days_in_year, delete_confirmation_message, format_modified, format_size,
-    format_unix_timestamp, path_to_file_uri, quick_access_places,
+    days_in_month, days_in_year, delete_confirmation_message, format_file_type, format_modified,
+    format_size, format_unix_timestamp, path_to_file_uri, quick_access_places,
 };
 
 #[derive(Clone)]

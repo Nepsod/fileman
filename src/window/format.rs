@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use npio::FileInfo;
+use npio::{FileInfo, FileType};
 
 pub(crate) fn delete_confirmation_message(paths: &[PathBuf], permanent: bool) -> String {
     if paths.len() == 1 {
@@ -46,6 +46,44 @@ pub(crate) fn path_to_file_uri(path: &Path) -> String {
         format!("file://{path_string}")
     } else {
         format!("file:///{path_string}")
+    }
+}
+
+pub(crate) fn format_file_type(file_info: &FileInfo) -> String {
+    if file_info.get_file_type() == FileType::Directory {
+        return "File folder".to_string();
+    }
+
+    let Some(content_type) = file_info.get_content_type() else {
+        return "File".to_string();
+    };
+
+    if content_type.is_empty() {
+        return "File".to_string();
+    }
+
+    let subtype = content_type.split('/').nth(1).unwrap_or(&content_type);
+    match subtype {
+        "octet-stream" => "File".to_string(),
+        "directory" => "File folder".to_string(),
+        _ => {
+            let words: Vec<String> = subtype
+                .split(&['-', '.', '_'][..])
+                .filter(|segment| !segment.is_empty())
+                .map(|segment| {
+                    let mut chars = segment.chars();
+                    match chars.next() {
+                        None => String::new(),
+                        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    }
+                })
+                .collect();
+            if words.is_empty() {
+                content_type.to_string()
+            } else {
+                words.join(" ")
+            }
+        }
     }
 }
 

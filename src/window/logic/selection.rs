@@ -79,24 +79,129 @@ impl FilemanWindow {
             return;
         }
 
-        let (Some(start_index), Some(end_index)) =
-            self.marquee_index_range(origin_list, pointer_list, names.len())
-        else {
-            return;
-        };
-
         if !extend_selection {
             self.selected_files.clear();
         }
 
-        for index in start_index..=end_index {
+        let selected_indices =
+            self.marquee_selected_indices(origin_list, pointer_list, names.len());
+        let selection_anchor = selected_indices.first().copied();
+        let selection_focus = selected_indices.last().copied();
+        for index in selected_indices {
             if let Some(name) = names.get(index) {
                 self.selected_files.insert(name.clone());
             }
         }
 
-        self.selection_anchor = Some(start_index);
-        self.list_focus_index = Some(end_index);
+        if let Some(anchor) = selection_anchor {
+            self.selection_anchor = Some(anchor);
+        }
+        if let Some(focus) = selection_focus {
+            self.list_focus_index = Some(focus);
+        }
+    }
+
+    pub(crate) fn visible_tile_render_range(&self, item_count: usize) -> Range<usize> {
+        if item_count == 0 {
+            return 0..0;
+        }
+
+        let scroll_handle = &self.files_scroll_handle.0.borrow().base_handle;
+        let scroll_offset_y = (-scroll_handle.offset().y).as_f32();
+        let viewport_height = scroll_handle.bounds().size.height.as_f32();
+        let padding = ICON_VIEW_PADDING_PX;
+
+        let (row_stride, columns) = match self.view_mode {
+            ViewMode::Icon => {
+                let layout = icon_view_layout(self.icon_size, self.files_panel_width());
+                (layout.cell_height, layout.columns.max(1))
+            }
+            ViewMode::Compact => {
+                let layout = compact_view_layout(self.files_panel_width());
+                (layout.row_stride, layout.columns.max(1))
+            }
+            _ => return 0..item_count,
+        };
+
+        let start_row = ((scroll_offset_y - padding) / row_stride)
+            .floor()
+            .max(0.0) as usize;
+        let end_row = ((scroll_offset_y + viewport_height - padding) / row_stride)
+            .ceil() as usize
+            + 1;
+        let start_index = (start_row * columns).min(item_count);
+        let end_index = (end_row * columns).min(item_count).max(start_index);
+        start_index..end_index
+    }
+
+    fn marquee_selected_indices(
+        &self,
+        origin_list: Point<Pixels>,
+        pointer_list: Point<Pixels>,
+        item_count: usize,
+    ) -> Vec<usize> {
+        if item_count == 0 {
+            return Vec::new();
+        }
+
+        let selection_left = origin_list.x.min(pointer_list.x);
+        let selection_right = origin_list.x.max(pointer_list.x);
+        let selection_top = origin_list.y.min(pointer_list.y);
+        let selection_bottom = origin_list.y.max(pointer_list.y);
+
+        if matches!(self.view_mode, ViewMode::Icon | ViewMode::Compact) {
+            return (0..item_count)
+                .filter(|&index| {
+                    let bounds = self.tile_cell_bounds(index);
+                    bounds.left() < selection_right
+                        && bounds.right() > selection_left
+                        && bounds.top() < selection_bottom
+                        && bounds.bottom() > selection_top
+                })
+                .collect();
+        }
+
+        let (Some(start_index), Some(end_index)) =
+            self.marquee_index_range(origin_list, pointer_list, item_count)
+        else {
+            return Vec::new();
+        };
+        (start_index..=end_index).collect()
+    }
+
+    fn tile_cell_bounds(&self, index: usize) -> Bounds<Pixels> {
+        let padding = px(ICON_VIEW_PADDING_PX);
+        match self.view_mode {
+            ViewMode::Icon => {
+                let layout = icon_view_layout(self.icon_size, self.files_panel_width());
+                let columns = layout.columns.max(1);
+                let column = index % columns;
+                let row = index / columns;
+                let left = padding + px(column as f32 * layout.cell_width);
+                let top = padding + px(row as f32 * layout.cell_height);
+                Bounds::from_corners(
+                    point(left, top),
+                    point(left + px(layout.cell_width), top + px(layout.cell_height)),
+                )
+            }
+            ViewMode::Compact => {
+                let layout = compact_view_layout(self.files_panel_width());
+                let columns = layout.columns.max(1);
+                let column = index % columns;
+                let row = index / columns;
+                let cell_stride_x = layout.cell_width + layout.spacing;
+                let left = padding + px(column as f32 * cell_stride_x);
+                let top = padding + px(row as f32 * layout.row_stride);
+                Bounds::from_corners(
+                    point(left, top),
+                    point(
+                        left + px(layout.cell_width),
+                        top + px(layout.cell_height),
+                    ),
+                )
+            }
+            _ => Bounds::new(point(px(0.), px(0.)), size(px(0.), px(0.))),
+        }
     }
 
     pub(crate) fn attach_marquee_handlers(
@@ -155,16 +260,12 @@ impl FilemanWindow {
             return;
         }
 
-        if !extend_selection {
-            self.clear_selection(cx);
-        }
-
         let clamped_origin = self.marquee_clamp_pointer_to_viewport(origin);
         let origin_list = self.marquee_list_point(clamped_origin);
         let (autoscroll_vertical, autoscroll_horizontal) =
             self.marquee_autoscroll_axes(clamped_origin);
         self.marquee_drag = Some(MarqueeDrag {
-            origin,
+            origin: clamped_origin,
             pointer: clamped_origin,
             origin_list,
             pointer_list: origin_list,
@@ -224,12 +325,37 @@ impl FilemanWindow {
         cx.notify();
     }
 
+    pub(crate) fn files_panel_width(&self) -> f32 {
+        let panel_width: f32 = self.marquee_viewport_bounds().size.width.into();
+        if panel_width > 0.0 {
+            panel_width
+        } else {
+            let total_width = self.config.window.last_window_width.max(800) as f32;
+            let sidebar_width = self.config.window.splitter_pos as f32;
+            (total_width - sidebar_width - 64.0).max(200.0)
+        }
+    }
+
+    pub(crate) fn uses_tile_grid(&self) -> bool {
+        matches!(self.view_mode, ViewMode::Icon | ViewMode::Compact)
+    }
+
+    pub(crate) fn tile_grid_columns(&self) -> usize {
+        match self.view_mode {
+            ViewMode::Icon => icon_view_layout(self.icon_size, self.files_panel_width()).columns,
+            ViewMode::Compact => compact_view_layout(self.files_panel_width()).columns,
+            _ => 1,
+        }
+    }
+
     pub(crate) fn files_list_item_height(&self) -> Pixels {
         match self.view_mode {
-            ViewMode::Compact => px(40.0),
-            ViewMode::Table => px(36.0),
-            ViewMode::List => px(36.0),
-            ViewMode::Icon => px(96.0),
+            ViewMode::Icon => {
+                px(icon_view_layout(self.icon_size, self.files_panel_width()).cell_height)
+            }
+            ViewMode::Compact => px(COMPACT_TILE_HEIGHT_PX),
+            ViewMode::Table => px(TABLE_ROW_HEIGHT_PX),
+            ViewMode::List => px(LIST_ROW_HEIGHT_PX),
         }
     }
 
@@ -248,8 +374,28 @@ impl FilemanWindow {
         let control = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
 
         match key {
-            "up" | "arrowup" => self.move_list_focus(-1, shift, cx),
-            "down" | "arrowdown" => self.move_list_focus(1, shift, cx),
+            "up" | "arrowup" => {
+                let delta = if self.uses_tile_grid() {
+                    -(self.tile_grid_columns() as isize)
+                } else {
+                    -1
+                };
+                self.move_list_focus_by(delta, shift, cx);
+            }
+            "down" | "arrowdown" => {
+                let delta = if self.uses_tile_grid() {
+                    self.tile_grid_columns() as isize
+                } else {
+                    1
+                };
+                self.move_list_focus_by(delta, shift, cx);
+            }
+            "left" | "arrowleft" if self.uses_tile_grid() => {
+                self.move_list_focus_by(-1, shift, cx);
+            }
+            "right" | "arrowright" if self.uses_tile_grid() => {
+                self.move_list_focus_by(1, shift, cx);
+            }
             "home" => {
                 let names = self.visible_entry_names();
                 if names.is_empty() {
@@ -263,8 +409,7 @@ impl FilemanWindow {
                     self.selection_anchor = Some(0);
                 }
                 self.list_focus_index = Some(0);
-                self.files_scroll_handle
-                    .scroll_to_item(0, ScrollStrategy::Top);
+                self.scroll_list_index_into_view(0, ScrollStrategy::Top);
                 cx.notify();
             }
             "end" => {
@@ -281,8 +426,7 @@ impl FilemanWindow {
                     self.selection_anchor = Some(last);
                 }
                 self.list_focus_index = Some(last);
-                self.files_scroll_handle
-                    .scroll_to_item(last, ScrollStrategy::Bottom);
+                self.scroll_list_index_into_view(last, ScrollStrategy::Bottom);
                 cx.notify();
             }
             "enter" => self.open_focused_or_selection(cx),
@@ -293,19 +437,7 @@ impl FilemanWindow {
 
 
     pub(crate) fn icon_grid_columns(&self) -> usize {
-        const ICON_CELL_WIDTH: f32 = 88.0;
-        const ICON_GRID_GAP: f32 = 8.0;
-        let panel_width: f32 = self.marquee_viewport_bounds().size.width.into();
-        let panel_width = if panel_width > 0.0 {
-            panel_width
-        } else {
-            let total_width = self.config.window.last_window_width.max(800) as f32;
-            let sidebar_width = self.config.window.splitter_pos as f32;
-            (total_width - sidebar_width - 64.0).max(200.0)
-        };
-        (panel_width / (ICON_CELL_WIDTH + ICON_GRID_GAP))
-            .floor()
-            .max(1.0) as usize
+        self.tile_grid_columns()
     }
 
     pub(crate) fn invert_selection(&mut self, cx: &mut ViewContext<Self>) {
@@ -390,14 +522,41 @@ impl FilemanWindow {
         let clamp_index = |index: usize| index.min(item_count.saturating_sub(1));
 
         if self.view_mode == ViewMode::Icon {
-            let columns = self.icon_grid_columns().max(1);
-            let padding = px(8.0);
-            let gap = px(8.0);
-            let cell_width = px(88.0) + gap;
-            let cell_height = self.files_list_item_height() + gap;
+            let layout = icon_view_layout(self.icon_size, self.files_panel_width());
+            let columns = layout.columns.max(1);
+            let padding = px(ICON_VIEW_PADDING_PX);
+            let cell_width = px(layout.cell_width);
+            let cell_height = px(layout.cell_height);
 
             let index_at = |point: Point<Pixels>| -> usize {
                 let row = ((point.y - padding) / cell_height).floor().max(0.0) as usize;
+                let column = ((point.x - padding) / cell_width).floor().max(0.0) as usize;
+                row * columns + column
+            };
+
+            let top_left = Point::new(
+                origin_list.x.min(pointer_list.x),
+                origin_list.y.min(pointer_list.y),
+            );
+            let bottom_right = Point::new(
+                origin_list.x.max(pointer_list.x),
+                origin_list.y.max(pointer_list.y),
+            );
+            return (
+                Some(clamp_index(index_at(top_left))),
+                Some(clamp_index(index_at(bottom_right))),
+            );
+        }
+
+        if self.view_mode == ViewMode::Compact {
+            let layout = compact_view_layout(self.files_panel_width());
+            let columns = layout.columns.max(1);
+            let padding = px(ICON_VIEW_PADDING_PX);
+            let cell_width = px(layout.cell_width + layout.spacing);
+            let row_height = px(layout.row_stride);
+
+            let index_at = |point: Point<Pixels>| -> usize {
+                let row = ((point.y - padding) / row_height).floor().max(0.0) as usize;
                 let column = ((point.x - padding) / cell_width).floor().max(0.0) as usize;
                 row * columns + column
             };
@@ -464,6 +623,33 @@ impl FilemanWindow {
         )
     }
 
+    /// Converts list-content coordinates to viewport-local coordinates for the marquee layer.
+    pub(crate) fn marquee_viewport_point_from_list(&self, list_point: Point<Pixels>) -> Point<Pixels> {
+        let scroll = self.marquee_scroll_offset();
+        point(list_point.x + scroll.x, list_point.y + scroll.y)
+    }
+
+    pub(crate) fn marquee_overlay_bounds_from_list(
+        &self,
+        origin_list: Point<Pixels>,
+        pointer_list: Point<Pixels>,
+        use_list_coordinates: bool,
+    ) -> (Pixels, Pixels, Pixels, Pixels) {
+        let (origin, pointer) = if use_list_coordinates {
+            (origin_list, pointer_list)
+        } else {
+            (
+                self.marquee_viewport_point_from_list(origin_list),
+                self.marquee_viewport_point_from_list(pointer_list),
+            )
+        };
+        let left = origin.x.min(pointer.x);
+        let top = origin.y.min(pointer.y);
+        let width = (pointer.x - origin.x).abs();
+        let height = (pointer.y - origin.y).abs();
+        (left, top, width, height)
+    }
+
     pub(crate) fn marquee_scroll_by(&self, delta: Point<Pixels>) {
         let scroll_handle = &self.files_scroll_handle.0.borrow().base_handle;
         let mut offset = scroll_handle.offset();
@@ -481,24 +667,26 @@ impl FilemanWindow {
         self.files_scroll_handle.0.borrow().base_handle.bounds()
     }
 
-    pub(crate) fn move_list_focus(&mut self, delta: isize, extend: bool, cx: &mut ViewContext<Self>) {
+    pub(crate) fn move_list_focus_by(
+        &mut self,
+        index_delta: isize,
+        extend: bool,
+        cx: &mut ViewContext<Self>,
+    ) {
         let names = self.visible_entry_names();
         if names.is_empty() {
             return;
         }
 
+        let last_index = names.len().saturating_sub(1);
         let current_index = self
             .list_focus_index
             .unwrap_or_else(|| names.len().saturating_sub(1));
-        let next_index = if delta < 0 {
-            current_index.saturating_sub(delta.unsigned_abs() as usize)
-        } else {
-            (current_index + delta as usize).min(names.len() - 1)
-        };
+        let next_index = ((current_index as isize) + index_delta).clamp(0, last_index as isize)
+            as usize;
 
         self.list_focus_index = Some(next_index);
-        self.files_scroll_handle
-            .scroll_to_item(next_index, ScrollStrategy::Nearest);
+        self.scroll_list_index_into_view(next_index, ScrollStrategy::Nearest);
 
         if extend {
             let anchor = self.selection_anchor.unwrap_or(current_index);
@@ -509,6 +697,55 @@ impl FilemanWindow {
             self.selection_anchor = Some(next_index);
         }
         cx.notify();
+    }
+
+    pub(crate) fn scroll_list_index_into_view(&self, index: usize, strategy: ScrollStrategy) {
+        if !self.uses_tile_grid() {
+            self.files_scroll_handle.scroll_to_item(index, strategy);
+            return;
+        }
+
+        let columns = self.tile_grid_columns().max(1);
+        let row = index / columns;
+        let (item_top, item_bottom) = match self.view_mode {
+            ViewMode::Icon => {
+                let layout = icon_view_layout(self.icon_size, self.files_panel_width());
+                let top = row as f32 * layout.cell_height + ICON_VIEW_PADDING_PX;
+                (top, top + layout.cell_height)
+            }
+            ViewMode::Compact => {
+                let layout = compact_view_layout(self.files_panel_width());
+                let top = row as f32 * layout.row_stride + ICON_VIEW_PADDING_PX;
+                (top, top + layout.cell_height)
+            }
+            _ => unreachable!(),
+        };
+
+        let scroll_handle = &self.files_scroll_handle.0.borrow().base_handle;
+        let viewport_height = scroll_handle.bounds().size.height.as_f32();
+        let max_offset = scroll_handle.max_offset();
+        let mut offset = scroll_handle.offset();
+        let visible_top = -offset.y.as_f32();
+
+        let new_top = match strategy {
+            ScrollStrategy::Top => item_top,
+            ScrollStrategy::Bottom => (item_bottom - viewport_height).max(0.0),
+            ScrollStrategy::Center => {
+                ((item_top + item_bottom) / 2.0 - viewport_height / 2.0).max(0.0)
+            }
+            ScrollStrategy::Nearest => {
+                if item_top < visible_top {
+                    item_top
+                } else if item_bottom > visible_top + viewport_height {
+                    (item_bottom - viewport_height).max(0.0)
+                } else {
+                    visible_top
+                }
+            }
+        };
+
+        offset.y = px(-new_top.clamp(0.0, max_offset.y.as_f32()));
+        scroll_handle.set_offset(offset);
     }
 
     pub(crate) fn open_focused_or_selection(&mut self, cx: &mut ViewContext<Self>) {
@@ -553,9 +790,23 @@ impl FilemanWindow {
         let Some(item_size) = state.last_item_size else {
             return;
         };
-        let measured = px(item_size.contents.height.as_f32() / item_count as f32);
+        let divisor = self
+            .list_visible_range
+            .as_ref()
+            .map(|range| range.len())
+            .filter(|&len| len > 0)
+            .unwrap_or(item_count);
+        if divisor == 0 {
+            return;
+        }
+        let measured = px(item_size.contents.height.as_f32() / divisor as f32);
+        let intended = self.files_list_item_height();
         if measured > px(0.) {
-            self.uniform_list_row_height = Some(measured);
+            self.uniform_list_row_height = Some(if measured > intended {
+                intended
+            } else {
+                measured
+            });
         }
     }
 
@@ -711,7 +962,7 @@ impl FilemanWindow {
         let pointer_list = self.marquee_list_point(clamped_pointer);
         let (autoscroll_vertical, autoscroll_horizontal) =
             self.marquee_autoscroll_axes(clamped_pointer);
-        let (origin_list, pointer_list, should_apply) = {
+        let (origin_list, pointer_list, should_apply, became_active) = {
             let Some(marquee) = self.marquee_drag.as_mut() else {
                 return;
             };
@@ -720,9 +971,9 @@ impl FilemanWindow {
             marquee.pointer_list = pointer_list;
             marquee.autoscroll_vertical = autoscroll_vertical;
             marquee.autoscroll_horizontal = autoscroll_horizontal;
-            if !marquee.active
-                && crate::drag::marquee_exceeds_threshold(marquee.origin, clamped_pointer)
-            {
+            let became_active = !marquee.active
+                && crate::drag::marquee_exceeds_threshold(marquee.origin, clamped_pointer);
+            if became_active {
                 marquee.active = true;
             }
 
@@ -730,10 +981,16 @@ impl FilemanWindow {
                 marquee.origin_list,
                 marquee.pointer_list,
                 marquee.active,
+                became_active,
             )
         };
 
         if should_apply {
+            if became_active && !extend_selection {
+                self.selected_files.clear();
+                self.selection_anchor = None;
+                self.list_focus_index = None;
+            }
             self.apply_marquee_selection(origin_list, pointer_list, extend_selection);
         }
         cx.notify();
