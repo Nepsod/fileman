@@ -1,3 +1,4 @@
+mod dispatch;
 mod file_ops;
 mod navigation;
 mod search;

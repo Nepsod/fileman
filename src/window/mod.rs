@@ -2,6 +2,7 @@
 //! `render/` holds GPUI layout and dialogs (`impl Render` stays in `render/mod.rs`).
 
 mod format;
+pub(crate) mod imports;
 pub mod logic;
 pub mod render;
 

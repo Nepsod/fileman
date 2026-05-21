@@ -1,11 +1,18 @@
 use crate::actions::*;
-use crate::search::SearchScope;
-use crate::sort::{SortColumn, SortOrder};
-use crate::view_mode::ViewMode;
 use crate::window::FilemanWindow;
 use nptk::gpui::{App, Context, Menu, MenuItem, Window};
 
 type ViewContext<'a, T> = Context<'a, T>;
+
+macro_rules! register_fileman_action {
+    ($cx:expr, $Action:ty) => {
+        $cx.on_action(|action: &$Action, cx| {
+            with_active_fileman(cx, |this, window, cx| {
+                this.dispatch_action(action, window, cx);
+            });
+        });
+    };
+}
 
 impl FilemanWindow {
     pub(crate) fn register_menus(&self, cx: &mut ViewContext<Self>) {
@@ -108,202 +115,63 @@ pub(crate) fn with_active_fileman(
 }
 
 pub fn register_app_menu_handlers(cx: &mut App) {
-    cx.on_action(|_: &CreateFolder, cx| {
-        with_active_fileman(cx, |this, _, cx| this.create_folder(cx));
-    });
-    cx.on_action(|_: &CreateFile, cx| {
-        with_active_fileman(cx, |this, _, cx| this.create_file(cx));
-    });
-    cx.on_action(|_: &GoBack, cx| {
-        with_active_fileman(cx, |this, _, cx| this.go_back(cx));
-    });
-    cx.on_action(|_: &GoForward, cx| {
-        with_active_fileman(cx, |this, _, cx| this.go_forward(cx));
-    });
-    cx.on_action(|_: &GoUp, cx| {
-        with_active_fileman(cx, |this, _, cx| this.go_up(cx));
-    });
-    cx.on_action(|_: &ToggleHidden, cx| {
-        with_active_fileman(cx, |this, _, cx| this.toggle_hidden(cx));
-    });
-    cx.on_action(|_: &DeleteSelected, cx| {
-        with_active_fileman(cx, |this, _, cx| this.delete_selected(cx));
-    });
-    cx.on_action(|_: &DeletePermanent, cx| {
-        with_active_fileman(cx, |this, _, cx| this.request_delete(true, cx));
-    });
-    cx.on_action(|_: &Refresh, cx| {
-        with_active_fileman(cx, |this, _, cx| {
-            this.reload_volume_mounts();
-            this.reload_current_directory(cx);
-        });
-    });
-    cx.on_action(|_: &SelectAll, cx| {
-        with_active_fileman(cx, |this, _, cx| this.select_all_visible(cx));
-    });
-    cx.on_action(|_: &Rename, cx| {
-        with_active_fileman(cx, |this, _, cx| this.start_rename_selected(cx));
-    });
-    cx.on_action(|_: &Copy, cx| {
-        with_active_fileman(cx, |this, _, cx| this.copy_selected(cx));
-    });
-    cx.on_action(|_: &Cut, cx| {
-        with_active_fileman(cx, |this, _, cx| this.cut_selected(cx));
-    });
-    cx.on_action(|_: &Paste, cx| {
-        with_active_fileman(cx, |this, _, cx| this.paste_clipboard(cx));
-    });
-    cx.on_action(|_: &Duplicate, cx| {
-        with_active_fileman(cx, |this, _, cx| this.duplicate_selected(cx));
-    });
-    cx.on_action(|_: &ClearSelection, cx| {
-        with_active_fileman(cx, |this, _, cx| this.clear_selection(cx));
-    });
-    cx.on_action(|_: &InvertSelection, cx| {
-        with_active_fileman(cx, |this, _, cx| this.invert_selection(cx));
-    });
-    cx.on_action(|_: &ActivateSearch, cx| {
-        with_active_fileman(cx, |this, window, cx| this.activate_search(window, cx));
-    });
-    cx.on_action(|_: &ClearSearch, cx| {
-        with_active_fileman(cx, |this, _, cx| this.clear_search(cx));
-    });
-    cx.on_action(|_: &ToggleSearchSubfolders, cx| {
-        with_active_fileman(cx, |this, window, cx| this.toggle_search_subfolders(window, cx));
-    });
-    cx.on_action(|_: &SetSearchCurrentFolder, cx| {
-        with_active_fileman(cx, |this, window, cx| {
-            this.set_search_scope(SearchScope::CurrentFolder, window, cx);
-        });
-    });
-    cx.on_action(|_: &SetSearchIncludeSubfolders, cx| {
-        with_active_fileman(cx, |this, window, cx| {
-            this.set_search_scope(SearchScope::Subfolders, window, cx);
-        });
-    });
-    cx.on_action(|_: &FocusPathBar, cx| {
-        with_active_fileman(cx, |this, window, cx| this.focus_path_bar(window, cx));
-    });
-    cx.on_action(|_: &GoHome, cx| {
-        with_active_fileman(cx, |this, _, cx| this.go_home(cx));
-    });
-    cx.on_action(|_: &NewTab, cx| {
-        with_active_fileman(cx, |this, _, cx| this.new_tab(cx));
-    });
-    cx.on_action(|_: &NewWindow, cx| {
-        with_active_fileman(cx, |this, _, cx| this.spawn_new_window(cx));
-    });
-    cx.on_action(|_: &CloseTab, cx| {
-        with_active_fileman(cx, |this, _, cx| this.close_tab(cx));
-    });
-    cx.on_action(|_: &AddBookmark, cx| {
-        with_active_fileman(cx, |this, _, cx| this.add_bookmark_for_current(cx));
-    });
-    cx.on_action(|_: &RemoveBookmark, cx| {
-        with_active_fileman(cx, |this, _, cx| this.remove_bookmark_for_current(cx));
-    });
-    cx.on_action(|_: &SortByName, cx| {
-        with_active_fileman(cx, |this, _, cx| this.apply_sort(SortColumn::Name, None, cx));
-    });
-    cx.on_action(|_: &SortBySize, cx| {
-        with_active_fileman(cx, |this, _, cx| this.apply_sort(SortColumn::Size, None, cx));
-    });
-    cx.on_action(|_: &SortByModified, cx| {
-        with_active_fileman(cx, |this, _, cx| this.apply_sort(SortColumn::Modified, None, cx));
-    });
-    cx.on_action(|_: &SortByType, cx| {
-        with_active_fileman(cx, |this, _, cx| this.apply_sort(SortColumn::Type, None, cx));
-    });
-    cx.on_action(|_: &ToggleSortOrder, cx| {
-        with_active_fileman(cx, |this, _, cx| this.toggle_sort_order(cx));
-    });
-    cx.on_action(|_: &SortNameAsc, cx| {
-        with_active_fileman(cx, |this, _, cx| {
-            this.apply_sort(SortColumn::Name, Some(SortOrder::Ascending), cx);
-        });
-    });
-    cx.on_action(|_: &SortNameDesc, cx| {
-        with_active_fileman(cx, |this, _, cx| {
-            this.apply_sort(SortColumn::Name, Some(SortOrder::Descending), cx);
-        });
-    });
-    cx.on_action(|_: &SortSizeAsc, cx| {
-        with_active_fileman(cx, |this, _, cx| {
-            this.apply_sort(SortColumn::Size, Some(SortOrder::Ascending), cx);
-        });
-    });
-    cx.on_action(|_: &SortSizeDesc, cx| {
-        with_active_fileman(cx, |this, _, cx| {
-            this.apply_sort(SortColumn::Size, Some(SortOrder::Descending), cx);
-        });
-    });
-    cx.on_action(|_: &SortModifiedAsc, cx| {
-        with_active_fileman(cx, |this, _, cx| {
-            this.apply_sort(SortColumn::Modified, Some(SortOrder::Ascending), cx);
-        });
-    });
-    cx.on_action(|_: &SortModifiedDesc, cx| {
-        with_active_fileman(cx, |this, _, cx| {
-            this.apply_sort(SortColumn::Modified, Some(SortOrder::Descending), cx);
-        });
-    });
-    cx.on_action(|_: &SortTypeAsc, cx| {
-        with_active_fileman(cx, |this, _, cx| {
-            this.apply_sort(SortColumn::Type, Some(SortOrder::Ascending), cx);
-        });
-    });
-    cx.on_action(|_: &SortTypeDesc, cx| {
-        with_active_fileman(cx, |this, _, cx| {
-            this.apply_sort(SortColumn::Type, Some(SortOrder::Descending), cx);
-        });
-    });
-    cx.on_action(|_: &Undo, cx| {
-        with_active_fileman(cx, |this, _, cx| this.undo_last(cx));
-    });
-    cx.on_action(|_: &Redo, cx| {
-        with_active_fileman(cx, |this, _, cx| this.redo_last(cx));
-    });
-    cx.on_action(|_: &OpenTerminal, cx| {
-        with_active_fileman(cx, |this, _, cx| this.open_terminal_here(cx));
-    });
-    cx.on_action(|_: &OpenSelection, cx| {
-        with_active_fileman(cx, |this, _, cx| this.open_primary_selection(cx));
-    });
-    cx.on_action(|_: &OpenWithSystem, cx| {
-        with_active_fileman(cx, |this, _, cx| this.open_selection_with_system(cx));
-    });
-    cx.on_action(|_: &ShowProperties, cx| {
-        with_active_fileman(cx, |this, _, cx| this.show_properties_for_selection(cx));
-    });
-    cx.on_action(|_: &ShowSettings, cx| {
-        with_active_fileman(cx, |this, _, cx| this.open_settings(cx));
-    });
-    cx.on_action(|_: &ShowAbout, cx| {
-        with_active_fileman(cx, |this, _, cx| this.open_about(cx));
-    });
-    cx.on_action(|_: &GoToParent, cx| {
-        with_active_fileman(cx, |this, _, cx| this.go_to_parent_of_selection(cx));
-    });
-    cx.on_action(|_: &ZoomIn, cx| {
-        with_active_fileman(cx, |this, _, cx| this.zoom_icons_in(cx));
-    });
-    cx.on_action(|_: &ZoomOut, cx| {
-        with_active_fileman(cx, |this, _, cx| this.zoom_icons_out(cx));
-    });
-    cx.on_action(|_: &ZoomReset, cx| {
-        with_active_fileman(cx, |this, _, cx| this.zoom_icons_reset(cx));
-    });
-    cx.on_action(|_: &ViewList, cx| {
-        with_active_fileman(cx, |this, _, cx| this.set_view_mode(ViewMode::List, cx));
-    });
-    cx.on_action(|_: &ViewIcon, cx| {
-        with_active_fileman(cx, |this, _, cx| this.set_view_mode(ViewMode::Icon, cx));
-    });
-    cx.on_action(|_: &ViewCompact, cx| {
-        with_active_fileman(cx, |this, _, cx| this.set_view_mode(ViewMode::Compact, cx));
-    });
-    cx.on_action(|_: &ViewTable, cx| {
-        with_active_fileman(cx, |this, _, cx| this.set_view_mode(ViewMode::Table, cx));
-    });
+    register_fileman_action!(cx, CreateFolder);
+    register_fileman_action!(cx, CreateFile);
+    register_fileman_action!(cx, GoBack);
+    register_fileman_action!(cx, GoForward);
+    register_fileman_action!(cx, GoUp);
+    register_fileman_action!(cx, ToggleHidden);
+    register_fileman_action!(cx, DeleteSelected);
+    register_fileman_action!(cx, DeletePermanent);
+    register_fileman_action!(cx, Refresh);
+    register_fileman_action!(cx, SelectAll);
+    register_fileman_action!(cx, Rename);
+    register_fileman_action!(cx, crate::actions::Copy);
+    register_fileman_action!(cx, Cut);
+    register_fileman_action!(cx, Paste);
+    register_fileman_action!(cx, Duplicate);
+    register_fileman_action!(cx, ClearSelection);
+    register_fileman_action!(cx, InvertSelection);
+    register_fileman_action!(cx, ActivateSearch);
+    register_fileman_action!(cx, ClearSearch);
+    register_fileman_action!(cx, ToggleSearchSubfolders);
+    register_fileman_action!(cx, SetSearchCurrentFolder);
+    register_fileman_action!(cx, SetSearchIncludeSubfolders);
+    register_fileman_action!(cx, FocusPathBar);
+    register_fileman_action!(cx, GoHome);
+    register_fileman_action!(cx, NewTab);
+    register_fileman_action!(cx, NewWindow);
+    register_fileman_action!(cx, CloseTab);
+    register_fileman_action!(cx, AddBookmark);
+    register_fileman_action!(cx, RemoveBookmark);
+    register_fileman_action!(cx, SortByName);
+    register_fileman_action!(cx, SortBySize);
+    register_fileman_action!(cx, SortByModified);
+    register_fileman_action!(cx, SortByType);
+    register_fileman_action!(cx, ToggleSortOrder);
+    register_fileman_action!(cx, SortNameAsc);
+    register_fileman_action!(cx, SortNameDesc);
+    register_fileman_action!(cx, SortSizeAsc);
+    register_fileman_action!(cx, SortSizeDesc);
+    register_fileman_action!(cx, SortModifiedAsc);
+    register_fileman_action!(cx, SortModifiedDesc);
+    register_fileman_action!(cx, SortTypeAsc);
+    register_fileman_action!(cx, SortTypeDesc);
+    register_fileman_action!(cx, Undo);
+    register_fileman_action!(cx, Redo);
+    register_fileman_action!(cx, OpenTerminal);
+    register_fileman_action!(cx, OpenSelection);
+    register_fileman_action!(cx, OpenWithSystem);
+    register_fileman_action!(cx, ShowProperties);
+    register_fileman_action!(cx, ShowSettings);
+    register_fileman_action!(cx, ShowAbout);
+    register_fileman_action!(cx, GoToParent);
+    register_fileman_action!(cx, ZoomIn);
+    register_fileman_action!(cx, ZoomOut);
+    register_fileman_action!(cx, ZoomReset);
+    register_fileman_action!(cx, ViewList);
+    register_fileman_action!(cx, ViewIcon);
+    register_fileman_action!(cx, ViewCompact);
+    register_fileman_action!(cx, ViewTable);
     cx.on_action(|_: &Quit, cx| cx.quit());
 }
