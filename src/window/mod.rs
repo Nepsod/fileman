@@ -108,6 +108,7 @@ pub struct FilemanWindow {
     marquee_drag: Option<MarqueeDrag>,
     marquee_cancel_subscription: Option<Subscription>,
     marquee_autoscroll_task: Option<Task<()>>,
+    icon_label_layout_cache: Vec<crate::icon_label_layout::IconViewLabelLayout>,
     list_visible_range: Option<Range<usize>>,
     show_about: bool,
     path_line_input: Entity<ToolbarLineInput>,

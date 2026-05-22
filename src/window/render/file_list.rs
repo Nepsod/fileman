@@ -25,85 +25,9 @@ fn file_list_item(item_id: SharedString, is_selected: bool, is_focused: bool) ->
         .rounded()
 }
 
-const ICON_LABEL_MAX_LINES_UNSELECTED: usize = 2;
-const ICON_LABEL_LINE_HEIGHT_FACTOR: f32 = 1.2;
-
-#[derive(Debug, Clone, Copy)]
-struct IconViewLabelLayout {
-    width: f32,
-    height: f32,
-    fits_on_one_line: bool,
-}
-
-fn icon_view_label_layout(
-    label: &str,
-    max_width_px: f32,
-    max_lines: Option<usize>,
-    window: &Window,
-    cx: &App,
-) -> IconViewLabelLayout {
-    use nptk::theme::theme_settings;
-
-    let font_size = TextSize::XSmall.rems(cx).to_pixels(window.rem_size());
-    let line_height = px(font_size.as_f32() * ICON_LABEL_LINE_HEIGHT_FACTOR);
-    let line_height_px = line_height.as_f32();
-    let font = theme_settings(cx).ui_font(cx).clone();
-    let text_color = cx.theme().colors().text;
-    let text_run = TextRun {
-        len: label.len(),
-        font,
-        color: text_color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    let text_runs = [text_run];
-
-    let unwrapped = window
-        .text_system()
-        .layout_line(label, font_size, &text_runs, None);
-    let natural_width = unwrapped.width.as_f32();
-
-    if natural_width <= max_width_px {
-        return IconViewLabelLayout {
-            width: natural_width + crate::view_mode::ICON_LABEL_SHELL_HORIZONTAL_PADDING_PX,
-            height: line_height_px,
-            fits_on_one_line: true,
-        };
-    }
-
-    let shaped_lines = window
-        .text_system()
-        .shape_text(
-            label.into(),
-            font_size,
-            &text_runs,
-            Some(px(max_width_px)),
-            max_lines,
-        )
-        .unwrap_or_default();
-
-    let mut width = 0.0_f32;
-    let mut height = 0.0_f32;
-    for line in shaped_lines {
-        let line_size = line.size(line_height);
-        width = width.max(line_size.width.as_f32());
-        height += line_size.height.as_f32();
-    }
-
-    if width <= 0.0 {
-        width = max_width_px;
-    }
-    if height <= 0.0 {
-        height = line_height_px;
-    }
-
-    IconViewLabelLayout {
-        width: width + crate::view_mode::ICON_LABEL_SHELL_HORIZONTAL_PADDING_PX,
-        height,
-        fits_on_one_line: false,
-    }
-}
+use crate::icon_label_layout::{
+    icon_view_label_layout, IconViewLabelLayout, ICON_LABEL_MAX_LINES_UNSELECTED,
+};
 
 fn tile_grid_rows(mut tiles: Vec<AnyElement>, columns: usize, gap: Pixels) -> Vec<AnyElement> {
     let columns = columns.max(1);
@@ -736,11 +660,7 @@ impl FilemanWindow {
         };
 
         let label_shell = {
-            let layout = icon_label_layout.unwrap_or(IconViewLabelLayout {
-                width: label_max_width_px,
-                height: 12.0,
-                fits_on_one_line: false,
-            });
+            let layout = icon_label_layout.unwrap_or(IconViewLabelLayout::fallback(label_max_width_px));
             let label_container = if view_mode == ViewMode::Icon && layout.fits_on_one_line {
                 div()
                     .max_w(label_max_width)
@@ -891,6 +811,9 @@ impl FilemanWindow {
     }
 
     pub(in crate::window::render) fn render_files_area(&mut self, window: &mut Window, cx: &mut ViewContext<Self>) -> impl IntoElement {
+        if self.view_mode == ViewMode::Icon {
+            self.sync_icon_label_layout_cache(window, cx);
+        }
         let subfolder_search = self.using_subfolder_search();
         let view_mode = self.view_mode;
         let colors = cx.theme().colors().clone();

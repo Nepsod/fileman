@@ -1,6 +1,36 @@
+use crate::icon_label_layout::{
+    icon_view_label_layout, IconViewLabelLayout, ICON_LABEL_MAX_LINES_UNSELECTED,
+};
 use crate::window::imports::*;
 
 impl FilemanWindow {
+    pub(crate) fn sync_icon_label_layout_cache(&mut self, window: &Window, cx: &App) {
+        if self.view_mode != ViewMode::Icon {
+            self.icon_label_layout_cache.clear();
+            return;
+        }
+
+        let names = self.visible_entry_names();
+        let layout = icon_view_layout(self.icon_size, self.files_panel_width());
+        let label_max_width_px =
+            (layout.cell_width - ICON_VIEW_PADDING_PX * 2.0).max(10.0);
+        self.icon_label_layout_cache
+            .resize(names.len(), IconViewLabelLayout::fallback(label_max_width_px));
+        for (index, name) in names.iter().enumerate() {
+            let max_lines = if self.selected_files.contains(name) {
+                None
+            } else {
+                Some(ICON_LABEL_MAX_LINES_UNSELECTED)
+            };
+            self.icon_label_layout_cache[index] = icon_view_label_layout(
+                name,
+                label_max_width_px,
+                max_lines,
+                window,
+                cx,
+            );
+        }
+    }
     pub(crate) fn apply_directory_drop_target(
         &self,
         row: Stateful<Div>,
@@ -73,7 +103,14 @@ impl FilemanWindow {
         origin_list: Point<Pixels>,
         pointer_list: Point<Pixels>,
         extend_selection: bool,
+        window: Option<&Window>,
+        cx: &App,
     ) {
+        if let Some(window) = window {
+            if self.view_mode == ViewMode::Icon {
+                self.sync_icon_label_layout_cache(window, cx);
+            }
+        }
         let names = self.visible_entry_names();
         if names.is_empty() {
             return;
@@ -99,42 +136,6 @@ impl FilemanWindow {
         if let Some(focus) = selection_focus {
             self.list_focus_index = Some(focus);
         }
-    }
-
-    pub(crate) fn visible_tile_render_range(&self, item_count: usize) -> Range<usize> {
-        if item_count == 0 {
-            return 0..0;
-        }
-
-        let scroll_handle = &self.files_scroll_handle.0.borrow().base_handle;
-        let scroll_offset_y = (-scroll_handle.offset().y).as_f32();
-        let viewport_height = scroll_handle.bounds().size.height.as_f32();
-        let padding = ICON_VIEW_PADDING_PX;
-
-        let (row_stride, columns) = match self.view_mode {
-            ViewMode::Icon => {
-                let layout = icon_view_layout(self.icon_size, self.files_panel_width());
-                (
-                    icon_view_tile_row_stride(layout.cell_height),
-                    layout.columns.max(1),
-                )
-            }
-            ViewMode::Compact => {
-                let layout = compact_view_layout(self.files_panel_width());
-                (layout.row_stride, layout.columns.max(1))
-            }
-            _ => return 0..item_count,
-        };
-
-        let start_row = ((scroll_offset_y - padding) / row_stride)
-            .floor()
-            .max(0.0) as usize;
-        let end_row = ((scroll_offset_y + viewport_height - padding) / row_stride)
-            .ceil() as usize
-            + 1;
-        let start_index = (start_row * columns).min(item_count);
-        let end_index = (end_row * columns).min(item_count).max(start_index);
-        start_index..end_index
     }
 
     fn marquee_selected_indices(
@@ -270,10 +271,13 @@ impl FilemanWindow {
                 let icon_pixel_size = self.icon_size as f32;
                 let label_max_width =
                     (layout.cell_width - ICON_VIEW_PADDING_PX * 2.0).max(10.0);
-                let label_hit_width = (label_max_width
-                    + ICON_LABEL_SHELL_HORIZONTAL_PADDING_PX)
-                    .min(layout.cell_width);
                 let label_shell_padding = ICON_TILE_LABEL_SHELL_PADDING_PX;
+                let label_layout = self
+                    .icon_label_layout_cache
+                    .get(index)
+                    .copied()
+                    .unwrap_or(IconViewLabelLayout::fallback(label_max_width));
+                let label_hit_width = label_layout.width.min(layout.cell_width);
                 let icon_left =
                     cell.origin.x + px((layout.cell_width - icon_pixel_size) / 2.0);
                 let icon_top = cell.origin.y + px(ICON_VIEW_PADDING_PX);
@@ -291,8 +295,7 @@ impl FilemanWindow {
                     point(label_left, label_top),
                     point(
                         label_left + px(label_hit_width),
-                        label_top
-                            + px(ICON_LABEL_AREA_HEIGHT_PX + label_shell_padding * 2.0),
+                        label_top + px(label_layout.height + label_shell_padding * 2.0),
                     ),
                 );
                 (icon_bounds, label_bounds)
@@ -427,7 +430,7 @@ impl FilemanWindow {
                     cx,
                 );
             }))
-            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if cx.has_active_drag() {
                     if this.marquee_drag.is_some() {
                         this.finish_marquee_drag(cx);
@@ -445,7 +448,7 @@ impl FilemanWindow {
                         .marquee_drag
                         .as_ref()
                         .is_some_and(|marquee| marquee.extend_selection);
-                    this.update_marquee_drag(event.position, extend_selection, cx);
+                    this.update_marquee_drag(event.position, extend_selection, Some(window), cx);
                 }
             }))
             .on_mouse_up(
@@ -670,10 +673,6 @@ impl FilemanWindow {
     }
 
 
-    pub(crate) fn icon_grid_columns(&self) -> usize {
-        self.tile_grid_columns()
-    }
-
     pub(crate) fn invert_selection(&mut self, cx: &mut ViewContext<Self>) {
         if self.using_subfolder_search() {
             let keys: Vec<String> = self
@@ -743,97 +742,6 @@ impl FilemanWindow {
         )
     }
 
-    pub(crate) fn marquee_index_range(
-        &self,
-        origin_list: Point<Pixels>,
-        pointer_list: Point<Pixels>,
-        item_count: usize,
-    ) -> (Option<usize>, Option<usize>) {
-        if item_count == 0 {
-            return (None, None);
-        }
-
-        let clamp_index = |index: usize| index.min(item_count.saturating_sub(1));
-
-        if self.view_mode == ViewMode::Icon {
-            let layout = icon_view_layout(self.icon_size, self.files_panel_width());
-            let columns = layout.columns.max(1);
-            let padding = px(ICON_VIEW_PADDING_PX);
-            let cell_width = px(layout.cell_width);
-            let cell_height = px(layout.cell_height);
-
-            let index_at = |point: Point<Pixels>| -> usize {
-                let row = ((point.y - padding) / cell_height).floor().max(0.0) as usize;
-                let column = ((point.x - padding) / cell_width).floor().max(0.0) as usize;
-                row * columns + column
-            };
-
-            let top_left = Point::new(
-                origin_list.x.min(pointer_list.x),
-                origin_list.y.min(pointer_list.y),
-            );
-            let bottom_right = Point::new(
-                origin_list.x.max(pointer_list.x),
-                origin_list.y.max(pointer_list.y),
-            );
-            return (
-                Some(clamp_index(index_at(top_left))),
-                Some(clamp_index(index_at(bottom_right))),
-            );
-        }
-
-        if self.view_mode == ViewMode::Compact {
-            let layout = compact_view_layout(self.files_panel_width());
-            let columns = layout.columns.max(1);
-            let padding = px(ICON_VIEW_PADDING_PX);
-            let cell_width = px(layout.cell_width + layout.spacing);
-            let row_height = px(layout.row_stride);
-
-            let index_at = |point: Point<Pixels>| -> usize {
-                let row = ((point.y - padding) / row_height).floor().max(0.0) as usize;
-                let column = ((point.x - padding) / cell_width).floor().max(0.0) as usize;
-                row * columns + column
-            };
-
-            let top_left = Point::new(
-                origin_list.x.min(pointer_list.x),
-                origin_list.y.min(pointer_list.y),
-            );
-            let bottom_right = Point::new(
-                origin_list.x.max(pointer_list.x),
-                origin_list.y.max(pointer_list.y),
-            );
-            return (
-                Some(clamp_index(index_at(top_left))),
-                Some(clamp_index(index_at(bottom_right))),
-            );
-        }
-
-        let start_index = clamp_index(self.marquee_list_index_for_list_y(
-            origin_list.y.min(pointer_list.y),
-            item_count,
-        ));
-        let end_index = clamp_index(self.marquee_list_index_for_list_y(
-            origin_list.y.max(pointer_list.y),
-            item_count,
-        ));
-        (Some(start_index), Some(end_index))
-    }
-
-    pub(crate) fn marquee_list_index_for_list_y(&self, list_y: Pixels, item_count: usize) -> usize {
-        if item_count == 0 {
-            return 0;
-        }
-
-        let item_height = self.marquee_list_row_height();
-        if item_height <= px(0.) {
-            return 0;
-        }
-
-        let index = (list_y / item_height).floor().max(0.0) as usize;
-        index.min(item_count - 1)
-    }
-
     pub(crate) fn marquee_list_point(&self, window_point: Point<Pixels>) -> Point<Pixels> {
         let bounds = self.marquee_viewport_bounds();
         let scroll = self.marquee_scroll_offset();
@@ -863,14 +771,6 @@ impl FilemanWindow {
         } else {
             measured
         }
-    }
-
-    pub(crate) fn marquee_local_point(&self, window_point: Point<Pixels>) -> Point<Pixels> {
-        let bounds = self.marquee_viewport_bounds();
-        point(
-            window_point.x - bounds.origin.x,
-            window_point.y - bounds.origin.y,
-        )
     }
 
     /// Converts list-content coordinates to viewport-local coordinates for the marquee layer.
@@ -1077,7 +977,12 @@ impl FilemanWindow {
                     if let Some(extend_selection) =
                         this.marquee_drag.as_ref().map(|marquee| marquee.extend_selection)
                     {
-                        this.update_marquee_drag(window.mouse_position(), extend_selection, cx);
+                        this.update_marquee_drag(
+                            window.mouse_position(),
+                            extend_selection,
+                            Some(window),
+                            cx,
+                        );
                     }
                 });
             } else {
@@ -1108,6 +1013,11 @@ impl FilemanWindow {
     }
 
     pub(crate) fn select_visible_range(&mut self, anchor_index: usize, index: usize) {
+        if self.uses_tile_grid() {
+            self.select_visible_tile_range(anchor_index, index);
+            return;
+        }
+
         let names = self.visible_entry_names();
         if names.is_empty() {
             return;
@@ -1193,13 +1103,14 @@ impl FilemanWindow {
             )
         };
 
-        self.update_marquee_drag(pointer, extend_selection, cx);
+        self.update_marquee_drag(pointer, extend_selection, None, cx);
     }
 
     pub(crate) fn update_marquee_drag(
         &mut self,
         pointer: Point<Pixels>,
         extend_selection: bool,
+        window: Option<&Window>,
         cx: &mut ViewContext<Self>,
     ) {
         if cx.has_active_drag() {
@@ -1242,9 +1153,44 @@ impl FilemanWindow {
                 self.selection_anchor = None;
                 self.list_focus_index = None;
             }
-            self.apply_marquee_selection(origin_list, pointer_list, extend_selection);
+            self.apply_marquee_selection(
+                origin_list,
+                pointer_list,
+                extend_selection,
+                window,
+                cx,
+            );
         }
         cx.notify();
+    }
+
+    fn select_visible_tile_range(&mut self, anchor_index: usize, index: usize) {
+        let names = self.visible_entry_names();
+        if names.is_empty() {
+            return;
+        }
+
+        let columns = self.tile_grid_columns().max(1);
+        let anchor_index = anchor_index.min(names.len() - 1);
+        let index = index.min(names.len() - 1);
+        let anchor_row = anchor_index / columns;
+        let anchor_col = anchor_index % columns;
+        let focus_row = index / columns;
+        let focus_col = index % columns;
+        let row_start = anchor_row.min(focus_row);
+        let row_end = anchor_row.max(focus_row);
+        let col_start = anchor_col.min(focus_col);
+        let col_end = anchor_col.max(focus_col);
+
+        self.selected_files.clear();
+        for row in row_start..=row_end {
+            for col in col_start..=col_end {
+                let entry_index = row * columns + col;
+                if let Some(name) = names.get(entry_index) {
+                    self.selected_files.insert(name.clone());
+                }
+            }
+        }
     }
 
     pub(crate) fn visible_entry_names(&self) -> Vec<String> {

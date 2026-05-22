@@ -212,6 +212,7 @@ impl FilemanWindow {
             marquee_drag: None,
             marquee_cancel_subscription: None,
             marquee_autoscroll_task: None,
+            icon_label_layout_cache: Vec::new(),
             list_visible_range: None,
             show_about: false,
             path_line_input,

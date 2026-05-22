@@ -7,6 +7,7 @@ mod clipboard;
 mod config;
 mod devices;
 mod drag;
+mod icon_label_layout;
 mod icons;
 mod jobs;
 mod location_bar;
