@@ -876,7 +876,7 @@ impl FilemanWindow {
             let tile_gap = if view_mode == ViewMode::Compact {
                 COMPACT_TILE_SPACING_PX
             } else {
-                0.0
+                ICON_VIEW_TILE_GAP_PX
             };
 
             let tiles: Vec<_> = if subfolder_search {

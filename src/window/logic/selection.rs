@@ -245,6 +245,48 @@ impl FilemanWindow {
             || Self::point_in_bounds(list_point, label_bounds)
     }
 
+    fn list_row_index_at_list_point(
+        &self,
+        list_point: Point<Pixels>,
+        item_count: usize,
+    ) -> Option<usize> {
+        if item_count == 0 || self.uses_tile_grid() {
+            return None;
+        }
+
+        let row_height = self.marquee_list_row_height();
+        if row_height <= px(0.) {
+            return None;
+        }
+
+        let index = (list_point.y / row_height).floor().max(0.0) as usize;
+        if index >= item_count {
+            return None;
+        }
+
+        let row_top = row_height * index as f32;
+        let row_bottom = row_top + row_height;
+        if list_point.y >= row_top && list_point.y < row_bottom {
+            Some(index)
+        } else {
+            None
+        }
+    }
+
+    fn marquee_starts_on_background(&self, list_point: Point<Pixels>, item_count: usize) -> bool {
+        if item_count == 0 {
+            return true;
+        }
+        if self.uses_tile_grid() {
+            match self.tile_slot_at_list_point(list_point, item_count) {
+                None => true,
+                Some(_) => !self.list_point_on_tile_interactive_part(list_point, item_count),
+            }
+        } else {
+            self.list_row_index_at_list_point(list_point, item_count).is_none()
+        }
+    }
+
     fn tile_marquee_intersects_index(
         &self,
         index: usize,
@@ -397,27 +439,7 @@ impl FilemanWindow {
                 let clamped_origin = this.marquee_clamp_pointer_to_viewport(event.position);
                 let origin_list = this.marquee_list_point(clamped_origin);
                 let item_count = this.visible_entry_count();
-                if this.tile_slot_at_list_point(origin_list, item_count).is_some() {
-                    return;
-                }
-                if !this.should_handle_marquee_pointer(origin_list, cx) {
-                    return;
-                }
-                this.begin_marquee_drag(
-                    event.position,
-                    event.modifiers.control || event.modifiers.platform,
-                    window,
-                    cx,
-                );
-            }))
-            .on_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                if event.button != MouseButton::Left {
-                    return;
-                }
-                let clamped_origin = this.marquee_clamp_pointer_to_viewport(event.position);
-                let origin_list = this.marquee_list_point(clamped_origin);
-                let item_count = this.visible_entry_count();
-                if this.tile_slot_at_list_point(origin_list, item_count).is_none() {
+                if !this.marquee_starts_on_background(origin_list, item_count) {
                     return;
                 }
                 if !this.should_handle_marquee_pointer(origin_list, cx) {
@@ -479,8 +501,8 @@ impl FilemanWindow {
         }
 
         let item_count = self.visible_entry_count();
-        let background_pointer_down = self.uses_tile_grid()
-            && self.tile_slot_at_list_point(origin_list, item_count).is_none();
+        let background_pointer_down =
+            self.marquee_starts_on_background(origin_list, item_count);
         let (autoscroll_vertical, autoscroll_horizontal) =
             self.marquee_autoscroll_axes(clamped_origin);
         self.marquee_drag = Some(MarqueeDrag {
@@ -1063,16 +1085,15 @@ impl FilemanWindow {
             let Some(marquee) = self.marquee_drag.as_ref() else {
                 return;
             };
+            if marquee.autoscroll_vertical == 0 && marquee.autoscroll_horizontal == 0 {
+                return;
+            }
             (
                 marquee.autoscroll_vertical,
                 marquee.autoscroll_horizontal,
                 marquee.extend_selection,
             )
         };
-
-        if vertical == 0 && horizontal == 0 {
-            return;
-        }
 
         let step = px(crate::drag::MARQUEE_AUTOSCROLL_STEP);
         self.marquee_scroll_by(point(
