@@ -61,8 +61,15 @@ pub const ICON_VIEW_PADDING_PX: f32 = 2.0;
 pub const ICON_VIEW_HORIZONTAL_SPACING_PX: f32 = 22.0;
 /// Vertical gap between icon-view rows (legacy reused horizontal spacing here).
 pub const ICON_VIEW_ROW_GAP_PX: f32 = 6.0;
-const ICON_LABEL_AREA_HEIGHT_PX: f32 = 12.0 * 1.25 * 2.0;
+/// Gap between icon tiles in the grid (marquee and background clicks use this space).
+pub const ICON_VIEW_TILE_GAP_PX: f32 = 10.0;
+pub const ICON_LABEL_AREA_HEIGHT_PX: f32 = 12.0 * 1.25 * 2.0;
 pub const ICON_ICON_LABEL_GAP_PX: f32 = 1.0;
+pub const ICON_TILE_LABEL_SHELL_PADDING_PX: f32 = 1.0;
+pub const ICON_LABEL_SHELL_HORIZONTAL_PADDING_PX: f32 = 4.0;
+pub const COMPACT_TILE_HORIZONTAL_PADDING_PX: f32 = 8.0;
+pub const COMPACT_TILE_ICON_LABEL_GAP_PX: f32 = 10.0;
+pub const COMPACT_TILE_PART_SHELL_PADDING_PX: f32 = 2.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct IconViewLayout {
@@ -71,11 +78,20 @@ pub struct IconViewLayout {
     pub cell_height: f32,
 }
 
+pub fn icon_view_tile_column_stride(cell_width: f32) -> f32 {
+    cell_width + ICON_VIEW_TILE_GAP_PX
+}
+
+pub fn icon_view_tile_row_stride(cell_height: f32) -> f32 {
+    cell_height + ICON_VIEW_TILE_GAP_PX
+}
+
 pub fn icon_view_layout(icon_size: u32, panel_width: f32) -> IconViewLayout {
     let icon_size_pixels = icon_size as f32;
     let cell_width = (icon_size_pixels + ICON_VIEW_HORIZONTAL_SPACING_PX * 2.0).max(1.0);
     let available_width = (panel_width - ICON_VIEW_PADDING_PX * 2.0).max(1.0);
-    let columns = (available_width / cell_width).floor().max(1.0) as usize;
+    let column_stride = icon_view_tile_column_stride(cell_width);
+    let columns = (available_width / column_stride).floor().max(1.0) as usize;
     let cell_height = icon_size_pixels
         + ICON_ICON_LABEL_GAP_PX
         + ICON_LABEL_AREA_HEIGHT_PX

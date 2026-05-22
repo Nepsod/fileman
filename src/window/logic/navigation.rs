@@ -597,6 +597,7 @@ impl FilemanWindow {
 
     pub(crate) fn set_view_mode(&mut self, mode: ViewMode, cx: &mut ViewContext<Self>) {
         self.view_mode = mode;
+        self.uniform_list_row_height = None;
         self.icon_size = self.config.icon_size_for_mode(mode);
         self.config.folder_view.mode = mode.config_value().to_string();
         self.config.save();

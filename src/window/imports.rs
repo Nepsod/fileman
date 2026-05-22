@@ -23,9 +23,13 @@ pub(crate) use crate::ui_icons::ThemeIconButton;
 pub(crate) use crate::undo::UndoStack;
 pub(crate) use crate::view_mode::{
     clamp_icon_size, compact_view_layout, icon_view_layout, IconViewLayout, ViewMode,
-    COMPACT_TILE_HEIGHT_PX,
-    COMPACT_TILE_ICON_PX, COMPACT_TILE_SPACING_PX,
-    COMPACT_TILE_WIDTH_PX, ICON_ICON_LABEL_GAP_PX, ICON_VIEW_PADDING_PX, ICON_ZOOM_STEP,
+    COMPACT_TILE_HEIGHT_PX, COMPACT_TILE_HORIZONTAL_PADDING_PX,
+    COMPACT_TILE_ICON_LABEL_GAP_PX, COMPACT_TILE_ICON_PX, COMPACT_TILE_PART_SHELL_PADDING_PX,
+    COMPACT_TILE_SPACING_PX, COMPACT_TILE_WIDTH_PX, ICON_ICON_LABEL_GAP_PX,
+    ICON_LABEL_AREA_HEIGHT_PX, ICON_LABEL_SHELL_HORIZONTAL_PADDING_PX,
+    ICON_TILE_LABEL_SHELL_PADDING_PX, ICON_VIEW_PADDING_PX, ICON_VIEW_TILE_GAP_PX,
+    icon_view_tile_column_stride, icon_view_tile_row_stride,
+    ICON_ZOOM_STEP,
     LIST_ROW_HEIGHT_PX,
     MAX_ICON_SIZE, MIN_ICON_SIZE, TABLE_COLUMN_MODIFIED_PX, TABLE_COLUMN_SIZE_PX,
     TABLE_COLUMN_TYPE_PX, TABLE_HEADER_HEIGHT_PX, TABLE_ROW_HEIGHT_PX,
@@ -35,7 +39,8 @@ pub(crate) use crate::window::format::{
     quick_access_places,
 };
 pub(crate) use crate::window::{
-    ContextMenuTarget, FilemanWindow, PendingDelete, PendingPasteChoice, PendingRename,
+    ContextMenuTarget, FilemanWindow, PendingDelete, PendingPasteChoice,
+    PendingRename,
 };
 pub(crate) use nptk::file_icons::FileIconPresentation;
 pub(crate) use nptk::gpui::{

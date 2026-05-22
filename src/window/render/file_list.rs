@@ -27,9 +27,6 @@ fn file_list_item(item_id: SharedString, is_selected: bool, is_focused: bool) ->
 
 const ICON_LABEL_MAX_LINES_UNSELECTED: usize = 2;
 const ICON_LABEL_LINE_HEIGHT_FACTOR: f32 = 1.2;
-const ICON_LABEL_SHELL_HORIZONTAL_PADDING_PX: f32 = 4.0;
-const ICON_TILE_LABEL_SHELL_PADDING_PX: f32 = 1.0;
-const COMPACT_TILE_PART_SHELL_PADDING_PX: f32 = 2.0;
 
 #[derive(Debug, Clone, Copy)]
 struct IconViewLabelLayout {
@@ -69,7 +66,7 @@ fn icon_view_label_layout(
 
     if natural_width <= max_width_px {
         return IconViewLabelLayout {
-            width: natural_width + ICON_LABEL_SHELL_HORIZONTAL_PADDING_PX,
+            width: natural_width + crate::view_mode::ICON_LABEL_SHELL_HORIZONTAL_PADDING_PX,
             height: line_height_px,
             fits_on_one_line: true,
         };
@@ -102,7 +99,7 @@ fn icon_view_label_layout(
     }
 
     IconViewLabelLayout {
-        width: width + ICON_LABEL_SHELL_HORIZONTAL_PADDING_PX,
+        width: width + crate::view_mode::ICON_LABEL_SHELL_HORIZONTAL_PADDING_PX,
         height,
         fits_on_one_line: false,
     }
@@ -547,7 +544,8 @@ impl FilemanWindow {
 
         if matches!(view_mode, ViewMode::Icon | ViewMode::Compact) {
             let tile_secondary_label = (view_mode == ViewMode::Compact).then(|| type_string.clone());
-            let mut tile = self.render_file_tile(
+            let directory_drop_path = is_directory.then_some(file_path.clone());
+            let tile = self.render_file_tile(
                 drag_row_id,
                 view_mode,
                 icon_element,
@@ -557,6 +555,7 @@ impl FilemanWindow {
                 is_focused,
                 icon_layout,
                 drag_payload,
+                directory_drop_path,
                 FileTileInteraction::Entry {
                     entry_index,
                     name_for_open,
@@ -567,9 +566,6 @@ impl FilemanWindow {
                 window,
                 cx,
             );
-            if is_directory {
-                tile = self.apply_directory_drop_target(tile, file_path, cx);
-            }
             return tile.into_any_element();
         }
 
@@ -658,6 +654,7 @@ impl FilemanWindow {
         is_focused: bool,
         icon_layout: IconViewLayout,
         drag_payload: DraggedFilePaths,
+        directory_drop_path: Option<PathBuf>,
         interaction: FileTileInteraction,
         window: &Window,
         cx: &mut ViewContext<Self>,
@@ -738,124 +735,110 @@ impl FilemanWindow {
                 .into_any_element()
         };
 
+        let label_shell = {
+            let layout = icon_label_layout.unwrap_or(IconViewLabelLayout {
+                width: label_max_width_px,
+                height: 12.0,
+                fits_on_one_line: false,
+            });
+            let label_container = if view_mode == ViewMode::Icon && layout.fits_on_one_line {
+                div()
+                    .max_w(label_max_width)
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_start()
+                    .text_center()
+            } else if view_mode == ViewMode::Icon {
+                div()
+                    .w(px(layout.width))
+                    .h(px(layout.height))
+                    .max_w(label_max_width)
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_start()
+                    .text_center()
+            } else {
+                div().flex_1().min_w_0().overflow_hidden()
+            };
+            tile_part_shell(
+                label_part_id,
+                label_container.child(label_element),
+                is_selected,
+                is_focused,
+                px(crate::view_mode::ICON_TILE_LABEL_SHELL_PADDING_PX),
+                view_mode == ViewMode::Icon,
+                click_label,
+                context_label,
+                cx,
+            )
+        };
+
+        let drag_payload_for_shell = drag_payload.clone();
+        let attach_drag_to_shell = |this: &Self,
+                                    mut shell: Stateful<Div>,
+                                    cx: &mut ViewContext<Self>| {
+            shell = shell.on_drag(drag_payload_for_shell.clone(), |payload: &DraggedFilePaths, _, _, cx| {
+                cx.new(|_| payload.clone())
+            });
+            if let Some(destination) = directory_drop_path.clone() {
+                shell = this.apply_directory_drop_target(shell, destination, cx);
+            }
+            shell
+        };
+
+        let mut icon_shell = icon_tile_icon_shell(
+            icon_part_id.clone(),
+            tile_icon_content(icon_element, icon_pixel_size).into_any_element(),
+            icon_pixel_size,
+            is_selected,
+            click_icon,
+            context_icon,
+            cx,
+        );
+        icon_shell = attach_drag_to_shell(self, icon_shell, cx);
+        let label_shell = attach_drag_to_shell(self, label_shell, cx);
+
         match view_mode {
-            ViewMode::Icon => div()
-                .id(tile_id)
-                .w(px(tile_width))
-                .h(px(tile_height))
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_start()
-                .pt(px(ICON_VIEW_PADDING_PX))
-                .on_drag(drag_payload, |payload: &DraggedFilePaths, _, _, cx| {
-                    cx.new(|_| payload.clone())
-                })
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .gap(px(ICON_ICON_LABEL_GAP_PX))
-                        .child(icon_tile_icon_shell(
-                            icon_part_id.clone(),
-                            tile_icon_content(icon_element, icon_pixel_size).into_any_element(),
-                            icon_pixel_size,
-                            is_selected,
-                            click_icon,
-                            context_icon,
-                            cx,
-                        ))
-                        .child({
-                            let layout = icon_label_layout.unwrap_or(IconViewLabelLayout {
-                                width: label_max_width_px,
-                                height: 12.0,
-                                fits_on_one_line: false,
-                            });
-                            let label_container = if layout.fits_on_one_line {
-                                div()
-                                    .max_w(label_max_width)
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .justify_start()
-                                    .text_center()
-                            } else {
-                                div()
-                                    .w(px(layout.width))
-                                    .h(px(layout.height))
-                                    .max_w(label_max_width)
-                                    .flex()
-                                    .flex_col()
-                                    .items_center()
-                                    .justify_start()
-                                    .text_center()
-                            };
-                            tile_part_shell(
-                                label_part_id,
-                                label_container.child(label_element),
-                                is_selected,
-                                is_focused,
-                                px(ICON_TILE_LABEL_SHELL_PADDING_PX),
-                                true,
-                                click_label,
-                                context_label,
-                                cx,
-                            )
-                        }),
-                ),
-            ViewMode::Compact => div()
-                .id(tile_id)
-                .w(px(tile_width))
-                .h(px(tile_height))
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_start()
-                .overflow_hidden()
-                .on_drag(drag_payload, |payload: &DraggedFilePaths, _, _, cx| {
-                    cx.new(|_| payload.clone())
-                })
-                .child(
-                    h_flex()
-                        .size_full()
-                        .items_center()
-                        .gap(px(10.0))
-                        .px(px(8.0))
-                        .child(
-                            tile_part_shell(
-                                icon_part_id.clone(),
-                                tile_icon_content(icon_element, icon_pixel_size),
-                                is_selected,
-                                false,
-                                px(COMPACT_TILE_PART_SHELL_PADDING_PX),
-                                false,
-                                click_icon,
-                                context_icon,
-                                cx,
-                            )
-                            .flex_shrink_0(),
-                        )
-                        .child(
-                            tile_part_shell(
-                                label_part_id,
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .child(label_element),
-                                is_selected,
-                                is_focused,
-                                px(COMPACT_TILE_PART_SHELL_PADDING_PX),
-                                false,
-                                click_label,
-                                context_label,
-                                cx,
-                            )
-                            .flex_1()
-                            .min_w_0(),
-                        ),
-                ),
+            ViewMode::Icon => {
+                let interactive = div()
+                    .id(format!("{tile_id}-interactive"))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(ICON_ICON_LABEL_GAP_PX))
+                    .pt(px(ICON_VIEW_PADDING_PX))
+                    .child(icon_shell)
+                    .child(label_shell);
+                div()
+                    .id(tile_id)
+                    .w(px(tile_width))
+                    .h(px(tile_height))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_start()
+                    .child(interactive)
+            }
+            ViewMode::Compact => {
+                let interactive = h_flex()
+                    .id(format!("{tile_id}-interactive"))
+                    .items_center()
+                    .gap(px(COMPACT_TILE_ICON_LABEL_GAP_PX))
+                    .px(px(COMPACT_TILE_HORIZONTAL_PADDING_PX))
+                    .child(icon_shell.flex_shrink_0())
+                    .child(label_shell.flex_1().min_w_0());
+                div()
+                    .id(tile_id)
+                    .w(px(tile_width))
+                    .h(px(tile_height))
+                    .flex()
+                    .items_center()
+                    .justify_start()
+                    .overflow_hidden()
+                    .child(interactive)
+            }
             _ => unreachable!(),
         }
     }
@@ -1009,15 +992,13 @@ impl FilemanWindow {
             Vec::new()
         };
 
-        let scroll = div()
+        let mut scroll = div()
             .id("files-scroll-area")
             .flex_1()
             .flex()
             .flex_col()
             .min_h_0()
             .relative()
-            .drag_over::<DraggedFilePaths>(|style, _, _, cx| drop_target_style(style, cx))
-            .drag_over::<ExternalPaths>(|style, _, _, cx| drop_target_style(style, cx))
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 this.drop_external_files(paths, cx);
             }))
@@ -1042,36 +1023,42 @@ impl FilemanWindow {
                 |panel| panel.child(empty_state),
             );
 
+        if !uses_tile_grid {
+            scroll = scroll
+                .drag_over::<DraggedFilePaths>(|style, _, _, cx| drop_target_style(style, cx))
+                .drag_over::<ExternalPaths>(|style, _, _, cx| drop_target_style(style, cx));
+        }
+
         if uses_tile_grid {
             let tile_scroll_handle = self.files_scroll_handle.0.borrow().base_handle.clone();
             let tile_gap = if view_mode == ViewMode::Compact {
                 px(COMPACT_TILE_SPACING_PX)
             } else {
-                px(0.0)
+                px(ICON_VIEW_TILE_GAP_PX)
             };
             scroll.child(
-                self.attach_marquee_handlers(
-                    div()
-                        .id("fileman-marquee-layer")
-                        .flex_1()
-                        .min_h_0()
-                        .relative(),
-                    cx,
-                )
-                .child(
-                    div()
-                        .id("fileman-tile-scroll")
-                        .overflow_y_scroll()
-                        .size_full()
-                        .track_scroll(&tile_scroll_handle)
-                        .relative()
-                        .p(px(ICON_VIEW_PADDING_PX))
-                        .flex()
-                        .flex_col()
-                        .gap(tile_gap)
-                        .children(tile_scroll_content)
-                        .child(self.render_marquee_overlay(cx, true)),
-                ),
+                div()
+                    .id("fileman-marquee-layer")
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(
+                        self.attach_marquee_handlers(
+                            div()
+                                .id("fileman-tile-scroll")
+                                .overflow_y_scroll()
+                                .size_full()
+                                .track_scroll(&tile_scroll_handle)
+                                .relative()
+                                .p(px(ICON_VIEW_PADDING_PX))
+                                .flex()
+                                .flex_col()
+                                .gap(tile_gap)
+                                .children(tile_scroll_content)
+                                .child(self.render_marquee_overlay(cx, true)),
+                            cx,
+                        ),
+                    ),
             )
         } else {
             let table_header = (view_mode == ViewMode::Table
@@ -1180,8 +1167,8 @@ impl FilemanWindow {
         let icon_layout = icon_view_layout(self.icon_size, self.files_panel_width());
 
         if matches!(view_mode, ViewMode::Icon | ViewMode::Compact) {
-            let path_for_drop = path.clone();
-            let mut tile = self.render_file_tile(
+            let directory_drop_path = is_directory.then_some(path.clone());
+            let tile = self.render_file_tile(
                 drag_row_id,
                 view_mode,
                 icon_element,
@@ -1191,6 +1178,7 @@ impl FilemanWindow {
                 is_focused,
                 icon_layout,
                 drag_payload,
+                directory_drop_path,
                 FileTileInteraction::Search {
                     entry_index,
                     path,
@@ -1200,9 +1188,6 @@ impl FilemanWindow {
                 window,
                 cx,
             );
-            if is_directory {
-                tile = self.apply_directory_drop_target(tile, path_for_drop, cx);
-            }
             return tile.into_any_element();
         }
 

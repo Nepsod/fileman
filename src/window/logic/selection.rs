@@ -26,14 +26,14 @@ impl FilemanWindow {
             })
             .on_drop(cx.listener({
                 let destination = destination.clone();
-                move |this, dragged: &DraggedFilePaths, _, cx| {
-                    this.drop_into_directory(&destination, dragged, cx);
+                move |this, dragged: &DraggedFilePaths, window, cx| {
+                    this.drop_into_directory(&destination, dragged, window, cx);
                 }
             }))
             .on_drop(cx.listener({
                 let destination = destination.clone();
-                move |this, paths: &ExternalPaths, _, cx| {
-                    this.drop_external_into_directory(&destination, paths, cx);
+                move |this, paths: &ExternalPaths, window, cx| {
+                    this.drop_external_into_directory(&destination, paths, window, cx);
                 }
             }))
     }
@@ -114,7 +114,10 @@ impl FilemanWindow {
         let (row_stride, columns) = match self.view_mode {
             ViewMode::Icon => {
                 let layout = icon_view_layout(self.icon_size, self.files_panel_width());
-                (layout.cell_height, layout.columns.max(1))
+                (
+                    icon_view_tile_row_stride(layout.cell_height),
+                    layout.columns.max(1),
+                )
             }
             ViewMode::Compact => {
                 let layout = compact_view_layout(self.files_panel_width());
@@ -151,22 +154,179 @@ impl FilemanWindow {
 
         if matches!(self.view_mode, ViewMode::Icon | ViewMode::Compact) {
             return (0..item_count)
-                .filter(|&index| {
-                    let bounds = self.tile_cell_bounds(index);
-                    bounds.left() < selection_right
-                        && bounds.right() > selection_left
-                        && bounds.top() < selection_bottom
-                        && bounds.bottom() > selection_top
-                })
+                .filter(|&index| self.tile_marquee_intersects_index(index, selection_left, selection_right, selection_top, selection_bottom))
                 .collect();
         }
 
-        let (Some(start_index), Some(end_index)) =
-            self.marquee_index_range(origin_list, pointer_list, item_count)
-        else {
+        let item_height = self.marquee_list_row_height();
+        if item_height <= px(0.) {
             return Vec::new();
+        }
+
+        (0..item_count)
+            .filter(|&index| {
+                let row_top = item_height * index as f32;
+                let row_bottom = row_top + item_height;
+                row_top < selection_bottom && row_bottom > selection_top
+            })
+            .collect()
+    }
+
+    fn point_in_bounds(point: Point<Pixels>, bounds: Bounds<Pixels>) -> bool {
+        point.x >= bounds.left()
+            && point.x <= bounds.right()
+            && point.y >= bounds.top()
+            && point.y <= bounds.bottom()
+    }
+
+    fn visible_entry_count(&self) -> usize {
+        if self.using_subfolder_search() {
+            self.search_matches.len()
+        } else {
+            self.visible_files().len()
+        }
+    }
+
+    fn tile_slot_at_list_point(&self, list_point: Point<Pixels>, item_count: usize) -> Option<usize> {
+        if item_count == 0 {
+            return None;
+        }
+
+        let padding = px(ICON_VIEW_PADDING_PX);
+        if list_point.x < padding || list_point.y < padding {
+            return None;
+        }
+
+        let index = match self.view_mode {
+            ViewMode::Icon => {
+                let layout = icon_view_layout(self.icon_size, self.files_panel_width());
+                let columns = layout.columns.max(1);
+                let column_stride = px(icon_view_tile_column_stride(layout.cell_width));
+                let row_stride = px(icon_view_tile_row_stride(layout.cell_height));
+                let column = ((list_point.x - padding) / column_stride).floor() as usize;
+                let row = ((list_point.y - padding) / row_stride).floor() as usize;
+                row * columns + column
+            }
+            ViewMode::Compact => {
+                let layout = compact_view_layout(self.files_panel_width());
+                let columns = layout.columns.max(1);
+                let column = ((list_point.x - padding) / px(layout.cell_width + layout.spacing))
+                    .floor() as usize;
+                let row =
+                    ((list_point.y - padding) / px(layout.row_stride)).floor() as usize;
+                row * columns + column
+            }
+            _ => return None,
         };
-        (start_index..=end_index).collect()
+
+        if index >= item_count {
+            return None;
+        }
+
+        let slot_bounds = self.tile_cell_bounds(index);
+        if Self::point_in_bounds(list_point, slot_bounds) {
+            Some(index)
+        } else {
+            None
+        }
+    }
+
+    fn list_point_on_tile_interactive_part(
+        &self,
+        list_point: Point<Pixels>,
+        item_count: usize,
+    ) -> bool {
+        let Some(index) = self.tile_slot_at_list_point(list_point, item_count) else {
+            return false;
+        };
+        let (icon_bounds, label_bounds) = self.tile_interactive_bounds(index);
+        Self::point_in_bounds(list_point, icon_bounds)
+            || Self::point_in_bounds(list_point, label_bounds)
+    }
+
+    fn tile_marquee_intersects_index(
+        &self,
+        index: usize,
+        selection_left: Pixels,
+        selection_right: Pixels,
+        selection_top: Pixels,
+        selection_bottom: Pixels,
+    ) -> bool {
+        let intersects = |bounds: Bounds<Pixels>| {
+            bounds.left() < selection_right
+                && bounds.right() > selection_left
+                && bounds.top() < selection_bottom
+                && bounds.bottom() > selection_top
+        };
+        let (icon_bounds, label_bounds) = self.tile_interactive_bounds(index);
+        intersects(icon_bounds) || intersects(label_bounds)
+    }
+
+    fn tile_interactive_bounds(&self, index: usize) -> (Bounds<Pixels>, Bounds<Pixels>) {
+        let cell = self.tile_cell_bounds(index);
+        match self.view_mode {
+            ViewMode::Icon => {
+                let layout = icon_view_layout(self.icon_size, self.files_panel_width());
+                let icon_pixel_size = self.icon_size as f32;
+                let label_max_width =
+                    (layout.cell_width - ICON_VIEW_PADDING_PX * 2.0).max(10.0);
+                let label_hit_width = (label_max_width
+                    + ICON_LABEL_SHELL_HORIZONTAL_PADDING_PX)
+                    .min(layout.cell_width);
+                let label_shell_padding = ICON_TILE_LABEL_SHELL_PADDING_PX;
+                let icon_left =
+                    cell.origin.x + px((layout.cell_width - icon_pixel_size) / 2.0);
+                let icon_top = cell.origin.y + px(ICON_VIEW_PADDING_PX);
+                let icon_bounds = Bounds::from_corners(
+                    point(icon_left, icon_top),
+                    point(
+                        icon_left + px(icon_pixel_size),
+                        icon_top + px(icon_pixel_size),
+                    ),
+                );
+                let label_top = icon_bounds.bottom() + px(ICON_ICON_LABEL_GAP_PX);
+                let label_left =
+                    cell.origin.x + px((layout.cell_width - label_hit_width) / 2.0);
+                let label_bounds = Bounds::from_corners(
+                    point(label_left, label_top),
+                    point(
+                        label_left + px(label_hit_width),
+                        label_top
+                            + px(ICON_LABEL_AREA_HEIGHT_PX + label_shell_padding * 2.0),
+                    ),
+                );
+                (icon_bounds, label_bounds)
+            }
+            ViewMode::Compact => {
+                let icon_block = COMPACT_TILE_ICON_PX as f32
+                    + COMPACT_TILE_PART_SHELL_PADDING_PX * 2.0;
+                let inner_left = cell.origin.x + px(COMPACT_TILE_HORIZONTAL_PADDING_PX);
+                let icon_top = cell.origin.y
+                    + px((COMPACT_TILE_HEIGHT_PX - icon_block) / 2.0);
+                let icon_bounds = Bounds::from_corners(
+                    point(inner_left, icon_top),
+                    point(inner_left + px(icon_block), icon_top + px(icon_block)),
+                );
+                let label_left = icon_bounds.right()
+                    + px(COMPACT_TILE_ICON_LABEL_GAP_PX + COMPACT_TILE_PART_SHELL_PADDING_PX);
+                let label_width = COMPACT_TILE_WIDTH_PX
+                    - COMPACT_TILE_HORIZONTAL_PADDING_PX * 2.0
+                    - icon_block
+                    - COMPACT_TILE_ICON_LABEL_GAP_PX
+                    - COMPACT_TILE_PART_SHELL_PADDING_PX * 2.0;
+                let label_top =
+                    cell.origin.y + px(COMPACT_TILE_PART_SHELL_PADDING_PX);
+                let label_bounds = Bounds::from_corners(
+                    point(label_left, label_top),
+                    point(
+                        label_left + px(label_width.max(0.0)),
+                        cell.origin.y + px(COMPACT_TILE_HEIGHT_PX - COMPACT_TILE_PART_SHELL_PADDING_PX),
+                    ),
+                );
+                (icon_bounds, label_bounds)
+            }
+            _ => (cell, cell),
+        }
     }
 
     fn tile_cell_bounds(&self, index: usize) -> Bounds<Pixels> {
@@ -177,8 +337,10 @@ impl FilemanWindow {
                 let columns = layout.columns.max(1);
                 let column = index % columns;
                 let row = index / columns;
-                let left = padding + px(column as f32 * layout.cell_width);
-                let top = padding + px(row as f32 * layout.cell_height);
+                let left = padding
+                    + px(column as f32 * icon_view_tile_column_stride(layout.cell_width));
+                let top =
+                    padding + px(row as f32 * icon_view_tile_row_stride(layout.cell_height));
                 Bounds::from_corners(
                     point(left, top),
                     point(left + px(layout.cell_width), top + px(layout.cell_height)),
@@ -204,6 +366,21 @@ impl FilemanWindow {
         }
     }
 
+    fn should_handle_marquee_pointer(&self, list_point: Point<Pixels>, cx: &App) -> bool {
+        if cx.has_active_drag() {
+            return false;
+        }
+        if self.using_subfolder_search() {
+            return false;
+        }
+        if self.uses_tile_grid()
+            && self.list_point_on_tile_interactive_part(list_point, self.visible_entry_count())
+        {
+            return false;
+        }
+        true
+    }
+
     pub(crate) fn attach_marquee_handlers(
         &self,
         layer: Stateful<Div>,
@@ -211,16 +388,52 @@ impl FilemanWindow {
     ) -> Stateful<Div> {
         layer
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                if event.button == MouseButton::Left {
-                    this.begin_marquee_drag(
-                        event.position,
-                        event.modifiers.control || event.modifiers.platform,
-                        window,
-                        cx,
-                    );
+                if event.button != MouseButton::Left {
+                    return;
                 }
+                let clamped_origin = this.marquee_clamp_pointer_to_viewport(event.position);
+                let origin_list = this.marquee_list_point(clamped_origin);
+                let item_count = this.visible_entry_count();
+                if this.tile_slot_at_list_point(origin_list, item_count).is_some() {
+                    return;
+                }
+                if !this.should_handle_marquee_pointer(origin_list, cx) {
+                    return;
+                }
+                this.begin_marquee_drag(
+                    event.position,
+                    event.modifiers.control || event.modifiers.platform,
+                    window,
+                    cx,
+                );
+            }))
+            .on_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                if event.button != MouseButton::Left {
+                    return;
+                }
+                let clamped_origin = this.marquee_clamp_pointer_to_viewport(event.position);
+                let origin_list = this.marquee_list_point(clamped_origin);
+                let item_count = this.visible_entry_count();
+                if this.tile_slot_at_list_point(origin_list, item_count).is_none() {
+                    return;
+                }
+                if !this.should_handle_marquee_pointer(origin_list, cx) {
+                    return;
+                }
+                this.begin_marquee_drag(
+                    event.position,
+                    event.modifiers.control || event.modifiers.platform,
+                    window,
+                    cx,
+                );
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if cx.has_active_drag() {
+                    if this.marquee_drag.is_some() {
+                        this.finish_marquee_drag(cx);
+                    }
+                    return;
+                }
                 if this.marquee_drag.is_some()
                     && event.pressed_button != Some(MouseButton::Left)
                 {
@@ -256,12 +469,15 @@ impl FilemanWindow {
         window: &mut Window,
         cx: &mut ViewContext<Self>,
     ) {
-        if self.using_subfolder_search() {
+        let clamped_origin = self.marquee_clamp_pointer_to_viewport(origin);
+        let origin_list = self.marquee_list_point(clamped_origin);
+        if !self.should_handle_marquee_pointer(origin_list, cx) {
             return;
         }
 
-        let clamped_origin = self.marquee_clamp_pointer_to_viewport(origin);
-        let origin_list = self.marquee_list_point(clamped_origin);
+        let item_count = self.visible_entry_count();
+        let background_pointer_down = self.uses_tile_grid()
+            && self.tile_slot_at_list_point(origin_list, item_count).is_none();
         let (autoscroll_vertical, autoscroll_horizontal) =
             self.marquee_autoscroll_axes(clamped_origin);
         self.marquee_drag = Some(MarqueeDrag {
@@ -271,6 +487,7 @@ impl FilemanWindow {
             pointer_list: origin_list,
             extend_selection,
             active: false,
+            background_pointer_down,
             autoscroll_vertical,
             autoscroll_horizontal,
         });
@@ -359,11 +576,28 @@ impl FilemanWindow {
         }
     }
 
+    pub(crate) fn clear_file_selection(&mut self, cx: &mut ViewContext<Self>) {
+        if self.selected_files.is_empty()
+            && self.selection_anchor.is_none()
+            && self.list_focus_index.is_none()
+        {
+            return;
+        }
+        self.selected_files.clear();
+        self.selection_anchor = None;
+        self.list_focus_index = None;
+        cx.notify();
+    }
+
     pub(crate) fn finish_marquee_drag(&mut self, cx: &mut ViewContext<Self>) {
         self.marquee_cancel_subscription.take();
         self.marquee_autoscroll_task.take();
-        if self.marquee_drag.is_some() {
-            self.marquee_drag = None;
+        let Some(marquee) = self.marquee_drag.take() else {
+            return;
+        };
+        if !marquee.active && marquee.background_pointer_down {
+            self.clear_file_selection(cx);
+        } else {
             cx.notify();
         }
     }
@@ -610,9 +844,25 @@ impl FilemanWindow {
     }
 
     pub(crate) fn marquee_list_row_height(&self) -> Pixels {
-        self.uniform_list_row_height
+        if self.uses_tile_grid() {
+            return self.files_list_item_height();
+        }
+
+        let intended = self.files_list_item_height();
+        let Some(measured) = self
+            .uniform_list_row_height
             .filter(|height| *height > px(0.))
-            .unwrap_or_else(|| self.files_list_item_height())
+        else {
+            return intended;
+        };
+
+        let intended_px = intended.as_f32();
+        let measured_px = measured.as_f32();
+        if measured_px < intended_px * 0.5 || measured_px > intended_px * 1.5 {
+            intended
+        } else {
+            measured
+        }
     }
 
     pub(crate) fn marquee_local_point(&self, window_point: Point<Pixels>) -> Point<Pixels> {
@@ -710,7 +960,8 @@ impl FilemanWindow {
         let (item_top, item_bottom) = match self.view_mode {
             ViewMode::Icon => {
                 let layout = icon_view_layout(self.icon_size, self.files_panel_width());
-                let top = row as f32 * layout.cell_height + ICON_VIEW_PADDING_PX;
+                let top =
+                    row as f32 * icon_view_tile_row_stride(layout.cell_height) + ICON_VIEW_PADDING_PX;
                 (top, top + layout.cell_height)
             }
             ViewMode::Compact => {
@@ -786,27 +1037,14 @@ impl FilemanWindow {
             return;
         }
 
+        let _ = item_count;
         let state = self.files_scroll_handle.0.borrow();
         let Some(item_size) = state.last_item_size else {
             return;
         };
-        let divisor = self
-            .list_visible_range
-            .as_ref()
-            .map(|range| range.len())
-            .filter(|&len| len > 0)
-            .unwrap_or(item_count);
-        if divisor == 0 {
-            return;
-        }
-        let measured = px(item_size.contents.height.as_f32() / divisor as f32);
-        let intended = self.files_list_item_height();
+        let measured = item_size.contents.height;
         if measured > px(0.) {
-            self.uniform_list_row_height = Some(if measured > intended {
-                intended
-            } else {
-                measured
-            });
+            self.uniform_list_row_height = Some(measured);
         }
     }
 
@@ -830,6 +1068,12 @@ impl FilemanWindow {
 
             if event.pressed_button == Some(MouseButton::Left) {
                 let _ = view_for_mouse_move.update(cx, |this, cx| {
+                    if cx.has_active_drag() {
+                        if this.marquee_drag.is_some() {
+                            this.finish_marquee_drag(cx);
+                        }
+                        return;
+                    }
                     if let Some(extend_selection) =
                         this.marquee_drag.as_ref().map(|marquee| marquee.extend_selection)
                     {
@@ -958,6 +1202,13 @@ impl FilemanWindow {
         extend_selection: bool,
         cx: &mut ViewContext<Self>,
     ) {
+        if cx.has_active_drag() {
+            if self.marquee_drag.is_some() {
+                self.finish_marquee_drag(cx);
+            }
+            return;
+        }
+
         let clamped_pointer = self.marquee_clamp_pointer_to_viewport(pointer);
         let pointer_list = self.marquee_list_point(clamped_pointer);
         let (autoscroll_vertical, autoscroll_horizontal) =

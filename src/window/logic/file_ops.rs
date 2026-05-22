@@ -285,6 +285,7 @@ impl FilemanWindow {
         &mut self,
         destination_directory: &Path,
         paths: &gpui::ExternalPaths,
+        window: &mut Window,
         cx: &mut ViewContext<Self>,
     ) {
         let sources = crate::drag::filter_sources_for_destination(
@@ -296,7 +297,13 @@ impl FilemanWindow {
             self.set_status("Cannot copy into this folder", cx);
             return;
         }
-        self.paste_dropped_files(sources, destination_directory.to_path_buf(), false, cx);
+        self.offer_drop_into_directory(
+            sources,
+            destination_directory.to_path_buf(),
+            window.mouse_position(),
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn drop_internal_files(&mut self, dragged: &DraggedFilePaths, cx: &mut ViewContext<Self>) {
@@ -316,6 +323,7 @@ impl FilemanWindow {
         &mut self,
         destination_directory: &Path,
         dragged: &DraggedFilePaths,
+        window: &mut Window,
         cx: &mut ViewContext<Self>,
     ) {
         let sources =
@@ -324,7 +332,95 @@ impl FilemanWindow {
             self.set_status("Cannot move into this folder", cx);
             return;
         }
-        self.paste_dropped_files(sources, destination_directory.to_path_buf(), true, cx);
+        self.offer_drop_into_directory(
+            sources,
+            destination_directory.to_path_buf(),
+            window.mouse_position(),
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn offer_drop_into_directory(
+        &mut self,
+        sources: Vec<PathBuf>,
+        destination_directory: PathBuf,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut ViewContext<Self>,
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+        self.deploy_drop_choice_menu(position, sources, destination_directory, window, cx);
+    }
+
+    pub(crate) fn deploy_drop_choice_menu(
+        &mut self,
+        position: Point<Pixels>,
+        sources: Vec<PathBuf>,
+        destination_directory: PathBuf,
+        window: &mut Window,
+        cx: &mut ViewContext<Self>,
+    ) {
+        self.dismiss_context_menu();
+        let focus_handle = self.focus_handle.clone();
+        let window_weak = cx.weak_entity();
+
+        let context_menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            let weak_for_move = window_weak.clone();
+            let weak_for_copy = window_weak.clone();
+            let weak_for_cancel = window_weak.clone();
+            let sources_for_move = sources.clone();
+            let sources_for_copy = sources.clone();
+            let destination_for_move = destination_directory.clone();
+            let destination_for_copy = destination_directory.clone();
+            menu.context(focus_handle.clone())
+                .entry("Move here", None, move |_, cx| {
+                    let _ = weak_for_move.update(cx, |this, cx| {
+                        this.paste_dropped_files(
+                            sources_for_move.clone(),
+                            destination_for_move.clone(),
+                            true,
+                            cx,
+                        );
+                    });
+                })
+                .entry("Copy here", None, move |_, cx| {
+                    let _ = weak_for_copy.update(cx, |this, cx| {
+                        this.paste_dropped_files(
+                            sources_for_copy.clone(),
+                            destination_for_copy.clone(),
+                            false,
+                            cx,
+                        );
+                    });
+                })
+                .separator()
+                .entry("Cancel", None, move |_, cx| {
+                    let _ = weak_for_cancel.update(cx, |this, cx| {
+                        this.dismiss_context_menu();
+                        cx.notify();
+                    });
+                })
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe_in(
+            &context_menu,
+            window,
+            |this, _, _: &DismissEvent, window, cx| {
+                if this.context_menu.as_ref().is_some_and(|(menu, _, _)| {
+                    menu.focus_handle(cx).contains_focused(window, cx)
+                }) {
+                    window.focus(&this.focus_handle, cx);
+                }
+                this.dismiss_context_menu();
+                cx.notify();
+            },
+        );
+
+        self.context_menu = Some((context_menu, position, subscription));
     }
 
     pub(crate) fn duplicate_selected(&mut self, cx: &mut ViewContext<Self>) {

@@ -23,6 +23,8 @@ pub struct MarqueeDrag {
     pub pointer_list: Point<Pixels>,
     pub extend_selection: bool,
     pub active: bool,
+    /// Set when a tile-grid press starts outside icon/label; a click without drag clears selection.
+    pub background_pointer_down: bool,
     /// Autoscroll while the pointer is near or past a viewport edge (-1, 0, 1).
     pub autoscroll_vertical: i8,
     pub autoscroll_horizontal: i8,
