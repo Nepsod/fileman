@@ -1,6 +1,10 @@
 use crate::icon_label_layout::{
     icon_view_label_layout, IconViewLabelLayout, ICON_LABEL_MAX_LINES_UNSELECTED,
 };
+use crate::window::logic::selection_math::{
+    file_entry_is_visible, list_row_index_at_list_y, tile_rectangle_selection_indices,
+    tile_slot_at_list_point, TileGridMode,
+};
 use crate::window::imports::*;
 
 impl FilemanWindow {
@@ -223,47 +227,19 @@ impl FilemanWindow {
     }
 
     fn tile_slot_at_list_point(&self, list_point: Point<Pixels>, item_count: usize) -> Option<usize> {
-        if item_count == 0 {
-            return None;
-        }
-
-        let padding = px(ICON_VIEW_PADDING_PX);
-        if list_point.x < padding || list_point.y < padding {
-            return None;
-        }
-
-        let index = match self.view_mode {
-            ViewMode::Icon => {
-                let layout = icon_view_layout(self.icon_size, self.files_panel_width());
-                let columns = layout.columns.max(1);
-                let column_stride = px(icon_view_tile_column_stride(layout.cell_width));
-                let row_stride = px(icon_view_tile_row_stride(layout.cell_height));
-                let column = ((list_point.x - padding) / column_stride).floor() as usize;
-                let row = ((list_point.y - padding) / row_stride).floor() as usize;
-                row * columns + column
-            }
-            ViewMode::Compact => {
-                let layout = compact_view_layout(self.files_panel_width());
-                let columns = layout.columns.max(1);
-                let column = ((list_point.x - padding) / px(layout.cell_width + layout.spacing))
-                    .floor() as usize;
-                let row =
-                    ((list_point.y - padding) / px(layout.row_stride)).floor() as usize;
-                row * columns + column
-            }
+        let mode = match self.view_mode {
+            ViewMode::Icon => TileGridMode::Icon,
+            ViewMode::Compact => TileGridMode::Compact,
             _ => return None,
         };
-
-        if index >= item_count {
-            return None;
-        }
-
-        let slot_bounds = self.tile_cell_bounds(index);
-        if Self::point_in_bounds(list_point, slot_bounds) {
-            Some(index)
-        } else {
-            None
-        }
+        tile_slot_at_list_point(
+            mode,
+            list_point.x.as_f32(),
+            list_point.y.as_f32(),
+            item_count,
+            self.icon_size,
+            self.files_panel_width(),
+        )
     }
 
     fn list_point_on_tile_interactive_part(
@@ -297,23 +273,7 @@ impl FilemanWindow {
             return None;
         }
 
-        let content_bottom = row_height * item_count as f32;
-        if list_point.y >= content_bottom {
-            return None;
-        }
-
-        let index = (list_point.y / row_height).floor().max(0.0) as usize;
-        if index >= item_count {
-            return None;
-        }
-
-        let row_top = row_height * index as f32;
-        let row_bottom = row_top + row_height;
-        if list_point.y >= row_top && list_point.y < row_bottom {
-            Some(index)
-        } else {
-            None
-        }
+        list_row_index_at_list_y(list_point.y.as_f32(), row_height.as_f32(), item_count)
     }
 
     fn marquee_starts_on_background(&self, list_point: Point<Pixels>, item_count: usize) -> bool {
@@ -1012,7 +972,7 @@ impl FilemanWindow {
         let view_for_mouse_up = view.clone();
         window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
             if phase == DispatchPhase::Capture {
-                let _ = view_for_mouse_up.update(cx, |this, cx| {
+                view_for_mouse_up.update(cx, |this, cx| {
                     if this.marquee_drag.is_some() {
                         this.finish_marquee_drag(cx);
                     }
@@ -1026,7 +986,7 @@ impl FilemanWindow {
             }
 
             if event.pressed_button == Some(MouseButton::Left) {
-                let _ = view_for_mouse_move.update(cx, |this, cx| {
+                view_for_mouse_move.update(cx, |this, cx| {
                     if cx.has_active_drag() {
                         if this.marquee_drag.is_some() {
                             this.finish_marquee_drag(cx);
@@ -1045,7 +1005,7 @@ impl FilemanWindow {
                     }
                 });
             } else {
-                let _ = view_for_mouse_move.update(cx, |this, cx| {
+                view_for_mouse_move.update(cx, |this, cx| {
                     if this.marquee_drag.is_some() {
                         this.finish_marquee_drag(cx);
                     }
@@ -1229,24 +1189,12 @@ impl FilemanWindow {
         }
 
         let columns = self.tile_grid_columns().max(1);
-        let anchor_index = anchor_index.min(names.len() - 1);
-        let index = index.min(names.len() - 1);
-        let anchor_row = anchor_index / columns;
-        let anchor_col = anchor_index % columns;
-        let focus_row = index / columns;
-        let focus_col = index % columns;
-        let row_start = anchor_row.min(focus_row);
-        let row_end = anchor_row.max(focus_row);
-        let col_start = anchor_col.min(focus_col);
-        let col_end = anchor_col.max(focus_col);
-
+        let selected_indices =
+            tile_rectangle_selection_indices(anchor_index, index, columns, names.len());
         self.selected_files.clear();
-        for row in row_start..=row_end {
-            for col in col_start..=col_end {
-                let entry_index = row * columns + col;
-                if let Some(name) = names.get(entry_index) {
-                    self.selected_files.insert(name.clone());
-                }
+        for entry_index in selected_indices {
+            if let Some(name) = names.get(entry_index) {
+                self.selected_files.insert(name.clone());
             }
         }
     }
@@ -1266,21 +1214,11 @@ impl FilemanWindow {
     }
 
     pub(crate) fn visible_files(&self) -> Vec<&FileInfo> {
-        let search = self.search_query.to_ascii_lowercase();
         self.files
             .iter()
             .filter(|file_info| {
                 let name = file_info.get_name().unwrap_or("");
-                if name.is_empty() {
-                    return false;
-                }
-                if !self.show_hidden && name.starts_with('.') {
-                    return false;
-                }
-                if !search.is_empty() && !name.to_ascii_lowercase().contains(&search) {
-                    return false;
-                }
-                true
+                file_entry_is_visible(name, &self.search_query, self.show_hidden)
             })
             .collect()
     }

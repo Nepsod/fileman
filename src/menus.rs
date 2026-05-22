@@ -1,4 +1,5 @@
 use crate::actions::*;
+use crate::window::logic::foreground::log_entity_update;
 use crate::window::FilemanWindow;
 use nptk::gpui::{App, Context, Menu, MenuItem, Window};
 
@@ -107,11 +108,14 @@ pub(crate) fn with_active_fileman(
         return;
     };
 
-    let _ = handle.update(cx, |root, window, cx| {
-        if let Ok(view) = root.downcast::<FilemanWindow>() {
-            view.update(cx, |fileman, cx| f(fileman, window, cx));
-        }
-    });
+    log_entity_update(
+        "active_fileman_menu_action",
+        handle.update(cx, |root, window, cx| {
+            if let Ok(view) = root.downcast::<FilemanWindow>() {
+                view.update(cx, |fileman, cx| f(fileman, window, cx));
+            }
+        }),
+    );
 }
 
 pub fn register_app_menu_handlers(cx: &mut App) {

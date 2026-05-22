@@ -1,3 +1,4 @@
+use crate::window::logic::foreground::log_entity_update;
 use crate::window::imports::*;
 
 impl FilemanWindow {
@@ -200,13 +201,16 @@ impl FilemanWindow {
                                     .unwrap_or_default();
                                 let weak = weak.clone();
                                 submenu = submenu.entry(label, None, move |_, cx| {
-                                    let _ = weak.update(cx, |this, cx| {
-                                        this.launch_file_with_application(
-                                            application_id.clone(),
-                                            path.clone(),
-                                            cx,
-                                        );
-                                    });
+                                    log_entity_update(
+                                        "open_with_application",
+                                        weak.update(cx, |this, cx| {
+                                            this.launch_file_with_application(
+                                                application_id.clone(),
+                                                path.clone(),
+                                                cx,
+                                            );
+                                        }),
+                                    );
                                 });
                             }
                             submenu
@@ -377,31 +381,40 @@ impl FilemanWindow {
             let destination_for_copy = destination_directory.clone();
             menu.context(focus_handle.clone())
                 .entry("Move here", None, move |_, cx| {
-                    let _ = weak_for_move.update(cx, |this, cx| {
-                        this.paste_dropped_files(
-                            sources_for_move.clone(),
-                            destination_for_move.clone(),
-                            true,
-                            cx,
-                        );
-                    });
+                    log_entity_update(
+                        "drop_paste_move",
+                        weak_for_move.update(cx, |this, cx| {
+                            this.paste_dropped_files(
+                                sources_for_move.clone(),
+                                destination_for_move.clone(),
+                                true,
+                                cx,
+                            );
+                        }),
+                    );
                 })
                 .entry("Copy here", None, move |_, cx| {
-                    let _ = weak_for_copy.update(cx, |this, cx| {
-                        this.paste_dropped_files(
-                            sources_for_copy.clone(),
-                            destination_for_copy.clone(),
-                            false,
-                            cx,
-                        );
-                    });
+                    log_entity_update(
+                        "drop_paste_copy",
+                        weak_for_copy.update(cx, |this, cx| {
+                            this.paste_dropped_files(
+                                sources_for_copy.clone(),
+                                destination_for_copy.clone(),
+                                false,
+                                cx,
+                            );
+                        }),
+                    );
                 })
                 .separator()
                 .entry("Cancel", None, move |_, cx| {
-                    let _ = weak_for_cancel.update(cx, |this, cx| {
-                        this.dismiss_context_menu();
-                        cx.notify();
-                    });
+                    log_entity_update(
+                        "drop_paste_cancel",
+                        weak_for_cancel.update(cx, |this, cx| {
+                            this.dismiss_context_menu();
+                            cx.notify();
+                        }),
+                    );
                 })
         });
 
@@ -449,10 +462,13 @@ impl FilemanWindow {
                 errors.join("; ")
             };
 
-            let _ = this.update(cx, |this, cx| {
-                this.set_status(status, cx);
-                this.reload_current_directory(cx);
-            });
+            log_entity_update(
+                "paste_dropped_complete",
+                this.update(cx, |this, cx| {
+                    this.set_status(status, cx);
+                    this.reload_current_directory(cx);
+                }),
+            );
         })
         .detach();
     }
@@ -487,12 +503,15 @@ impl FilemanWindow {
                     .and_then(|name| name.to_str())
                     .unwrap_or("…")
                     .to_string();
-                let _ = this.update(cx, |this, cx| {
-                    this.set_status(
-                        format!("{action_label} {current}/{total}: {file_name}"),
-                        cx,
-                    );
-                });
+                log_entity_update(
+                    "paste_progress",
+                    this.update(cx, |this, cx| {
+                        this.set_status(
+                            format!("{action_label} {current}/{total}: {file_name}"),
+                            cx,
+                        );
+                    }),
+                );
                 let paste_destination = paste_destination.clone();
                 let cancel_flag = cancel.clone();
                 let partial = Tokio::spawn(cx, async move {
@@ -526,14 +545,17 @@ impl FilemanWindow {
                 combined.errors.join("; ")
             };
 
-            let _ = this.update(cx, |this, cx| {
-                this.paste_cancel = None;
-                for (source, destination) in combined.recorded_moves {
-                    this.undo_stack.push_move(source, destination);
-                }
-                this.set_status(status, cx);
-                this.reload_current_directory(cx);
-            });
+            log_entity_update(
+                "paste_complete",
+                this.update(cx, |this, cx| {
+                    this.paste_cancel = None;
+                    for (source, destination) in combined.recorded_moves {
+                        this.undo_stack.push_move(source, destination);
+                    }
+                    this.set_status(status, cx);
+                    this.reload_current_directory(cx);
+                }),
+            );
         })
         .detach();
     }
@@ -701,9 +723,12 @@ impl FilemanWindow {
                 Err(error) => Some(error.to_string()),
             };
             if let Some(message) = message {
-                let _ = this.update(cx, |this, cx| {
-                    this.set_status(message, cx);
-                });
+                log_entity_update(
+                    "launch_file_status",
+                    this.update(cx, |this, cx| {
+                        this.set_status(message, cx);
+                    }),
+                );
             }
         })
         .detach();
@@ -725,9 +750,12 @@ impl FilemanWindow {
                 Err(error) => Some(error.to_string()),
             };
             if let Some(message) = message {
-                let _ = this.update(cx, |this, cx| {
-                    this.set_status(message, cx);
-                });
+                log_entity_update(
+                    "launch_with_application_status",
+                    this.update(cx, |this, cx| {
+                        this.set_status(message, cx);
+                    }),
+                );
             }
         })
         .detach();
@@ -869,10 +897,13 @@ impl FilemanWindow {
                 errors.join("; ")
             };
 
-            let _ = this.update(cx, |this, cx| {
-                this.set_status(status, cx);
-                this.reload_current_directory(cx);
-            });
+            log_entity_update(
+                "delete_complete",
+                this.update(cx, |this, cx| {
+                    this.set_status(status, cx);
+                    this.reload_current_directory(cx);
+                }),
+            );
         })
         .detach();
     }
@@ -988,12 +1019,15 @@ impl FilemanWindow {
             .flatten();
 
             if let Some(kind_row) = kind_row {
-                let _ = this.update(cx, |this, cx| {
-                    if let Some(dialog) = this.pending_properties.as_mut() {
-                        crate::properties::insert_kind_row(dialog, kind_row);
-                        cx.notify();
-                    }
-                });
+                log_entity_update(
+                    "properties_kind_row",
+                    this.update(cx, |this, cx| {
+                        if let Some(dialog) = this.pending_properties.as_mut() {
+                            crate::properties::insert_kind_row(dialog, kind_row);
+                            cx.notify();
+                        }
+                    }),
+                );
             }
 
             let icon_size = crate::properties::PROPERTIES_ICON_SIZE;
@@ -1017,16 +1051,19 @@ impl FilemanWindow {
             };
 
             let path_for_cache = path.clone();
-            let _ = this.update(cx, |this, cx| {
-                if let Some(dialog) = this.pending_properties.as_mut() {
-                    if dialog.icon.is_none() {
-                        dialog.icon = Some(presentation.clone());
+            log_entity_update(
+                "properties_icon",
+                this.update(cx, |this, cx| {
+                    if let Some(dialog) = this.pending_properties.as_mut() {
+                        if dialog.icon.is_none() {
+                            dialog.icon = Some(presentation.clone());
+                        }
+                        this.icon_cache
+                            .store_icon(path_for_cache, icon_size, presentation);
+                        cx.notify();
                     }
-                    this.icon_cache
-                        .store_icon(path_for_cache, icon_size, presentation);
-                    cx.notify();
-                }
-            });
+                }),
+            );
         })
         .detach();
     }

@@ -54,3 +54,76 @@ impl Default for UndoStack {
         Self::new(256)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nptk::std::fs;
+
+    fn test_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "fileman_undo_test_{label}_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create undo test directory");
+        directory
+    }
+
+    #[test]
+    fn push_move_clears_redo_stack() {
+        let directory = test_directory("redo_clear");
+        let first_source = directory.join("first.txt");
+        let first_dest = directory.join("first_moved.txt");
+        let second_source = directory.join("second.txt");
+        let second_dest = directory.join("second_moved.txt");
+        fs::write(&first_dest, b"1").unwrap();
+        fs::write(&second_dest, b"2").unwrap();
+
+        let mut stack = UndoStack::new(8);
+        stack.push_move(first_source.clone(), first_dest.clone());
+        stack.undo_one().expect("undo first move");
+        stack.push_move(second_source, second_dest);
+        assert!(stack.redo_one().is_err());
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn max_depth_drops_oldest_undo_entry() {
+        let directory = test_directory("max_depth");
+        let mut stack = UndoStack::new(2);
+        for index in 0..3 {
+            let source = directory.join(format!("file{index}.txt"));
+            let dest = directory.join(format!("moved{index}.txt"));
+            fs::write(&dest, format!("{index}").as_bytes()).unwrap();
+            stack.push_move(source, dest);
+        }
+
+        assert!(stack.undo_one().is_ok());
+        assert!(stack.undo_one().is_ok());
+        assert!(stack.undo_one().is_err());
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn undo_and_redo_round_trip_rename() {
+        let directory = test_directory("round_trip");
+        let source = directory.join("original.txt");
+        let dest = directory.join("renamed.txt");
+        fs::write(&dest, b"payload").unwrap();
+
+        let mut stack = UndoStack::new(8);
+        stack.push_move(source.clone(), dest.clone());
+        stack.undo_one().expect("undo rename");
+        assert!(source.exists());
+        assert!(!dest.exists());
+
+        stack.redo_one().expect("redo rename");
+        assert!(!source.exists());
+        assert!(dest.exists());
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+}

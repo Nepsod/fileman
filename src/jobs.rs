@@ -121,3 +121,69 @@ fn delete_before_overwrite(path: &nptk::std::path::Path) -> Result<(), String> {
             .map_err(|error| format!("Failed to remove file: {error}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nptk::std::fs;
+
+    fn test_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "fileman_jobs_test_{label}_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create jobs test directory");
+        directory
+    }
+
+    #[test]
+    fn count_paste_conflicts_only_counts_existing_destination_names() {
+        let destination = test_directory("conflicts");
+        let existing = destination.join("exists.txt");
+        fs::write(&existing, b"a").unwrap();
+        let missing_name = destination.join("missing.txt");
+        let outside = test_directory("outside");
+        let outside_file = outside.join("outside.txt");
+        fs::write(&outside_file, b"b").unwrap();
+
+        assert_eq!(
+            count_paste_conflicts(&[existing.clone(), outside_file.clone()], &destination),
+            1
+        );
+        assert_eq!(
+            count_paste_conflicts(&[missing_name, outside_file], &destination),
+            0
+        );
+
+        let _ = fs::remove_dir_all(&destination);
+        let _ = fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn run_paste_batch_skips_conflicting_sources() {
+        let destination = test_directory("skip");
+        let source_directory = test_directory("sources");
+        let source = source_directory.join("report.txt");
+        fs::write(&source, b"source").unwrap();
+        fs::write(destination.join("report.txt"), b"dest").unwrap();
+
+        let result = run_paste_batch(
+            vec![source.clone()],
+            destination.clone(),
+            false,
+            PasteJobSettings {
+                conflict: ConflictResolution::Skip,
+            },
+            None,
+        );
+
+        assert!(result.errors.is_empty());
+        assert!(result.recorded_moves.is_empty());
+        assert_eq!(fs::read_to_string(destination.join("report.txt")).unwrap(), "dest");
+        assert!(source.exists());
+
+        let _ = fs::remove_dir_all(&destination);
+        let _ = fs::remove_dir_all(&source_directory);
+    }
+}

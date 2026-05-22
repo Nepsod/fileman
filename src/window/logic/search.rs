@@ -1,6 +1,13 @@
+use crate::window::logic::foreground::log_entity_update;
 use crate::window::imports::*;
 
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
+
 impl FilemanWindow {
+    fn bump_search_generation(&mut self) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+    }
+
     pub(crate) fn activate_search(&mut self, window: &mut Window, cx: &mut ViewContext<Self>) {
         self.path_edit_active = false;
         self.search_active = true;
@@ -13,6 +20,7 @@ impl FilemanWindow {
     }
 
     pub(crate) fn clear_search(&mut self, cx: &mut ViewContext<Self>) {
+        self.bump_search_generation();
         self.search_active = false;
         self.search_query.clear();
         self.search_matches.clear();
@@ -69,33 +77,62 @@ impl FilemanWindow {
 
     pub(crate) fn schedule_subfolder_search(&mut self, cx: &mut ViewContext<Self>) {
         if !self.using_subfolder_search() {
+            self.bump_search_generation();
             self.search_matches.clear();
             self.search_in_progress = false;
             cx.notify();
             return;
         }
 
-        let root = self.current_path.clone();
-        let query = self.search_query.clone();
-        let show_hidden = self.show_hidden;
+        self.bump_search_generation();
+        let generation = self.search_generation;
         self.search_in_progress = true;
         self.set_status("Searching subfolders…", cx);
 
         cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(SEARCH_DEBOUNCE)
+                .await;
+
+            let search_params = log_entity_update(
+                "search_prepare",
+                this.update(cx, |this, _| {
+                    if generation != this.search_generation || !this.using_subfolder_search() {
+                        return None;
+                    }
+                    Some((
+                        this.current_path.clone(),
+                        this.search_query.clone(),
+                        this.show_hidden,
+                    ))
+                }),
+            )
+            .flatten();
+
+            let Some((root, query, show_hidden)) = search_params else {
+                return;
+            };
+
             let matches = Tokio::spawn(cx, async move {
                 crate::search::find_in_subfolders(&root, &query, show_hidden)
             })
             .await
             .unwrap_or_default();
 
-            let _ = this.update(cx, |this, cx| {
-                this.search_in_progress = false;
-                this.search_matches = matches;
-                this.invalidate_icon_label_layout_cache();
-                let count = this.search_matches.len();
-                this.set_status(format!("Found {count} matches in subfolders"), cx);
-                cx.notify();
-            });
+            log_entity_update(
+                "search_complete",
+                this.update(cx, |this, cx| {
+                    if generation != this.search_generation {
+                        return;
+                    }
+                    this.search_in_progress = false;
+                    this.search_matches = matches;
+                    this.invalidate_icon_label_layout_cache();
+                    let count = this.search_matches.len();
+                    this.set_status(format!("Found {count} matches in subfolders"), cx);
+                    cx.notify();
+                }),
+            );
         })
         .detach();
     }
@@ -110,7 +147,9 @@ impl FilemanWindow {
             self.activate_search(window, cx);
         }
         self.search_scope = scope;
+        self.bump_search_generation();
         self.search_matches.clear();
+        self.search_in_progress = false;
         match scope {
             SearchScope::CurrentFolder => {
                 self.set_status("Search: current folder only", cx);
@@ -135,7 +174,9 @@ impl FilemanWindow {
             SearchScope::CurrentFolder => SearchScope::Subfolders,
             SearchScope::Subfolders => SearchScope::CurrentFolder,
         };
+        self.bump_search_generation();
         self.search_matches.clear();
+        self.search_in_progress = false;
         if self.using_subfolder_search() {
             self.schedule_subfolder_search(cx);
         } else {
@@ -149,5 +190,4 @@ impl FilemanWindow {
             && self.search_scope == SearchScope::Subfolders
             && !self.search_query.trim().is_empty()
     }
-
 }

@@ -92,6 +92,7 @@ pub struct FilemanWindow {
     path_edit_active: bool,
     directory_watcher: Option<notify::RecommendedWatcher>,
     directory_reload_generation: u64,
+    search_generation: u64,
     tabs: TabModel,
     bookmark_paths: Vec<PathBuf>,
     volume_mounts: Vec<VolumeMount>,

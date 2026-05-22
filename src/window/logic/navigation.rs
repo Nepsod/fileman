@@ -1,3 +1,4 @@
+use crate::window::logic::foreground::log_entity_update;
 use crate::window::imports::*;
 
 impl FilemanWindow {
@@ -197,6 +198,7 @@ impl FilemanWindow {
             path_edit_active: false,
             directory_watcher: None,
             directory_reload_generation: 0,
+            search_generation: 0,
             tabs: TabModel::new(initial_path.clone()),
             bookmark_paths: crate::bookmarks::load_bookmarks(),
             volume_mounts: crate::devices::list_removable_mounts(),
@@ -321,10 +323,13 @@ impl FilemanWindow {
                     continue;
                 };
 
-                let _ = this.update(cx, |this, cx| {
-                    this.icon_cache.store_icon(path, icon_size, icon);
-                    cx.notify();
-                });
+                log_entity_update(
+                    "store_file_icon",
+                    this.update(cx, |this, cx| {
+                        this.icon_cache.store_icon(path, icon_size, icon);
+                        cx.notify();
+                    }),
+                );
             }
         })
         .detach();
@@ -387,10 +392,13 @@ impl FilemanWindow {
                     continue;
                 };
 
-                let _ = this.update(cx, |this, cx| {
-                    this.icon_cache.store_theme_icon(icon_name, toolbar_size, presentation);
-                    cx.notify();
-                });
+                log_entity_update(
+                    "store_theme_icon_toolbar",
+                    this.update(cx, |this, cx| {
+                        this.icon_cache.store_theme_icon(icon_name, toolbar_size, presentation);
+                        cx.notify();
+                    }),
+                );
             }
 
             for path in paths {
@@ -421,11 +429,14 @@ impl FilemanWindow {
                     continue;
                 };
 
-                let _ = this.update(cx, |this, cx| {
-                    this.icon_cache
-                        .store_icon(path, sidebar_size, presentation);
-                    cx.notify();
-                });
+                log_entity_update(
+                    "store_sidebar_icon",
+                    this.update(cx, |this, cx| {
+                        this.icon_cache
+                            .store_icon(path, sidebar_size, presentation);
+                        cx.notify();
+                    }),
+                );
             }
         })
         .detach();
@@ -499,32 +510,35 @@ impl FilemanWindow {
             })
             .await;
 
-            let _ = this.update(cx, |this, cx| {
-                if generation != this.directory_reload_generation {
-                    return;
-                }
-                if show_loading {
-                    this.loading_directory = false;
-                }
-                match files_result {
-                    Ok(Ok(mut files)) => {
-                        crate::sort::sort_files(&mut files, this.sort_column, this.sort_order);
-                        this.files = files;
-                        this.invalidate_icon_label_layout_cache();
-                        if show_loading && !this.using_subfolder_search() {
-                            this.set_status("Ready", cx);
-                        }
-                        this.queue_icon_loads(cx);
+            log_entity_update(
+                "reload_directory",
+                this.update(cx, |this, cx| {
+                    if generation != this.directory_reload_generation {
+                        return;
                     }
-                    _ => {
-                        if show_loading {
-                            this.files.clear();
-                            this.set_status("Failed to load directory", cx);
+                    if show_loading {
+                        this.loading_directory = false;
+                    }
+                    match files_result {
+                        Ok(Ok(mut files)) => {
+                            crate::sort::sort_files(&mut files, this.sort_column, this.sort_order);
+                            this.files = files;
+                            this.invalidate_icon_label_layout_cache();
+                            if show_loading && !this.using_subfolder_search() {
+                                this.set_status("Ready", cx);
+                            }
+                            this.queue_icon_loads(cx);
+                        }
+                        _ => {
+                            if show_loading {
+                                this.files.clear();
+                                this.set_status("Failed to load directory", cx);
+                            }
                         }
                     }
-                }
-                cx.notify();
-            });
+                    cx.notify();
+                }),
+            );
         })
         .detach();
     }
@@ -579,11 +593,14 @@ impl FilemanWindow {
                         break;
                     }
 
-                    let _ = this.update(cx, |this, cx| {
-                        if this.current_path == watch_path {
-                            this.reload_directory_entries(false, cx);
-                        }
-                    });
+                    log_entity_update(
+                        "directory_watch_reload",
+                        this.update(cx, |this, cx| {
+                            if this.current_path == watch_path {
+                                this.reload_directory_entries(false, cx);
+                            }
+                        }),
+                    );
                 }
 
                 cx.background_executor().timer(POLL_INTERVAL).await;
@@ -646,11 +663,14 @@ impl FilemanWindow {
         cx.spawn(async move |this, cx| {
             loop {
                 while let Ok(mounts) = mounts_receiver.try_recv() {
-                    let _ = this.update(cx, |this, cx| {
-                        this.volume_mounts = mounts;
-                        this.queue_ui_icon_loads(cx);
-                        cx.notify();
-                    });
+                    log_entity_update(
+                        "volume_mounts_update",
+                        this.update(cx, |this, cx| {
+                            this.volume_mounts = mounts;
+                            this.queue_ui_icon_loads(cx);
+                            cx.notify();
+                        }),
+                    );
                 }
 
                 cx.background_executor()
