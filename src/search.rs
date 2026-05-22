@@ -1,6 +1,8 @@
 use nptk::std::fs;
 use nptk::std::path::{Path, PathBuf};
 
+use crate::window::table_columns_for_path;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchScope {
     CurrentFolder,
@@ -13,6 +15,9 @@ pub struct SearchMatch {
     pub name: String,
     pub parent_label: String,
     pub is_directory: bool,
+    pub size_display: String,
+    pub type_display: String,
+    pub modified_display: String,
 }
 
 const MAX_SEARCH_DEPTH: usize = 12;
@@ -84,11 +89,17 @@ fn walk_directory(
                     }
                 })
                 .unwrap_or_else(|| ".".to_string());
+            let is_directory = path.is_dir();
+            let (size_display, type_display, modified_display) =
+                table_columns_for_path(&path, is_directory);
             results.push(SearchMatch {
                 path: path.clone(),
                 name: name.to_string(),
                 parent_label,
-                is_directory: path.is_dir(),
+                is_directory,
+                size_display,
+                type_display,
+                modified_display,
             });
         }
 

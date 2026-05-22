@@ -17,6 +17,7 @@ impl FilemanWindow {
         self.search_query.clear();
         self.search_matches.clear();
         self.search_in_progress = false;
+        self.invalidate_icon_label_layout_cache();
         self.search_line_input.update(cx, |input, cx| {
             input.set_text("", cx);
         });
@@ -40,7 +41,12 @@ impl FilemanWindow {
         match event {
             ToolbarLineInputEvent::Changed(text) => {
                 self.search_query = text;
-                self.schedule_subfolder_search(cx);
+                if self.using_subfolder_search() {
+                    self.schedule_subfolder_search(cx);
+                } else {
+                    self.invalidate_icon_label_layout_cache();
+                    cx.notify();
+                }
             }
             ToolbarLineInputEvent::Submit => {
                 self.record_search_history();
@@ -85,6 +91,7 @@ impl FilemanWindow {
             let _ = this.update(cx, |this, cx| {
                 this.search_in_progress = false;
                 this.search_matches = matches;
+                this.invalidate_icon_label_layout_cache();
                 let count = this.search_matches.len();
                 this.set_status(format!("Found {count} matches in subfolders"), cx);
                 cx.notify();

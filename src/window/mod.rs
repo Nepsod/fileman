@@ -35,6 +35,7 @@ use crate::view_mode::ViewMode;
 pub(crate) use format::{
     days_in_month, days_in_year, delete_confirmation_message, format_file_type, format_modified,
     format_size, format_unix_timestamp, path_to_file_uri, quick_access_places,
+    table_columns_for_path,
 };
 
 #[derive(Clone)]
@@ -109,6 +110,7 @@ pub struct FilemanWindow {
     marquee_cancel_subscription: Option<Subscription>,
     marquee_autoscroll_task: Option<Task<()>>,
     icon_label_layout_cache: Vec<crate::icon_label_layout::IconViewLabelLayout>,
+    icon_label_layout_cache_key: Option<(usize, u32, u32, u64, u64)>,
     list_visible_range: Option<Range<usize>>,
     show_about: bool,
     path_line_input: Entity<ToolbarLineInput>,

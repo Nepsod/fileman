@@ -4,13 +4,47 @@ use crate::icon_label_layout::{
 use crate::window::imports::*;
 
 impl FilemanWindow {
+    pub(crate) fn invalidate_icon_label_layout_cache(&mut self) {
+        self.icon_label_layout_cache_key = None;
+    }
+
+    fn icon_label_layout_cache_fingerprint(&self, entry_count: usize) -> (usize, u32, u32, u64, u64) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let panel_width = self.files_panel_width();
+        let mut selected_hasher = DefaultHasher::new();
+        let mut selected_names: Vec<_> = self.selected_files.iter().collect();
+        selected_names.sort();
+        for name in selected_names {
+            name.hash(&mut selected_hasher);
+        }
+        let mut visible_names_hasher = DefaultHasher::new();
+        for name in self.visible_entry_names() {
+            name.hash(&mut visible_names_hasher);
+        }
+        (
+            entry_count,
+            self.icon_size,
+            panel_width.to_bits(),
+            selected_hasher.finish(),
+            visible_names_hasher.finish(),
+        )
+    }
+
     pub(crate) fn sync_icon_label_layout_cache(&mut self, window: &Window, cx: &App) {
         if self.view_mode != ViewMode::Icon {
             self.icon_label_layout_cache.clear();
+            self.icon_label_layout_cache_key = None;
             return;
         }
 
         let names = self.visible_entry_names();
+        let cache_key = self.icon_label_layout_cache_fingerprint(names.len());
+        if self.icon_label_layout_cache_key == Some(cache_key) {
+            return;
+        }
+        self.icon_label_layout_cache_key = Some(cache_key);
         let layout = icon_view_layout(self.icon_size, self.files_panel_width());
         let label_max_width_px =
             (layout.cell_width - ICON_VIEW_PADDING_PX * 2.0).max(10.0);
@@ -254,8 +288,17 @@ impl FilemanWindow {
             return None;
         }
 
+        if list_point.y < px(0.) {
+            return None;
+        }
+
         let row_height = self.marquee_list_row_height();
         if row_height <= px(0.) {
+            return None;
+        }
+
+        let content_bottom = row_height * item_count as f32;
+        if list_point.y >= content_bottom {
             return None;
         }
 
@@ -282,6 +325,8 @@ impl FilemanWindow {
                 None => true,
                 Some(_) => !self.list_point_on_tile_interactive_part(list_point, item_count),
             }
+        } else if list_point.y < px(0.) {
+            false
         } else {
             self.list_row_index_at_list_point(list_point, item_count).is_none()
         }
@@ -415,15 +460,8 @@ impl FilemanWindow {
         if cx.has_active_drag() {
             return false;
         }
-        if self.using_subfolder_search() {
-            return false;
-        }
-        if self.uses_tile_grid()
-            && self.list_point_on_tile_interactive_part(list_point, self.visible_entry_count())
-        {
-            return false;
-        }
-        true
+        !self.uses_tile_grid()
+            || !self.list_point_on_tile_interactive_part(list_point, self.visible_entry_count())
     }
 
     pub(crate) fn attach_marquee_handlers(
@@ -439,10 +477,9 @@ impl FilemanWindow {
                 let clamped_origin = this.marquee_clamp_pointer_to_viewport(event.position);
                 let origin_list = this.marquee_list_point(clamped_origin);
                 let item_count = this.visible_entry_count();
-                if !this.marquee_starts_on_background(origin_list, item_count) {
-                    return;
-                }
-                if !this.should_handle_marquee_pointer(origin_list, cx) {
+                if !this.marquee_starts_on_background(origin_list, item_count)
+                    || !this.should_handle_marquee_pointer(origin_list, cx)
+                {
                     return;
                 }
                 this.begin_marquee_drag(

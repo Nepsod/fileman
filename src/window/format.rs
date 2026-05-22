@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
+use nptk::std::fs;
 use npio::{FileInfo, FileType};
 
 pub(crate) fn delete_confirmation_message(paths: &[PathBuf], permanent: bool) -> String {
@@ -47,6 +49,66 @@ pub(crate) fn path_to_file_uri(path: &Path) -> String {
     } else {
         format!("file:///{path_string}")
     }
+}
+
+pub(crate) fn table_columns_for_path(path: &Path, is_directory: bool) -> (String, String, String) {
+    if is_directory {
+        let type_display = "File folder".to_string();
+        let modified_display = path_modified_display(path);
+        return ("--".to_string(), type_display, modified_display);
+    }
+
+    let metadata = fs::metadata(path).ok();
+    let size_display = metadata
+        .as_ref()
+        .map(|meta| format_size(meta.len() as i64))
+        .unwrap_or_else(|| "--".to_string());
+    let modified_display = metadata
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| format_unix_timestamp(duration.as_secs()))
+        .unwrap_or_else(|| "--".to_string());
+    let type_display = format_file_type(&file_info_from_path(path, false));
+    (size_display, type_display, modified_display)
+}
+
+fn path_modified_display(path: &Path) -> String {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| format_unix_timestamp(duration.as_secs()))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+fn file_info_from_path(path: &Path, is_directory: bool) -> FileInfo {
+    let mut info = FileInfo::new();
+    if let Some(name) = path.file_name().and_then(|segment| segment.to_str()) {
+        info.set_name(name);
+    }
+    info.set_file_type(if is_directory {
+        FileType::Directory
+    } else {
+        FileType::Regular
+    });
+    if !is_directory {
+        if let Some(extension) = path.extension().and_then(|segment| segment.to_str()) {
+            let content_type = match extension.to_ascii_lowercase().as_str() {
+                "txt" => "text/plain",
+                "pdf" => "application/pdf",
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                "gif" => "image/gif",
+                "zip" => "application/zip",
+                "json" => "application/json",
+                "html" | "htm" => "text/html",
+                "rs" => "text/plain",
+                _ => "application/octet-stream",
+            };
+            info.set_content_type(content_type);
+        }
+    }
+    info
 }
 
 pub(crate) fn format_file_type(file_info: &FileInfo) -> String {

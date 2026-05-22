@@ -816,7 +816,6 @@ impl FilemanWindow {
         }
         let subfolder_search = self.using_subfolder_search();
         let view_mode = self.view_mode;
-        let colors = cx.theme().colors().clone();
         let search_in_progress = self.search_in_progress;
         let item_count = if subfolder_search {
             self.search_matches.len()
@@ -984,40 +983,40 @@ impl FilemanWindow {
                     ),
             )
         } else {
-            let table_header = (view_mode == ViewMode::Table
-                && !self.loading_directory
-                && item_count > 0)
-                .then(|| self.render_table_sortable_header(cx));
-
-            scroll
-                .when_some(table_header, |panel, header| panel.child(header))
-                .child(
-                    self.attach_marquee_handlers(
-                        div()
-                            .id("fileman-marquee-layer")
-                            .flex_1()
-                            .min_h_0()
-                            .relative(),
-                        cx,
-                    )
-                    .child(
-                        uniform_list(
-                            "fileman-file-list",
-                            item_count,
-                            cx.processor(move |this, range: Range<usize>, window, cx| {
-                                if subfolder_search {
-                                    this.render_search_match_range(range, view_mode, window, cx)
-                                } else {
-                                    this.render_file_entry_range(range, view_mode, window, cx)
-                                }
-                            }),
+            let mut marquee_layer = div()
+                .id("fileman-marquee-layer")
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col();
+            if view_mode == ViewMode::Table && !self.loading_directory && item_count > 0 {
+                marquee_layer = marquee_layer.child(self.render_table_sortable_header(cx));
+            }
+            scroll.child(
+                self.attach_marquee_handlers(marquee_layer, cx).child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .relative()
+                        .child(
+                            uniform_list(
+                                "fileman-file-list",
+                                item_count,
+                                cx.processor(move |this, range: Range<usize>, window, cx| {
+                                    if subfolder_search {
+                                        this.render_search_match_range(range, view_mode, window, cx)
+                                    } else {
+                                        this.render_file_entry_range(range, view_mode, window, cx)
+                                    }
+                                }),
+                            )
+                            .size_full()
+                            .track_scroll(&self.files_scroll_handle),
                         )
-                        .size_full()
-                        .track_scroll(&self.files_scroll_handle),
-                    )
-                    .vertical_scrollbar_for(&self.files_scroll_handle, window, cx)
-                    .child(self.render_marquee_overlay(cx, false)),
-                )
+                        .vertical_scrollbar_for(&self.files_scroll_handle, window, cx)
+                        .child(self.render_marquee_overlay(cx, false)),
+                ),
+            )
         }
     }
 
@@ -1047,6 +1046,7 @@ impl FilemanWindow {
             .border_dashed()
             .border_color(colors.border_selected)
             .bg(colors.element_selection_background.opacity(0.35))
+            .block_mouse_except_scroll()
             .into_any_element()
     }
 
@@ -1126,9 +1126,9 @@ impl FilemanWindow {
                 .start_slot(icon_element)
                 .child(Label::new(name).truncate().flex_1())
                 .end_slot(self.render_table_row_columns(
-                    "--".to_string(),
-                    "--".to_string(),
-                    "--".to_string(),
+                    search_match.size_display.clone(),
+                    search_match.type_display.clone(),
+                    search_match.modified_display.clone(),
                 ))
                 .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                     Self::handle_search_item_click(

@@ -29,6 +29,7 @@ impl FilemanWindow {
         };
         self.config.save();
         crate::sort::sort_files(&mut self.files, self.sort_column, self.sort_order);
+        self.invalidate_icon_label_layout_cache();
         self.set_status(format!("Sorted by {:?} ({:?})", self.sort_column, self.sort_order), cx);
         cx.notify();
     }
@@ -133,6 +134,7 @@ impl FilemanWindow {
         self.selection_anchor = None;
         self.list_focus_index = None;
         self.search_matches.clear();
+        self.invalidate_icon_label_layout_cache();
         self.restart_directory_watch(cx);
         self.reload_directory_entries(true, cx);
         if self.using_subfolder_search() {
@@ -213,6 +215,7 @@ impl FilemanWindow {
             marquee_cancel_subscription: None,
             marquee_autoscroll_task: None,
             icon_label_layout_cache: Vec::new(),
+            icon_label_layout_cache_key: None,
             list_visible_range: None,
             show_about: false,
             path_line_input,
@@ -507,6 +510,7 @@ impl FilemanWindow {
                     Ok(Ok(mut files)) => {
                         crate::sort::sort_files(&mut files, this.sort_column, this.sort_order);
                         this.files = files;
+                        this.invalidate_icon_label_layout_cache();
                         if show_loading && !this.using_subfolder_search() {
                             this.set_status("Ready", cx);
                         }
@@ -589,6 +593,7 @@ impl FilemanWindow {
     }
 
     pub(crate) fn set_icon_size(&mut self, size: u32, cx: &mut ViewContext<Self>) {
+        self.invalidate_icon_label_layout_cache();
         self.icon_size = clamp_icon_size(size);
         self.config.folder_view.icon_size = Some(self.icon_size);
         self.config.save();
@@ -599,6 +604,7 @@ impl FilemanWindow {
     pub(crate) fn set_view_mode(&mut self, mode: ViewMode, cx: &mut ViewContext<Self>) {
         self.view_mode = mode;
         self.uniform_list_row_height = None;
+        self.icon_label_layout_cache_key = None;
         self.icon_size = self.config.icon_size_for_mode(mode);
         self.config.folder_view.mode = mode.config_value().to_string();
         self.config.save();
@@ -686,6 +692,7 @@ impl FilemanWindow {
         self.show_hidden = !self.show_hidden;
         self.config.folder_view.show_hidden = self.show_hidden;
         self.config.save();
+        self.invalidate_icon_label_layout_cache();
         if self.using_subfolder_search() {
             self.schedule_subfolder_search(cx);
         }
