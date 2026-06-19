@@ -2,25 +2,16 @@ use crate::window::imports::*;
 
 #[derive(Clone)]
 enum FileTileInteraction {
-    Entry {
-        entry_index: usize,
-        name_for_open: String,
-        name_for_click: String,
-        is_directory: bool,
-        context_name: String,
-    },
-    Search {
-        entry_index: usize,
-        path: PathBuf,
-        selection_key: String,
+    VisibleEntry {
+        visible_index: usize,
         is_directory: bool,
     },
 }
 
 impl FileTileInteraction {
-    fn entry_index(&self) -> usize {
+    fn visible_index(&self) -> usize {
         match self {
-            Self::Entry { entry_index, .. } | Self::Search { entry_index, .. } => *entry_index,
+            Self::VisibleEntry { visible_index, .. } => *visible_index,
         }
     }
 }
@@ -372,29 +363,28 @@ impl FilemanWindow {
         }
     }
 
-    pub(in crate::window::render) fn handle_file_item_click(
+    pub(in crate::window::render) fn handle_visible_entry_click(
         this: &mut Self,
         event: &ClickEvent,
-        entry_index: usize,
-        name_for_open: &str,
+        visible_index: usize,
         is_directory: bool,
-        name_for_click: &str,
         cx: &mut ViewContext<Self>,
     ) {
         if event.click_count() == 2 {
-            let full_path = this.current_path.join(name_for_open);
+            let Some(path) = this.path_for_visible_index(visible_index) else {
+                return;
+            };
             if is_directory {
-                this.navigate_to(full_path, true, cx);
+                this.navigate_to(path, true, cx);
             } else {
-                this.launch_file(&full_path, cx);
+                this.launch_file(&path, cx);
             }
             return;
         }
 
         let modifiers = event.modifiers();
         this.apply_list_selection_click(
-            entry_index,
-            name_for_click,
+            visible_index,
             modifiers.shift,
             modifiers.control || modifiers.platform,
             cx,
@@ -407,37 +397,11 @@ impl FilemanWindow {
         interaction: &FileTileInteraction,
         cx: &mut ViewContext<Self>,
     ) {
-        match interaction {
-            FileTileInteraction::Entry {
-                entry_index,
-                name_for_open,
-                name_for_click,
-                is_directory,
-                ..
-            } => Self::handle_file_item_click(
-                this,
-                event,
-                *entry_index,
-                name_for_open,
-                *is_directory,
-                name_for_click,
-                cx,
-            ),
-            FileTileInteraction::Search {
-                entry_index,
-                path,
-                selection_key,
-                is_directory,
-            } => Self::handle_search_item_click(
-                this,
-                event,
-                *entry_index,
-                path,
-                *is_directory,
-                selection_key,
-                cx,
-            ),
-        }
+        let FileTileInteraction::VisibleEntry {
+            visible_index,
+            is_directory,
+        } = interaction;
+        Self::handle_visible_entry_click(this, event, *visible_index, *is_directory, cx);
     }
 
     fn dispatch_file_tile_context(
@@ -447,17 +411,8 @@ impl FilemanWindow {
         interaction: &FileTileInteraction,
         cx: &mut ViewContext<Self>,
     ) {
-        match interaction {
-            FileTileInteraction::Entry { context_name, .. } => {
-                this.prepare_context_selection(context_name, cx);
-            }
-            FileTileInteraction::Search { selection_key, .. } => {
-                if !this.selected_files.contains(selection_key) {
-                    this.selected_files.clear();
-                    this.selected_files.insert(selection_key.clone());
-                }
-            }
-        }
+        let FileTileInteraction::VisibleEntry { visible_index, .. } = interaction;
+        this.prepare_context_selection(*visible_index, cx);
         this.deploy_context_menu(
             event.position,
             ContextMenuTarget::FileList,
@@ -465,34 +420,6 @@ impl FilemanWindow {
             cx,
         );
         cx.notify();
-    }
-
-    pub(in crate::window::render) fn handle_search_item_click(
-        this: &mut Self,
-        event: &ClickEvent,
-        entry_index: usize,
-        path: &Path,
-        is_directory: bool,
-        selection_key: &str,
-        cx: &mut ViewContext<Self>,
-    ) {
-        if event.click_count() == 2 {
-            if is_directory {
-                this.navigate_to(path.to_path_buf(), true, cx);
-            } else {
-                this.launch_file(path, cx);
-            }
-            return;
-        }
-
-        let modifiers = event.modifiers();
-        this.apply_list_selection_click(
-            entry_index,
-            selection_key,
-            modifiers.shift,
-            modifiers.control || modifiers.platform,
-            cx,
-        );
     }
 
     pub(in crate::window::render) fn render_file_entry(
@@ -518,7 +445,7 @@ impl FilemanWindow {
             selection_name.clone()
         };
         let is_directory = file_info.get_file_type() == FileType::Directory;
-        let is_in_selection = self.selected_files.contains(&selection_name);
+        let is_in_selection = self.selected_indices.contains(&entry_index);
         let is_focused = self.list_focus_index == Some(entry_index)
             || inline_renaming;
         let size_string = if is_directory {
@@ -528,8 +455,6 @@ impl FilemanWindow {
         };
         let modified_string = format_modified(file_info);
         let type_string = format_file_type(file_info);
-        let name_for_click = selection_name.clone();
-        let name_for_open = selection_name.clone();
         let file_icon = if is_directory {
             IconName::Folder
         } else {
@@ -545,16 +470,19 @@ impl FilemanWindow {
         let item_id = SharedString::from(format!("file-row-{name}"));
         let icon_layout = icon_view_layout(self.icon_size, self.files_panel_width());
         let drag_payload = DraggedFilePaths {
-            paths: if is_in_selection && self.selected_files.len() > 1 {
+            paths: if is_in_selection && self.selected_indices.len() > 1 {
                 self.selected_paths()
             } else {
                 vec![file_path.clone()]
             },
         };
 
-        let context_name = name.clone();
         let drag_row_id = SharedString::from(format!("file-drag-{name}"));
         let row_height = self.files_list_item_height();
+        let tile_interaction = FileTileInteraction::VisibleEntry {
+            visible_index: entry_index,
+            is_directory,
+        };
 
         if matches!(view_mode, ViewMode::Icon | ViewMode::Compact) {
             let tile_secondary_label = (view_mode == ViewMode::Compact).then(|| type_string.clone());
@@ -570,13 +498,7 @@ impl FilemanWindow {
                 icon_layout,
                 drag_payload,
                 directory_drop_path,
-                FileTileInteraction::Entry {
-                    entry_index,
-                    name_for_open,
-                    name_for_click,
-                    is_directory,
-                    context_name,
-                },
+                tile_interaction,
                 window,
                 cx,
             );
@@ -590,19 +512,17 @@ impl FilemanWindow {
                 .child(Label::new(name).truncate().flex_1())
                 .end_slot(self.render_table_row_columns(size_string, type_string, modified_string))
                 .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                    Self::handle_file_item_click(
+                    Self::handle_visible_entry_click(
                         this,
                         event,
                         entry_index,
-                        &name_for_open,
                         is_directory,
-                        &name_for_click,
                         cx,
                     );
                 }))
                 .on_secondary_mouse_down(cx.listener(
                     move |this, event: &MouseDownEvent, window, cx| {
-                        this.prepare_context_selection(&context_name, cx);
+                        this.prepare_context_selection(entry_index, cx);
                         this.deploy_context_menu(
                             event.position,
                             ContextMenuTarget::FileList,
@@ -618,19 +538,17 @@ impl FilemanWindow {
                 .child(Label::new(name.clone()))
                 .end_slot(Label::new(size_string).color(Color::Muted).size(LabelSize::XSmall))
                 .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                    Self::handle_file_item_click(
+                    Self::handle_visible_entry_click(
                         this,
                         event,
                         entry_index,
-                        &name_for_open,
                         is_directory,
-                        &name_for_click,
                         cx,
                     );
                 }))
                 .on_secondary_mouse_down(cx.listener(
                     move |this, event: &MouseDownEvent, window, cx| {
-                        this.prepare_context_selection(&context_name, cx);
+                        this.prepare_context_selection(entry_index, cx);
                         this.deploy_context_menu(
                             event.position,
                             ContextMenuTarget::FileList,
@@ -708,7 +626,7 @@ impl FilemanWindow {
             (icon_layout.cell_width - ICON_VIEW_PADDING_PX * 2.0).max(10.0);
         let label_max_width = px(label_max_width_px);
         let icon_label_layout = if view_mode == ViewMode::Icon && secondary_label.is_none() {
-            self.cached_icon_label_layout(interaction.entry_index())
+            self.cached_icon_label_layout(interaction.visible_index())
         } else {
             None
         };
@@ -1151,12 +1069,11 @@ impl FilemanWindow {
         cx: &mut ViewContext<Self>,
     ) -> AnyElement {
         let path = search_match.path.clone();
-        let selection_key = Self::selection_key_for_path(&path);
         let inline_renaming = self
             .inline_rename
             .as_ref()
             .is_some_and(|pending| pending.path == path);
-        let is_in_selection = self.selected_files.contains(&selection_key);
+        let is_in_selection = self.selected_indices.contains(&entry_index);
         let is_focused = self.list_focus_index == Some(entry_index) || inline_renaming;
         let is_directory = search_match.is_directory;
         let file_icon = if is_directory {
@@ -1173,7 +1090,7 @@ impl FilemanWindow {
         let item_id = SharedString::from(format!("search-row-{}", path.display()));
         let subtitle = format!("{} · {}", search_match.parent_label, search_match.name);
         let drag_payload = DraggedFilePaths {
-            paths: if is_in_selection && self.selected_files.len() > 1 {
+            paths: if is_in_selection && self.selected_indices.len() > 1 {
                 self.selected_paths()
             } else {
                 vec![path.clone()]
@@ -1191,6 +1108,10 @@ impl FilemanWindow {
         let row_height = self.files_list_item_height();
         let drag_row_id = SharedString::from(format!("search-drag-{}", path.display()));
         let icon_layout = icon_view_layout(self.icon_size, self.files_panel_width());
+        let tile_interaction = FileTileInteraction::VisibleEntry {
+            visible_index: entry_index,
+            is_directory,
+        };
 
         if matches!(view_mode, ViewMode::Icon | ViewMode::Compact) {
             let directory_drop_path = is_directory.then_some(path.clone());
@@ -1205,24 +1126,13 @@ impl FilemanWindow {
                 icon_layout,
                 drag_payload,
                 directory_drop_path,
-                FileTileInteraction::Search {
-                    entry_index,
-                    path,
-                    selection_key,
-                    is_directory,
-                },
+                tile_interaction,
                 window,
                 cx,
             );
             return tile.into_any_element();
         }
 
-        let path_for_open_table = path.clone();
-        let path_for_open_list = path.clone();
-        let selection_key_for_click_table = selection_key.clone();
-        let selection_key_for_click_list = selection_key.clone();
-        let selection_key_for_context_table = selection_key.clone();
-        let selection_key_for_context_list = selection_key.clone();
         let list_item = match view_mode {
             ViewMode::Icon | ViewMode::Compact => unreachable!("handled by render_file_tile"),
             ViewMode::Table => file_list_item(item_id, is_in_selection, is_focused)
@@ -1234,23 +1144,17 @@ impl FilemanWindow {
                     search_match.modified_display.clone(),
                 ))
                 .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                    Self::handle_search_item_click(
+                    Self::handle_visible_entry_click(
                         this,
                         event,
                         entry_index,
-                        &path_for_open_table,
                         is_directory,
-                        &selection_key_for_click_table,
                         cx,
                     );
                 }))
                 .on_secondary_mouse_down(cx.listener(
                     move |this, event: &MouseDownEvent, window, cx| {
-                        if !this.selected_files.contains(&selection_key_for_context_table) {
-                            this.selected_files.clear();
-                            this.selected_files
-                                .insert(selection_key_for_context_table.clone());
-                        }
+                        this.prepare_context_selection(entry_index, cx);
                         this.deploy_context_menu(
                             event.position,
                             ContextMenuTarget::FileList,
@@ -1275,23 +1179,17 @@ impl FilemanWindow {
                         ),
                 )
                 .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                    Self::handle_search_item_click(
+                    Self::handle_visible_entry_click(
                         this,
                         event,
                         entry_index,
-                        &path_for_open_list,
                         is_directory,
-                        &selection_key_for_click_list,
                         cx,
                     );
                 }))
                 .on_secondary_mouse_down(cx.listener(
                     move |this, event: &MouseDownEvent, window, cx| {
-                        if !this.selected_files.contains(&selection_key_for_context_list) {
-                            this.selected_files.clear();
-                            this.selected_files
-                                .insert(selection_key_for_context_list.clone());
-                        }
+                        this.prepare_context_selection(entry_index, cx);
                         this.deploy_context_menu(
                             event.position,
                             ContextMenuTarget::FileList,

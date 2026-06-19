@@ -43,7 +43,10 @@ pub fn sort_files(files: &mut [FileInfo], column: SortColumn, order: SortOrder) 
                 .to_ascii_lowercase()
                 .cmp(&right.get_name().unwrap_or("").to_ascii_lowercase()),
             SortColumn::Size => left.get_size().cmp(&right.get_size()),
-            SortColumn::Type => file_type_key(left).cmp(&file_type_key(right)),
+            SortColumn::Type => compare_ascii_ignore_case(
+                left.get_content_type().unwrap_or(""),
+                right.get_content_type().unwrap_or(""),
+            ),
             SortColumn::Modified => modification_time(left).cmp(&modification_time(right)),
         };
 
@@ -67,11 +70,22 @@ fn directory_first(left: &FileInfo, right: &FileInfo) -> std::cmp::Ordering {
     right_is_directory.cmp(&left_is_directory)
 }
 
-fn file_type_key(file_info: &FileInfo) -> String {
-    file_info
-        .get_content_type()
-        .unwrap_or("")
-        .to_ascii_lowercase()
+fn compare_ascii_ignore_case(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left_chars = left.chars().map(|character| character.to_ascii_lowercase());
+    let mut right_chars = right.chars().map(|character| character.to_ascii_lowercase());
+    loop {
+        match (left_chars.next(), right_chars.next()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(left_character), Some(right_character)) => {
+                match left_character.cmp(&right_character) {
+                    std::cmp::Ordering::Equal => {}
+                    ordering => return ordering,
+                }
+            }
+        }
+    }
 }
 
 fn modification_time(file_info: &FileInfo) -> u64 {

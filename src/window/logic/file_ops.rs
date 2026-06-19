@@ -263,7 +263,7 @@ impl FilemanWindow {
     ) {
         self.dismiss_context_menu();
         let focus_handle = self.focus_handle.clone();
-        let has_selection = !self.selected_files.is_empty();
+        let has_selection = !self.selected_indices.is_empty();
         let selected_paths = self.selected_paths();
         let open_action_label = crate::open::open_label_for_path(
             selected_paths
@@ -1040,10 +1040,10 @@ impl FilemanWindow {
         .detach();
     }
 
-    pub(crate) fn prepare_context_selection(&mut self, file_name: &str, cx: &mut ViewContext<Self>) {
-        if !self.selected_files.contains(file_name) {
-            self.selected_files.clear();
-            self.selected_files.insert(file_name.to_string());
+    pub(crate) fn prepare_context_selection(&mut self, visible_index: usize, cx: &mut ViewContext<Self>) {
+        if !self.selected_indices.contains(&visible_index) {
+            self.selected_indices.clear();
+            self.selected_indices.insert(visible_index);
             cx.notify();
         }
     }
@@ -1086,17 +1086,10 @@ impl FilemanWindow {
     }
 
     pub(crate) fn selected_paths(&self) -> Vec<PathBuf> {
-        if self.using_subfolder_search() {
-            self.selected_files
-                .iter()
-                .map(PathBuf::from)
-                .collect()
-        } else {
-            self.selected_files
-                .iter()
-                .map(|name| self.current_path.join(name))
-                .collect()
-        }
+        self.selected_indices
+            .iter()
+            .filter_map(|&index| self.path_for_visible_index(index))
+            .collect()
     }
 
     pub(crate) fn set_status(&mut self, message: impl Into<SharedString>, cx: &mut ViewContext<Self>) {
@@ -1201,41 +1194,27 @@ impl FilemanWindow {
     }
 
     pub(crate) fn start_rename_selected(&mut self, cx: &mut ViewContext<Self>) {
-        let Some(selection_key) = self.selected_files.iter().next().cloned() else {
+        let Some(visible_index) = self.selected_indices.iter().copied().next() else {
             self.set_status("Select a single item to rename", cx);
             return;
         };
 
-        if self.selected_files.len() != 1 {
+        if self.selected_indices.len() != 1 {
             self.set_status("Select a single item to rename", cx);
             return;
         }
 
-        let path = if self.using_subfolder_search() {
-            PathBuf::from(&selection_key)
-        } else {
-            self.current_path.join(&selection_key)
+        let Some(path) = self.path_for_visible_index(visible_index) else {
+            self.set_status("Select a single item to rename", cx);
+            return;
         };
         let new_name = path
             .file_name()
             .and_then(|segment| segment.to_str())
-            .unwrap_or(&selection_key)
+            .unwrap_or("")
             .to_string();
 
-        self.list_focus_index = if self.using_subfolder_search() {
-            self.search_matches
-                .iter()
-                .position(|search_match| {
-                    Self::selection_key_for_path(&search_match.path) == selection_key
-                })
-        } else {
-            self.visible_file_indices.iter().position(|&file_index| {
-                self.files
-                    .get(file_index)
-                    .and_then(|file_info| file_info.get_name())
-                    .is_some_and(|entry_name| entry_name == selection_key)
-            })
-        };
+        self.list_focus_index = Some(visible_index);
         self.inline_rename = Some(PendingRename { path, new_name });
         self.pending_rename = None;
         cx.notify();

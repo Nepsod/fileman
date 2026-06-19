@@ -3,7 +3,7 @@ use crate::icon_label_layout::{
 };
 use crate::view_mode::{compact_view_layout, icon_view_layout, icon_view_tile_row_stride};
 use crate::window::logic::selection_math::{
-    file_entry_is_visible, list_row_index_at_list_y, prune_selection_keys, tile_index_range,
+    file_entry_is_visible, list_row_index_at_list_y, prune_selection_indices, tile_index_range,
     tile_rectangle_selection_indices, tile_row_count, tile_row_range_for_viewport,
     tile_slot_at_list_point, TileGridMode, TILE_VIEWPORT_OVERSCAN_ROWS,
 };
@@ -109,10 +109,10 @@ impl FilemanWindow {
 
         let panel_width = self.files_panel_width();
         let mut selected_hasher = DefaultHasher::new();
-        let mut selected_names: Vec<_> = self.selected_files.iter().collect();
-        selected_names.sort();
-        for name in selected_names {
-            name.hash(&mut selected_hasher);
+        let mut selected_indices: Vec<_> = self.selected_indices.iter().collect();
+        selected_indices.sort();
+        for index in selected_indices {
+            index.hash(&mut selected_hasher);
         }
         let mut visible_names_hasher = DefaultHasher::new();
         for name in self.visible_entry_names() {
@@ -152,7 +152,7 @@ impl FilemanWindow {
             let Some(name) = names.get(index) else {
                 continue;
             };
-            let max_lines = if self.selected_files.contains(name) {
+            let max_lines = if self.selected_indices.contains(&index) {
                 None
             } else {
                 Some(ICON_LABEL_MAX_LINES_UNSELECTED)
@@ -210,27 +210,26 @@ impl FilemanWindow {
     pub(crate) fn apply_list_selection_click(
         &mut self,
         entry_index: usize,
-        entry_name: &str,
         shift: bool,
         control: bool,
         cx: &mut ViewContext<Self>,
     ) {
         if control {
-            if !self.selected_files.remove(entry_name) {
-                self.selected_files.insert(entry_name.to_string());
+            if !self.selected_indices.remove(&entry_index) {
+                self.selected_indices.insert(entry_index);
             }
             self.selection_anchor = Some(entry_index);
         } else if shift {
             if let Some(anchor) = self.selection_anchor {
                 self.select_visible_range(anchor, entry_index);
             } else {
-                self.selected_files.clear();
-                self.selected_files.insert(entry_name.to_string());
+                self.selected_indices.clear();
+                self.selected_indices.insert(entry_index);
                 self.selection_anchor = Some(entry_index);
             }
         } else {
-            self.selected_files.clear();
-            self.selected_files.insert(entry_name.to_string());
+            self.selected_indices.clear();
+            self.selected_indices.insert(entry_index);
             self.selection_anchor = Some(entry_index);
         }
         self.list_focus_index = Some(entry_index);
@@ -256,7 +255,7 @@ impl FilemanWindow {
         }
 
         if !extend_selection {
-            self.selected_files.clear();
+            self.selected_indices.clear();
         }
 
         let selected_indices =
@@ -264,9 +263,7 @@ impl FilemanWindow {
         let selection_anchor = selected_indices.first().copied();
         let selection_focus = selected_indices.last().copied();
         for index in selected_indices {
-            if let Some(name) = names.get(index) {
-                self.selected_files.insert(name.clone());
-            }
+            self.selected_indices.insert(index);
         }
 
         if let Some(anchor) = selection_anchor {
@@ -668,7 +665,7 @@ impl FilemanWindow {
             self.cancel_active_paste(cx);
         }
         self.dismiss_context_menu();
-        self.selected_files.clear();
+        self.selected_indices.clear();
         self.selection_anchor = None;
         self.list_focus_index = None;
         cx.notify();
@@ -701,13 +698,13 @@ impl FilemanWindow {
     }
 
     pub(crate) fn clear_file_selection(&mut self, cx: &mut ViewContext<Self>) {
-        if self.selected_files.is_empty()
+        if self.selected_indices.is_empty()
             && self.selection_anchor.is_none()
             && self.list_focus_index.is_none()
         {
             return;
         }
-        self.selected_files.clear();
+        self.selected_indices.clear();
         self.selection_anchor = None;
         self.list_focus_index = None;
         cx.notify();
@@ -755,15 +752,15 @@ impl FilemanWindow {
                 self.move_list_focus_by(1, shift, cx);
             }
             "home" => {
-                let names = self.visible_entry_names();
-                if names.is_empty() {
+                let visible_count = self.visible_file_count();
+                if visible_count == 0 {
                     return;
                 }
                 if shift {
                     self.select_visible_range(self.selection_anchor.unwrap_or(0), 0);
                 } else {
-                    self.selected_files.clear();
-                    self.selected_files.insert(names[0].clone());
+                    self.selected_indices.clear();
+                    self.selected_indices.insert(0);
                     self.selection_anchor = Some(0);
                 }
                 self.list_focus_index = Some(0);
@@ -771,16 +768,16 @@ impl FilemanWindow {
                 cx.notify();
             }
             "end" => {
-                let names = self.visible_entry_names();
-                if names.is_empty() {
+                let visible_count = self.visible_file_count();
+                if visible_count == 0 {
                     return;
                 }
-                let last = names.len() - 1;
+                let last = visible_count - 1;
                 if shift {
                     self.select_visible_range(self.selection_anchor.unwrap_or(0), last);
                 } else {
-                    self.selected_files.clear();
-                    self.selected_files.insert(names[last].clone());
+                    self.selected_indices.clear();
+                    self.selected_indices.insert(last);
                     self.selection_anchor = Some(last);
                 }
                 self.list_focus_index = Some(last);
@@ -795,31 +792,12 @@ impl FilemanWindow {
 
 
     pub(crate) fn invert_selection(&mut self, cx: &mut ViewContext<Self>) {
-        if self.using_subfolder_search() {
-            let keys: Vec<String> = self
-                .search_matches
-                .iter()
-                .map(|search_match| Self::selection_key_for_path(&search_match.path))
-                .collect();
-            for key in keys {
-                if self.selected_files.contains(&key) {
-                    self.selected_files.remove(&key);
-                } else {
-                    self.selected_files.insert(key);
-                }
-            }
-        } else {
-            let visible_names: Vec<String> = self
-                .visible_files()
-                .into_iter()
-                .filter_map(|file_info| file_info.get_name().map(str::to_string))
-                .collect();
-            for name in visible_names {
-                if self.selected_files.contains(&name) {
-                    self.selected_files.remove(&name);
-                } else {
-                    self.selected_files.insert(name);
-                }
+        let visible_count = self.visible_file_count();
+        for index in 0..visible_count {
+            if self.selected_indices.contains(&index) {
+                self.selected_indices.remove(&index);
+            } else {
+                self.selected_indices.insert(index);
             }
         }
         cx.notify();
@@ -944,12 +922,12 @@ impl FilemanWindow {
         extend: bool,
         cx: &mut ViewContext<Self>,
     ) {
-        let names = self.visible_entry_names();
-        if names.is_empty() {
+        let visible_count = self.visible_file_count();
+        if visible_count == 0 {
             return;
         }
 
-        let last_index = names.len().saturating_sub(1);
+        let last_index = visible_count - 1;
         let current_index = self.list_focus_index.unwrap_or(0);
         let next_index = ((current_index as isize) + index_delta).clamp(0, last_index as isize)
             as usize;
@@ -961,8 +939,8 @@ impl FilemanWindow {
             let anchor = self.selection_anchor.unwrap_or(current_index);
             self.select_visible_range(anchor, next_index);
         } else {
-            self.selected_files.clear();
-            self.selected_files.insert(names[next_index].clone());
+            self.selected_indices.clear();
+            self.selected_indices.insert(next_index);
             self.selection_anchor = Some(next_index);
         }
         cx.notify();
@@ -1019,34 +997,22 @@ impl FilemanWindow {
     }
 
     pub(crate) fn open_focused_or_selection(&mut self, cx: &mut ViewContext<Self>) {
-        if !self.selected_files.is_empty() {
+        if !self.selected_indices.is_empty() {
             self.open_primary_selection(cx);
             return;
         }
 
-        let names = self.visible_entry_names();
         let Some(index) = self.list_focus_index else {
             return;
         };
-        let Some(name) = names.get(index) else {
+        let Some(path) = self.path_for_visible_index(index) else {
             return;
         };
 
-        if self.using_subfolder_search() {
-            let path = PathBuf::from(name);
-            if path.is_dir() {
-                self.navigate_to(path, true, cx);
-            } else {
-                self.launch_file(&path, cx);
-            }
-            return;
-        }
-
-        let full_path = self.current_path.join(name);
-        if full_path.is_dir() {
-            self.navigate_to(full_path, true, cx);
+        if path.is_dir() {
+            self.navigate_to(path, true, cx);
         } else {
-            self.launch_file(&full_path, cx);
+            self.launch_file(&path, cx);
         }
     }
 
@@ -1146,19 +1112,7 @@ impl FilemanWindow {
     }
 
     pub(crate) fn select_all_visible(&mut self, cx: &mut ViewContext<Self>) {
-        if self.using_subfolder_search() {
-            self.selected_files = self
-                .search_matches
-                .iter()
-                .map(|search_match| Self::selection_key_for_path(&search_match.path))
-                .collect();
-        } else {
-            self.selected_files = self
-                .visible_files()
-                .into_iter()
-                .filter_map(|file_info| file_info.get_name().map(str::to_string))
-                .collect();
-        }
+        self.selected_indices = (0..self.visible_file_count()).collect();
         cx.notify();
     }
 
@@ -1168,61 +1122,65 @@ impl FilemanWindow {
             return;
         }
 
-        let names = self.visible_entry_names();
-        if names.is_empty() {
+        let visible_count = self.visible_file_count();
+        if visible_count == 0 {
             return;
         }
-        let start = anchor_index.min(index).min(names.len() - 1);
-        let end = anchor_index.max(index).min(names.len() - 1);
-        self.selected_files.clear();
-        for name in &names[start..=end] {
-            self.selected_files.insert(name.clone());
+        let start = anchor_index.min(index).min(visible_count - 1);
+        let end = anchor_index.max(index).min(visible_count - 1);
+        self.selected_indices.clear();
+        for visible_index in start..=end {
+            self.selected_indices.insert(visible_index);
         }
     }
 
-    pub(crate) fn selection_key_for_path(path: &Path) -> String {
-        path.to_string_lossy().into_owned()
+    pub(crate) fn path_for_visible_index(&self, visible_index: usize) -> Option<PathBuf> {
+        if self.using_subfolder_search() {
+            self.search_matches
+                .get(visible_index)
+                .map(|search_match| search_match.path.clone())
+        } else {
+            self.visible_file_at(visible_index).map(|file_info| {
+                self.current_path
+                    .join(file_info.get_name().unwrap_or(""))
+            })
+        }
+    }
+
+    fn visible_index_for_path(&self, path: &Path) -> Option<usize> {
+        if self.using_subfolder_search() {
+            self.search_matches
+                .iter()
+                .position(|search_match| search_match.path == path)
+        } else {
+            let name = path.file_name()?.to_str()?;
+            self.visible_file_indices.iter().position(|&file_index| {
+                self.files
+                    .get(file_index)
+                    .and_then(|file_info| file_info.get_name())
+                    .is_some_and(|entry_name| entry_name == name)
+            })
+        }
     }
 
     pub(crate) fn remap_selection_after_rename(&mut self, source: &Path, destination: &Path) {
-        let old_key = if self.using_subfolder_search() {
-            Self::selection_key_for_path(source)
-        } else {
-            source
-                .file_name()
-                .and_then(|segment| segment.to_str())
-                .map(str::to_string)
-                .unwrap_or_default()
+        let Some(old_index) = self.visible_index_for_path(source) else {
+            return;
         };
-        if !self.selected_files.remove(&old_key) {
+        if !self.selected_indices.remove(&old_index) {
             return;
         }
-        let new_key = if self.using_subfolder_search() {
-            Self::selection_key_for_path(destination)
-        } else {
-            destination
-                .file_name()
-                .and_then(|segment| segment.to_str())
-                .map(str::to_string)
-                .unwrap_or_default()
-        };
-        if !new_key.is_empty() {
-            self.selected_files.insert(new_key);
+        if let Some(new_index) = self.visible_index_for_path(destination) {
+            self.selected_indices.insert(new_index);
         }
     }
 
     pub(crate) fn prune_selection_to_visible(&mut self) {
-        let visible_keys: HashSet<String> = self.visible_entry_names().into_iter().collect();
-        let visible_count = if self.using_subfolder_search() {
-            self.search_matches.len()
-        } else {
-            self.visible_file_indices.len()
-        };
-        prune_selection_keys(
-            &mut self.selected_files,
-            &visible_keys,
-            &mut self.list_focus_index,
+        let visible_count = self.visible_file_count();
+        prune_selection_indices(
+            &mut self.selected_indices,
             visible_count,
+            &mut self.list_focus_index,
         );
     }
 
@@ -1340,7 +1298,7 @@ impl FilemanWindow {
 
         if should_apply {
             if became_active && !extend_selection {
-                self.selected_files.clear();
+                self.selected_indices.clear();
                 self.selection_anchor = None;
                 self.list_focus_index = None;
             }
@@ -1356,19 +1314,17 @@ impl FilemanWindow {
     }
 
     fn select_visible_tile_range(&mut self, anchor_index: usize, index: usize) {
-        let names = self.visible_entry_names();
-        if names.is_empty() {
+        let visible_count = self.visible_file_count();
+        if visible_count == 0 {
             return;
         }
 
         let columns = self.tile_grid_columns().max(1);
         let selected_indices =
-            tile_rectangle_selection_indices(anchor_index, index, columns, names.len());
-        self.selected_files.clear();
-        for entry_index in selected_indices {
-            if let Some(name) = names.get(entry_index) {
-                self.selected_files.insert(name.clone());
-            }
+            tile_rectangle_selection_indices(anchor_index, index, columns, visible_count);
+        self.selected_indices.clear();
+        for visible_index in selected_indices {
+            self.selected_indices.insert(visible_index);
         }
     }
 
@@ -1376,7 +1332,7 @@ impl FilemanWindow {
         if self.using_subfolder_search() {
             self.search_matches
                 .iter()
-                .map(|search_match| Self::selection_key_for_path(&search_match.path))
+                .map(|search_match| search_match.path.to_string_lossy().into_owned())
                 .collect()
         } else {
             self.visible_files()

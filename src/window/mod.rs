@@ -75,7 +75,7 @@ pub(crate) enum ContextMenuTarget {
 pub struct FilemanWindow {
     current_path: PathBuf,
     show_hidden: bool,
-    selected_files: HashSet<String>,
+    selected_indices: HashSet<usize>,
     selection_anchor: Option<usize>,
     files: Vec<FileInfo>,
     config: FilemanConfig,

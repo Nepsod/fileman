@@ -315,7 +315,7 @@ impl FilemanWindow {
         cx: &mut ViewContext<Self>,
     ) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
-        let selection_count = self.selected_files.len();
+        let selection_count = self.selected_indices.len();
         let item_count = self.visible_file_count();
         let selection_summary = if selection_count == 0 {
             format!("{item_count} items")

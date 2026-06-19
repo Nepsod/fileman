@@ -6,13 +6,12 @@ use crate::view_mode::{
     ViewMode,
 };
 
-pub fn prune_selection_keys(
-    selected: &mut HashSet<String>,
-    visible_keys: &HashSet<String>,
-    list_focus_index: &mut Option<usize>,
+pub fn prune_selection_indices(
+    selected: &mut HashSet<usize>,
     visible_count: usize,
+    list_focus_index: &mut Option<usize>,
 ) {
-    selected.retain(|selection_key| visible_keys.contains(selection_key));
+    selected.retain(|&index| index < visible_count);
     if list_focus_index.is_some_and(|focus_index| focus_index >= visible_count) {
         *list_focus_index = None;
     }
@@ -23,12 +22,11 @@ mod selection_prune_tests {
     use super::*;
 
     #[test]
-    fn prune_selection_drops_missing_keys_and_out_of_range_focus() {
-        let mut selected = HashSet::from(["keep".to_string(), "gone".to_string()]);
-        let visible = HashSet::from(["keep".to_string()]);
+    fn prune_selection_drops_out_of_range_indices_and_focus() {
+        let mut selected = HashSet::from([0_usize, 3_usize]);
         let mut focus = Some(3);
-        prune_selection_keys(&mut selected, &visible, &mut focus, 2);
-        assert_eq!(selected, HashSet::from(["keep".to_string()]));
+        prune_selection_indices(&mut selected, 2, &mut focus);
+        assert_eq!(selected, HashSet::from([0_usize]));
         assert_eq!(focus, None);
     }
 }

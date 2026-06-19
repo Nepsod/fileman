@@ -132,7 +132,7 @@ impl FilemanWindow {
                 input.set_text(self.path_input_text.clone(), cx);
             });
         }
-        self.selected_files.clear();
+        self.selected_indices.clear();
         self.selection_anchor = None;
         self.list_focus_index = None;
         self.search_matches.clear();
@@ -175,7 +175,7 @@ impl FilemanWindow {
         let mut this = Self {
             current_path: initial_path.clone(),
             show_hidden: config.folder_view.show_hidden,
-            selected_files: HashSet::new(),
+            selected_indices: HashSet::new(),
             selection_anchor: None,
             files: Vec::new(),
             config,
