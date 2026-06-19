@@ -6,6 +6,7 @@ pub(crate) mod imports;
 pub mod logic;
 pub mod render;
 
+use std::cell::RefCell;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -76,6 +77,11 @@ pub struct FilemanWindow {
     current_path: PathBuf,
     show_hidden: bool,
     selected_indices: HashSet<usize>,
+    list_data_generation: u64,
+    selection_generation: u64,
+    selection_paths_cache: RefCell<Option<(u64, u64, Arc<[PathBuf]>)>>,
+    icons_in_flight: RefCell<HashSet<(PathBuf, u32)>>,
+    visible_display_names: Vec<SharedString>,
     selection_anchor: Option<usize>,
     files: Vec<FileInfo>,
     config: FilemanConfig,

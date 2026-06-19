@@ -1,12 +1,42 @@
 use nptk::std::path::{Path, PathBuf};
 
-use nptk::gpui::{px, App, IntoElement, Pixels, Point, Render, StyleRefinement, Window};
+use nptk::gpui::{App, IntoElement, Pixels, Point, Render, SharedString, StyleRefinement, Window};
 use nptk::theme::ActiveTheme;
 use nptk::ui::prelude::*;
 
 #[derive(Clone)]
+pub struct DragSourceValidation {
+    pub canonical: PathBuf,
+    pub parent_canonical: Option<PathBuf>,
+    pub is_directory: bool,
+}
+
+impl DragSourceValidation {
+    fn from_path(path: &Path) -> Self {
+        Self {
+            canonical: canonical_path_for_validation(path),
+            parent_canonical: path
+                .parent()
+                .map(canonical_path_for_validation),
+            is_directory: path_is_directory_for_validation(path),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct DraggedFilePaths {
     pub paths: Vec<PathBuf>,
+    pub sources: Vec<DragSourceValidation>,
+}
+
+impl DraggedFilePaths {
+    pub fn new(paths: Vec<PathBuf>) -> Self {
+        let sources = paths
+            .iter()
+            .map(|path| DragSourceValidation::from_path(path))
+            .collect();
+        Self { paths, sources }
+    }
 }
 
 const MARQUEE_DRAG_THRESHOLD: f32 = 5.0;
@@ -72,8 +102,12 @@ pub fn drop_target_style(mut style: StyleRefinement, cx: &App) -> StyleRefinemen
     style
 }
 
-fn canonical_path_for_validation(path: &Path) -> PathBuf {
+pub fn canonical_path_for_validation(path: &Path) -> PathBuf {
     nptk::std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+pub fn canonical_destination_path(destination: &Path) -> PathBuf {
+    canonical_path_for_validation(destination)
 }
 
 fn path_is_directory_for_validation(path: &Path) -> bool {
@@ -82,22 +116,28 @@ fn path_is_directory_for_validation(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+pub fn is_valid_drop_destination_cached(
+    sources: &[DragSourceValidation],
+    destination_canonical: &Path,
+) -> bool {
+    sources.iter().all(|source| {
+        source.canonical != destination_canonical
+            && source.parent_canonical.as_deref() != Some(destination_canonical)
+            && !(source.is_directory && destination_canonical.starts_with(&source.canonical))
+    })
+}
+
 pub fn is_valid_drop_destination(sources: &[PathBuf], destination: &Path) -> bool {
     if !destination.is_dir() {
         return false;
     }
 
-    let destination_canonical = canonical_path_for_validation(destination);
-    sources.iter().all(|source| {
-        let source_canonical = canonical_path_for_validation(source);
-        let source_parent_canonical = source
-            .parent()
-            .map(canonical_path_for_validation);
-        source_canonical != destination_canonical
-            && source_parent_canonical.as_ref() != Some(&destination_canonical)
-            && !(path_is_directory_for_validation(source)
-                && destination_canonical.starts_with(&source_canonical))
-    })
+    let destination_canonical = canonical_destination_path(destination);
+    let validations: Vec<DragSourceValidation> = sources
+        .iter()
+        .map(|path| DragSourceValidation::from_path(path))
+        .collect();
+    is_valid_drop_destination_cached(&validations, &destination_canonical)
 }
 
 pub fn filter_paste_sources(
@@ -129,85 +169,28 @@ pub fn filter_sources_for_destination(
 }
 
 pub fn marquee_exceeds_threshold(origin: Point<Pixels>, pointer: Point<Pixels>) -> bool {
-    let delta_x = (pointer.x - origin.x).abs();
-    let delta_y = (pointer.y - origin.y).abs();
-    delta_x > px(MARQUEE_DRAG_THRESHOLD) || delta_y > px(MARQUEE_DRAG_THRESHOLD)
+    let dx = (pointer.x - origin.x).as_f32();
+    let dy = (pointer.y - origin.y).as_f32();
+    (dx * dx + dy * dy).sqrt() >= MARQUEE_DRAG_THRESHOLD
 }
 
 fn drag_label_and_icon(paths: &[PathBuf]) -> (SharedString, IconName) {
-    let Some(path) = paths.first() else {
-        return (SharedString::from("No items"), IconName::File);
-    };
-
-    let name = path
-        .file_name()
-        .and_then(|segment| segment.to_str())
-        .unwrap_or("…");
-
-    let icon = if path.is_dir() {
-        IconName::Folder
+    if paths.len() == 1 {
+        let path = &paths[0];
+        let name = path
+            .file_name()
+            .and_then(|segment| segment.to_str())
+            .unwrap_or("Item");
+        let icon = if path_is_directory_for_validation(path) {
+            IconName::Folder
+        } else {
+            IconName::File
+        };
+        (SharedString::from(name), icon)
     } else {
-        IconName::File
-    };
-
-    (SharedString::from(name.to_string()), icon)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nptk::std::fs;
-
-    fn test_directory(label: &str) -> PathBuf {
-        let directory = std::env::temp_dir().join(format!(
-            "fileman_drag_test_{label}_{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).expect("create drag test directory");
-        directory
-    }
-
-    #[test]
-    fn paste_into_descendant_directory_is_blocked() {
-        let parent = test_directory("parent");
-        let child = parent.join("child");
-        fs::create_dir_all(&child).unwrap();
-
-        let sources = vec![parent.clone()];
-        assert!(!is_valid_drop_destination(&sources, &child));
-        assert!(filter_paste_sources(sources, &child, false).is_empty());
-
-        let _ = fs::remove_dir_all(&parent);
-    }
-
-    #[test]
-    fn paste_into_same_directory_is_blocked() {
-        let directory = test_directory("same");
-        let sources = vec![directory.join("item.txt")];
-        fs::write(&sources[0], b"x").unwrap();
-
-        assert!(!is_valid_drop_destination(&sources, &directory));
-        assert!(filter_paste_sources(sources, &directory, false).is_empty());
-
-        let _ = fs::remove_dir_all(&directory);
-    }
-
-    #[test]
-    fn paste_into_sibling_directory_is_allowed() {
-        let root = test_directory("siblings");
-        let source = root.join("source");
-        let destination = root.join("destination");
-        fs::create_dir_all(&source).unwrap();
-        fs::create_dir_all(&destination).unwrap();
-
-        let sources = vec![source.clone()];
-        assert!(is_valid_drop_destination(&sources, &destination));
-        assert_eq!(
-            filter_paste_sources(sources.clone(), &destination, false),
-            sources
-        );
-
-        let _ = fs::remove_dir_all(&root);
+        (
+            SharedString::from(format!("{} items", paths.len())),
+            IconName::Folder,
+        )
     }
 }

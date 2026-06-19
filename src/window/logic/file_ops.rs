@@ -1044,6 +1044,7 @@ impl FilemanWindow {
         if !self.selected_indices.contains(&visible_index) {
             self.selected_indices.clear();
             self.selected_indices.insert(visible_index);
+            self.bump_selection_generation();
             cx.notify();
         }
     }
@@ -1086,10 +1087,7 @@ impl FilemanWindow {
     }
 
     pub(crate) fn selected_paths(&self) -> Vec<PathBuf> {
-        self.selected_indices
-            .iter()
-            .filter_map(|&index| self.path_for_visible_index(index))
-            .collect()
+        self.cached_selected_paths().as_ref().to_vec()
     }
 
     pub(crate) fn set_status(&mut self, message: impl Into<SharedString>, cx: &mut ViewContext<Self>) {

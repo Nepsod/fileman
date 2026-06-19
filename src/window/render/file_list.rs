@@ -1,6 +1,6 @@
 use crate::window::imports::*;
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum FileTileInteraction {
     VisibleEntry {
         visible_index: usize,
@@ -16,8 +16,8 @@ impl FileTileInteraction {
     }
 }
 
-fn file_list_item(item_id: SharedString, is_selected: bool, is_focused: bool) -> ListItem {
-    ListItem::new(item_id)
+fn file_list_item(entry_index: usize, is_selected: bool, is_focused: bool) -> ListItem {
+    ListItem::new(entry_index)
         .spacing(ListItemSpacing::ExtraDense)
         .toggle_state(is_selected)
         .focused(is_focused)
@@ -430,8 +430,8 @@ impl FilemanWindow {
         window: &mut Window,
         cx: &mut ViewContext<Self>,
     ) -> AnyElement {
-        let selection_name = file_info.get_name().unwrap_or("").to_string();
-        let file_path = self.current_path.join(&selection_name);
+        let selection_name = file_info.get_name().unwrap_or("");
+        let file_path = self.current_path.join(selection_name);
         let inline_renaming = self
             .inline_rename
             .as_ref()
@@ -440,9 +440,11 @@ impl FilemanWindow {
             self.inline_rename
                 .as_ref()
                 .map(|pending| pending.new_name.clone())
-                .unwrap_or_else(|| selection_name.clone())
+                .unwrap_or_else(|| selection_name.to_string())
         } else {
-            selection_name.clone()
+            self.visible_display_name(entry_index)
+                .map(|display_name| display_name.to_string())
+                .unwrap_or_else(|| selection_name.to_string())
         };
         let is_directory = file_info.get_file_type() == FileType::Directory;
         let is_in_selection = self.selected_indices.contains(&entry_index);
@@ -467,17 +469,14 @@ impl FilemanWindow {
         };
         let icon_element =
             self.render_file_icon(&file_path, view_mode, file_icon, icon_color, cx);
-        let item_id = SharedString::from(format!("file-row-{name}"));
         let icon_layout = icon_view_layout(self.icon_size, self.files_panel_width());
-        let drag_payload = DraggedFilePaths {
-            paths: if is_in_selection && self.selected_indices.len() > 1 {
-                self.selected_paths()
-            } else {
-                vec![file_path.clone()]
-            },
-        };
+        let drag_payload = DraggedFilePaths::new(if is_in_selection && self.selected_indices.len() > 1 {
+            self.cached_selected_paths().as_ref().to_vec()
+        } else {
+            vec![file_path.clone()]
+        });
 
-        let drag_row_id = SharedString::from(format!("file-drag-{name}"));
+        let drag_row_id = SharedString::from(format!("file-drag-{entry_index}"));
         let row_height = self.files_list_item_height();
         let tile_interaction = FileTileInteraction::VisibleEntry {
             visible_index: entry_index,
@@ -507,7 +506,7 @@ impl FilemanWindow {
 
         let list_item = match view_mode {
             ViewMode::Icon | ViewMode::Compact => unreachable!("handled by render_file_tile"),
-            ViewMode::Table => file_list_item(item_id, is_in_selection, is_focused)
+            ViewMode::Table => file_list_item(entry_index, is_in_selection, is_focused)
                 .start_slot(icon_element)
                 .child(Label::new(name).truncate().flex_1())
                 .end_slot(self.render_table_row_columns(size_string, type_string, modified_string))
@@ -533,7 +532,7 @@ impl FilemanWindow {
                     },
                 ))
                 .into_any_element(),
-            ViewMode::List => file_list_item(item_id, is_in_selection, is_focused)
+            ViewMode::List => file_list_item(entry_index, is_in_selection, is_focused)
                 .start_slot(icon_element)
                 .child(Label::new(name.clone()))
                 .end_slot(Label::new(size_string).color(Color::Muted).size(LabelSize::XSmall))
@@ -1087,26 +1086,25 @@ impl FilemanWindow {
             Color::Default
         };
         let icon_element = self.render_file_icon(&path, view_mode, file_icon, icon_color, cx);
-        let item_id = SharedString::from(format!("search-row-{}", path.display()));
         let subtitle = format!("{} · {}", search_match.parent_label, search_match.name);
-        let drag_payload = DraggedFilePaths {
-            paths: if is_in_selection && self.selected_indices.len() > 1 {
-                self.selected_paths()
-            } else {
-                vec![path.clone()]
-            },
-        };
+        let drag_payload = DraggedFilePaths::new(if is_in_selection && self.selected_indices.len() > 1 {
+            self.cached_selected_paths().as_ref().to_vec()
+        } else {
+            vec![path.clone()]
+        });
         let name = if inline_renaming {
             self.inline_rename
                 .as_ref()
                 .map(|pending| pending.new_name.clone())
                 .unwrap_or_else(|| search_match.name.clone())
         } else {
-            search_match.name.clone()
+            self.visible_display_name(entry_index)
+                .map(|display_name| display_name.to_string())
+                .unwrap_or_else(|| search_match.name.clone())
         };
 
         let row_height = self.files_list_item_height();
-        let drag_row_id = SharedString::from(format!("search-drag-{}", path.display()));
+        let drag_row_id = SharedString::from(format!("search-drag-{entry_index}"));
         let icon_layout = icon_view_layout(self.icon_size, self.files_panel_width());
         let tile_interaction = FileTileInteraction::VisibleEntry {
             visible_index: entry_index,
@@ -1135,7 +1133,7 @@ impl FilemanWindow {
 
         let list_item = match view_mode {
             ViewMode::Icon | ViewMode::Compact => unreachable!("handled by render_file_tile"),
-            ViewMode::Table => file_list_item(item_id, is_in_selection, is_focused)
+            ViewMode::Table => file_list_item(entry_index, is_in_selection, is_focused)
                 .start_slot(icon_element)
                 .child(Label::new(name).truncate().flex_1())
                 .end_slot(self.render_table_row_columns(
@@ -1165,7 +1163,7 @@ impl FilemanWindow {
                     },
                 ))
                 .into_any_element(),
-            ViewMode::List => file_list_item(item_id, is_in_selection, is_focused)
+            ViewMode::List => file_list_item(entry_index, is_in_selection, is_focused)
                 .start_slot(icon_element)
                 .child(
                     v_flex()

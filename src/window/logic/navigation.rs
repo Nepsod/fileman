@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::sync::Arc;
+
 use crate::window::logic::foreground::log_entity_update;
 use crate::window::imports::*;
 
@@ -135,6 +138,7 @@ impl FilemanWindow {
         self.selected_indices.clear();
         self.selection_anchor = None;
         self.list_focus_index = None;
+        self.bump_selection_generation();
         self.search_matches.clear();
         self.invalidate_icon_label_layout_cache();
         self.restart_directory_watch(cx);
@@ -176,6 +180,11 @@ impl FilemanWindow {
             current_path: initial_path.clone(),
             show_hidden: config.folder_view.show_hidden,
             selected_indices: HashSet::new(),
+            list_data_generation: 0,
+            selection_generation: 0,
+            selection_paths_cache: RefCell::new(None),
+            icons_in_flight: RefCell::new(HashSet::new()),
+            visible_display_names: Vec::new(),
             selection_anchor: None,
             files: Vec::new(),
             config,
@@ -674,41 +683,53 @@ impl FilemanWindow {
         index_range: std::ops::Range<usize>,
         cx: &mut ViewContext<Self>,
     ) {
-        let icon_size = self.file_icon_cache_size();
-        let mut pending: Vec<(PathBuf, FileType)> = Vec::new();
+        const ICON_LOAD_CONCURRENCY: usize = 6;
 
-        if self.using_subfolder_search() {
-            for entry_index in index_range {
-                let Some(search_match) = self.search_matches.get(entry_index) else {
-                    continue;
-                };
-                let path = search_match.path.clone();
-                if self.icon_cache.cached_icon(&path, icon_size).is_some() {
-                    continue;
+        let icon_size = self.file_icon_cache_size();
+        let mut pending: Vec<(Arc<Path>, FileType)> = Vec::new();
+        {
+            let mut icons_in_flight = self.icons_in_flight.borrow_mut();
+            if self.using_subfolder_search() {
+                for entry_index in index_range {
+                    let Some(search_match) = self.search_matches.get(entry_index) else {
+                        continue;
+                    };
+                    let path = search_match.path.as_path();
+                    let flight_key = (search_match.path.clone(), icon_size);
+                    if icons_in_flight.contains(&flight_key)
+                        || self.icon_cache.cached_icon(path, icon_size).is_some()
+                    {
+                        continue;
+                    }
+                    icons_in_flight.insert(flight_key);
+                    let file_type = if search_match.is_directory {
+                        FileType::Directory
+                    } else {
+                        FileType::Regular
+                    };
+                    pending.push((Arc::from(path), file_type));
                 }
-                let file_type = if search_match.is_directory {
-                    FileType::Directory
-                } else {
-                    FileType::Regular
-                };
-                pending.push((path, file_type));
-            }
-        } else {
-            for entry_index in index_range {
-                let Some(file_info) = self.visible_file_at(entry_index) else {
-                    continue;
-                };
-                let Some(name) = file_info.get_name() else {
-                    continue;
-                };
-                if name.is_empty() {
-                    continue;
+            } else {
+                for entry_index in index_range {
+                    let Some(file_info) = self.visible_file_at(entry_index) else {
+                        continue;
+                    };
+                    let Some(name) = file_info.get_name() else {
+                        continue;
+                    };
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let path = self.current_path.join(name);
+                    let flight_key = (path.clone(), icon_size);
+                    if icons_in_flight.contains(&flight_key)
+                        || self.icon_cache.cached_icon(&path, icon_size).is_some()
+                    {
+                        continue;
+                    }
+                    icons_in_flight.insert(flight_key);
+                    pending.push((Arc::from(path), file_info.get_file_type()));
                 }
-                let path = self.current_path.join(name);
-                if self.icon_cache.cached_icon(&path, icon_size).is_some() {
-                    continue;
-                }
-                pending.push((path, file_info.get_file_type()));
             }
         }
 
@@ -723,34 +744,43 @@ impl FilemanWindow {
         };
 
         cx.spawn(async move |this, cx| {
-            for (path, file_type) in pending {
-                let path_for_load = path.clone();
-                let icon_service = icon_service.clone();
-                let image = Tokio::spawn(cx, async move {
-                    crate::icons::FileIconCache::load_icon(
-                        &icon_service,
-                        path_for_load,
-                        icon_size,
-                        file_type,
-                        use_thumbnails,
-                    )
-                    .await
-                })
-                .await
-                .ok()
-                .flatten();
+            for chunk in pending.chunks(ICON_LOAD_CONCURRENCY) {
+                let mut load_tasks = Vec::with_capacity(chunk.len());
+                for (path, file_type) in chunk {
+                    let path = Arc::clone(path);
+                    let file_type = *file_type;
+                    let icon_service = icon_service.clone();
+                    load_tasks.push((
+                        Arc::clone(&path),
+                        Tokio::spawn(cx, async move {
+                            crate::icons::FileIconCache::load_icon(
+                                &icon_service,
+                                path.as_ref().to_path_buf(),
+                                icon_size,
+                                file_type,
+                                use_thumbnails,
+                            )
+                            .await
+                        }),
+                    ));
+                }
 
-                let Some(icon) = image else {
-                    continue;
-                };
-
-                log_entity_update(
-                    "store_file_icon",
-                    this.update(cx, |this, cx| {
-                        this.icon_cache.store_icon(path, icon_size, icon);
-                        cx.notify();
-                    }),
-                );
+                for (path, task) in load_tasks {
+                    let loaded_icon = task.await.ok().flatten();
+                    let path_buf = path.as_ref().to_path_buf();
+                    log_entity_update(
+                        "store_file_icon",
+                        this.update(cx, |this, cx| {
+                            this.icons_in_flight
+                                .borrow_mut()
+                                .remove(&(path_buf.clone(), icon_size));
+                            if let Some(icon) = loaded_icon {
+                                this.icon_cache.store_icon(path_buf, icon_size, icon);
+                                cx.notify();
+                            }
+                        }),
+                    );
+                }
             }
         })
         .detach();

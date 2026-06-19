@@ -10,6 +10,60 @@ use crate::window::logic::selection_math::{
 use crate::window::imports::*;
 
 impl FilemanWindow {
+    pub(crate) fn bump_list_data_generation(&mut self) {
+        self.list_data_generation = self.list_data_generation.wrapping_add(1);
+        *self.selection_paths_cache.borrow_mut() = None;
+    }
+
+    pub(crate) fn bump_selection_generation(&mut self) {
+        self.selection_generation = self.selection_generation.wrapping_add(1);
+        *self.selection_paths_cache.borrow_mut() = None;
+    }
+
+    pub(crate) fn cached_selected_paths(&self) -> Arc<[PathBuf]> {
+        let list_generation = self.list_data_generation;
+        let selection_generation = self.selection_generation;
+        let mut cache = self.selection_paths_cache.borrow_mut();
+        if let Some((cached_list, cached_selection, paths)) = cache.as_ref() {
+            if *cached_list == list_generation && *cached_selection == selection_generation {
+                return paths.clone();
+            }
+        }
+        let paths: Arc<[PathBuf]> = self
+            .selected_indices
+            .iter()
+            .filter_map(|&index| self.path_for_visible_index(index))
+            .collect::<Vec<_>>()
+            .into();
+        *cache = Some((list_generation, selection_generation, paths.clone()));
+        paths
+    }
+
+    pub(crate) fn visible_name_at(&self, visible_index: usize) -> Option<&str> {
+        if self.using_subfolder_search() {
+            self.search_matches
+                .get(visible_index)
+                .map(|search_match| search_match.name.as_str())
+        } else {
+            self.visible_file_at(visible_index)
+                .and_then(|file_info| file_info.get_name())
+        }
+    }
+
+    pub(crate) fn rebuild_visible_display_names(&mut self) {
+        let visible_count = self.visible_file_count();
+        self.visible_display_names = (0..visible_count)
+            .filter_map(|visible_index| {
+                self.visible_name_at(visible_index)
+                    .map(SharedString::from)
+            })
+            .collect();
+    }
+
+    pub(crate) fn visible_display_name(&self, visible_index: usize) -> Option<&SharedString> {
+        self.visible_display_names.get(visible_index)
+    }
+
     pub(crate) fn invalidate_icon_label_layout_cache(&mut self) {
         self.icon_label_layout_cache_key = None;
         self.tile_visible_index_range = None;
@@ -27,6 +81,8 @@ impl FilemanWindow {
                     .then_some(index)
             })
             .collect();
+        self.bump_list_data_generation();
+        self.rebuild_visible_display_names();
     }
 
     pub(crate) fn visible_file_count(&self) -> usize {
@@ -115,9 +171,9 @@ impl FilemanWindow {
             index.hash(&mut selected_hasher);
         }
         let mut visible_names_hasher = DefaultHasher::new();
-        for name in self.visible_entry_names() {
-            name.hash(&mut visible_names_hasher);
-        }
+        self.visible_file_indices.hash(&mut visible_names_hasher);
+        self.search_generation.hash(&mut visible_names_hasher);
+        self.search_matches.len().hash(&mut visible_names_hasher);
         (
             entry_count,
             self.icon_size,
@@ -134,8 +190,14 @@ impl FilemanWindow {
             return;
         }
 
-        let names = self.visible_entry_names();
-        let cache_key = self.icon_label_layout_cache_fingerprint(names.len());
+        let entry_count = self.visible_file_count();
+        if entry_count == 0 {
+            self.icon_label_layout_cache.clear();
+            self.icon_label_layout_cache_key = None;
+            return;
+        }
+
+        let cache_key = self.icon_label_layout_cache_fingerprint(entry_count);
         if self.icon_label_layout_cache_key == Some(cache_key) {
             return;
         }
@@ -144,12 +206,11 @@ impl FilemanWindow {
         let label_max_width_px =
             (layout.cell_width - ICON_VIEW_PADDING_PX * 2.0).max(10.0);
         self.icon_label_layout_cache
-            .resize(names.len(), IconViewLabelLayout::fallback(label_max_width_px));
-        let item_count = names.len();
-        self.update_tile_visible_index_range(item_count);
-        let visible_range = self.tile_visible_index_range(item_count);
+            .resize(entry_count, IconViewLabelLayout::fallback(label_max_width_px));
+        self.update_tile_visible_index_range(entry_count);
+        let visible_range = self.tile_visible_index_range(entry_count);
         for index in visible_range {
-            let Some(name) = names.get(index) else {
+            let Some(name) = self.visible_name_at(index) else {
                 continue;
             };
             let max_lines = if self.selected_indices.contains(&index) {
@@ -176,20 +237,28 @@ impl FilemanWindow {
         destination: PathBuf,
         cx: &mut ViewContext<Self>,
     ) -> Stateful<Div> {
+        let destination_canonical = crate::drag::canonical_destination_path(&destination);
         row.drag_over::<DraggedFilePaths>(|style, _, _, cx| drop_target_style(style, cx))
             .drag_over::<ExternalPaths>(|style, _, _, cx| drop_target_style(style, cx))
             .can_drop({
                 let destination = destination.clone();
+                let destination_canonical = destination_canonical.clone();
                 move |payload, _, _| {
                     payload
                         .downcast_ref::<DraggedFilePaths>()
                         .is_some_and(|dragged| {
-                            crate::drag::is_valid_drop_destination(&dragged.paths, &destination)
+                            crate::drag::is_valid_drop_destination_cached(
+                                &dragged.sources,
+                                &destination_canonical,
+                            )
                         })
                         || payload
                             .downcast_ref::<ExternalPaths>()
                             .is_some_and(|paths| {
-                                crate::drag::is_valid_drop_destination(paths.paths(), &destination)
+                                crate::drag::is_valid_drop_destination(
+                                    paths.paths(),
+                                    &destination,
+                                )
                             })
                 }
             })
@@ -233,6 +302,7 @@ impl FilemanWindow {
             self.selection_anchor = Some(entry_index);
         }
         self.list_focus_index = Some(entry_index);
+        self.bump_selection_generation();
         cx.notify();
     }
 
@@ -249,8 +319,8 @@ impl FilemanWindow {
                 self.sync_icon_label_layout_cache(window, cx);
             }
         }
-        let names = self.visible_entry_names();
-        if names.is_empty() {
+        let names_len = self.visible_file_count();
+        if names_len == 0 {
             return;
         }
 
@@ -259,7 +329,7 @@ impl FilemanWindow {
         }
 
         let selected_indices =
-            self.marquee_selected_indices(origin_list, pointer_list, names.len());
+            self.marquee_selected_indices(origin_list, pointer_list, names_len);
         let selection_anchor = selected_indices.first().copied();
         let selection_focus = selected_indices.last().copied();
         for index in selected_indices {
@@ -272,6 +342,7 @@ impl FilemanWindow {
         if let Some(focus) = selection_focus {
             self.list_focus_index = Some(focus);
         }
+        self.bump_selection_generation();
     }
 
     fn marquee_selected_indices(
@@ -668,6 +739,7 @@ impl FilemanWindow {
         self.selected_indices.clear();
         self.selection_anchor = None;
         self.list_focus_index = None;
+        self.bump_selection_generation();
         cx.notify();
     }
 
@@ -707,6 +779,7 @@ impl FilemanWindow {
         self.selected_indices.clear();
         self.selection_anchor = None;
         self.list_focus_index = None;
+        self.bump_selection_generation();
         cx.notify();
     }
 
@@ -765,6 +838,7 @@ impl FilemanWindow {
                 }
                 self.list_focus_index = Some(0);
                 self.scroll_list_index_into_view(0, ScrollStrategy::Top);
+                self.bump_selection_generation();
                 cx.notify();
             }
             "end" => {
@@ -782,6 +856,7 @@ impl FilemanWindow {
                 }
                 self.list_focus_index = Some(last);
                 self.scroll_list_index_into_view(last, ScrollStrategy::Bottom);
+                self.bump_selection_generation();
                 cx.notify();
             }
             "enter" => self.open_focused_or_selection(cx),
@@ -800,6 +875,7 @@ impl FilemanWindow {
                 self.selected_indices.insert(index);
             }
         }
+        self.bump_selection_generation();
         cx.notify();
     }
 
@@ -943,6 +1019,7 @@ impl FilemanWindow {
             self.selected_indices.insert(next_index);
             self.selection_anchor = Some(next_index);
         }
+        self.bump_selection_generation();
         cx.notify();
     }
 
@@ -1113,6 +1190,7 @@ impl FilemanWindow {
 
     pub(crate) fn select_all_visible(&mut self, cx: &mut ViewContext<Self>) {
         self.selected_indices = (0..self.visible_file_count()).collect();
+        self.bump_selection_generation();
         cx.notify();
     }
 
@@ -1132,6 +1210,7 @@ impl FilemanWindow {
         for visible_index in start..=end {
             self.selected_indices.insert(visible_index);
         }
+        self.bump_selection_generation();
     }
 
     pub(crate) fn path_for_visible_index(&self, visible_index: usize) -> Option<PathBuf> {
@@ -1172,6 +1251,7 @@ impl FilemanWindow {
         }
         if let Some(new_index) = self.visible_index_for_path(destination) {
             self.selected_indices.insert(new_index);
+            self.bump_selection_generation();
         }
     }
 
@@ -1326,6 +1406,7 @@ impl FilemanWindow {
         for visible_index in selected_indices {
             self.selected_indices.insert(visible_index);
         }
+        self.bump_selection_generation();
     }
 
     pub(crate) fn visible_entry_names(&self) -> Vec<String> {

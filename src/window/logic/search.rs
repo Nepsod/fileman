@@ -129,6 +129,8 @@ impl FilemanWindow {
                     }
                     this.search_in_progress = false;
                     this.search_matches = matches;
+                    this.bump_list_data_generation();
+                    this.rebuild_visible_display_names();
                     this.invalidate_icon_label_layout_cache();
                     this.prune_selection_to_visible();
                     let count = this.search_matches.len();
