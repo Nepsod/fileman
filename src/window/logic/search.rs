@@ -25,6 +25,7 @@ impl FilemanWindow {
         self.search_query.clear();
         self.search_matches.clear();
         self.search_in_progress = false;
+        self.rebuild_visible_file_indices();
         self.invalidate_icon_label_layout_cache();
         self.search_line_input.update(cx, |input, cx| {
             input.set_text("", cx);
@@ -52,6 +53,7 @@ impl FilemanWindow {
                 if self.using_subfolder_search() {
                     self.schedule_subfolder_search(cx);
                 } else {
+                    self.rebuild_visible_file_indices();
                     self.invalidate_icon_label_layout_cache();
                     cx.notify();
                 }
@@ -128,8 +130,18 @@ impl FilemanWindow {
                     this.search_in_progress = false;
                     this.search_matches = matches;
                     this.invalidate_icon_label_layout_cache();
+                    this.prune_selection_to_visible();
                     let count = this.search_matches.len();
-                    this.set_status(format!("Found {count} matches in subfolders"), cx);
+                    let status = if count >= crate::search::MAX_SEARCH_RESULTS {
+                        format!(
+                            "Found {}+ matches in subfolders (showing first {})",
+                            crate::search::MAX_SEARCH_RESULTS,
+                            crate::search::MAX_SEARCH_RESULTS
+                        )
+                    } else {
+                        format!("Found {count} matches in subfolders")
+                    };
+                    this.set_status(status, cx);
                     cx.notify();
                 }),
             );

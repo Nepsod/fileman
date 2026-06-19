@@ -52,6 +52,13 @@ pub(crate) struct PendingRename {
 }
 
 #[derive(Clone)]
+pub(crate) struct PendingRenameCollision {
+    pub(crate) source_path: PathBuf,
+    pub(crate) destination: PathBuf,
+    pub(crate) new_name: String,
+}
+
+#[derive(Clone)]
 pub(crate) struct PendingPasteChoice {
     sources: Vec<PathBuf>,
     destination_directory: PathBuf,
@@ -79,6 +86,7 @@ pub struct FilemanWindow {
     status_message: SharedString,
     pending_delete: Option<PendingDelete>,
     pending_rename: Option<PendingRename>,
+    pending_rename_collision: Option<PendingRenameCollision>,
     loading_directory: bool,
     view_mode: ViewMode,
     clipboard: FileClipboard,
@@ -105,6 +113,7 @@ pub struct FilemanWindow {
     settings_terminal_focus: bool,
     pending_paste_choice: Option<PendingPasteChoice>,
     paste_cancel: Option<Arc<AtomicBool>>,
+    paste_generation: u64,
     files_scroll_handle: UniformListScrollHandle,
     uniform_list_row_height: Option<Pixels>,
     marquee_drag: Option<MarqueeDrag>,
@@ -113,6 +122,11 @@ pub struct FilemanWindow {
     icon_label_layout_cache: Vec<crate::icon_label_layout::IconViewLabelLayout>,
     icon_label_layout_cache_key: Option<(usize, u32, u32, u64, u64)>,
     list_visible_range: Option<Range<usize>>,
+    visible_file_indices: Vec<usize>,
+    tile_visible_index_range: Option<Range<usize>>,
+    last_tile_scroll_top_bits: Option<u32>,
+    inline_rename: Option<PendingRename>,
+    sidebar_resize_drag: Option<(f32, u32)>,
     show_about: bool,
     path_line_input: Entity<ToolbarLineInput>,
     search_line_input: Entity<ToolbarLineInput>,

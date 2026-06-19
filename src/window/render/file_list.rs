@@ -17,6 +17,14 @@ enum FileTileInteraction {
     },
 }
 
+impl FileTileInteraction {
+    fn entry_index(&self) -> usize {
+        match self {
+            Self::Entry { entry_index, .. } | Self::Search { entry_index, .. } => *entry_index,
+        }
+    }
+}
+
 fn file_list_item(item_id: SharedString, is_selected: bool, is_focused: bool) -> ListItem {
     ListItem::new(item_id)
         .spacing(ListItemSpacing::ExtraDense)
@@ -25,9 +33,62 @@ fn file_list_item(item_id: SharedString, is_selected: bool, is_focused: bool) ->
         .rounded()
 }
 
-use crate::icon_label_layout::{
-    icon_view_label_layout, IconViewLabelLayout, ICON_LABEL_MAX_LINES_UNSELECTED,
-};
+use crate::icon_label_layout::IconViewLabelLayout;
+
+fn tile_grid_spacer(height_px: f32) -> AnyElement {
+    div().h(px(height_px.max(0.0))).into_any_element()
+}
+
+fn tile_grid_viewport_rows<F>(
+    item_count: usize,
+    columns: usize,
+    row_stride_px: f32,
+    tile_gap: Pixels,
+    index_range: std::ops::Range<usize>,
+    mut render_tile: F,
+) -> Vec<AnyElement>
+where
+    F: FnMut(usize) -> Option<AnyElement>,
+{
+    use crate::window::logic::selection_math::tile_row_count;
+
+    if item_count == 0 {
+        return Vec::new();
+    }
+
+    let columns = columns.max(1);
+    let row_count = tile_row_count(item_count, columns);
+    let start_row = index_range.start / columns;
+    let end_row = index_range.end.div_ceil(columns).min(row_count);
+    let mut rows = Vec::new();
+
+    if start_row > 0 {
+        rows.push(tile_grid_spacer(start_row as f32 * row_stride_px));
+    }
+
+    for row in start_row..end_row {
+        let row_start = row * columns;
+        let row_end = (row_start + columns).min(item_count);
+        let row_tiles: Vec<_> = (row_start..row_end)
+            .filter_map(|entry_index| render_tile(entry_index))
+            .collect();
+        if !row_tiles.is_empty() {
+            rows.push(
+                h_flex()
+                    .gap(tile_gap)
+                    .items_start()
+                    .children(row_tiles)
+                    .into_any_element(),
+            );
+        }
+    }
+
+    if end_row < row_count {
+        rows.push(tile_grid_spacer((row_count - end_row) as f32 * row_stride_px));
+    }
+
+    rows
+}
 
 fn tile_grid_rows(mut tiles: Vec<AnyElement>, columns: usize, gap: Pixels) -> Vec<AnyElement> {
     let columns = columns.max(1);
@@ -149,6 +210,22 @@ fn table_column_label(text: &'static str) -> Label {
 }
 
 impl FilemanWindow {
+    fn ensure_search_match_columns(&mut self, entry_index: usize) {
+        let Some(search_match) = self.search_matches.get_mut(entry_index) else {
+            return;
+        };
+        if !search_match.size_display.is_empty() {
+            return;
+        }
+        let path = search_match.path.clone();
+        let is_directory = search_match.is_directory;
+        let (size_display, type_display, modified_display) =
+            table_columns_for_path(&path, is_directory);
+        search_match.size_display = size_display;
+        search_match.type_display = type_display;
+        search_match.modified_display = modified_display;
+    }
+
     fn render_table_row_columns(
         &self,
         size_string: String,
@@ -426,10 +503,24 @@ impl FilemanWindow {
         window: &mut Window,
         cx: &mut ViewContext<Self>,
     ) -> AnyElement {
-        let name = file_info.get_name().unwrap_or("").to_string();
+        let selection_name = file_info.get_name().unwrap_or("").to_string();
+        let file_path = self.current_path.join(&selection_name);
+        let inline_renaming = self
+            .inline_rename
+            .as_ref()
+            .is_some_and(|pending| pending.path == file_path);
+        let name = if inline_renaming {
+            self.inline_rename
+                .as_ref()
+                .map(|pending| pending.new_name.clone())
+                .unwrap_or_else(|| selection_name.clone())
+        } else {
+            selection_name.clone()
+        };
         let is_directory = file_info.get_file_type() == FileType::Directory;
-        let is_in_selection = self.selected_files.contains(&name);
-        let is_focused = self.list_focus_index == Some(entry_index);
+        let is_in_selection = self.selected_files.contains(&selection_name);
+        let is_focused = self.list_focus_index == Some(entry_index)
+            || inline_renaming;
         let size_string = if is_directory {
             "--".to_string()
         } else {
@@ -437,9 +528,8 @@ impl FilemanWindow {
         };
         let modified_string = format_modified(file_info);
         let type_string = format_file_type(file_info);
-        let name_for_click = name.clone();
-        let name_for_open = name.clone();
-        let file_path = self.current_path.join(&name);
+        let name_for_click = selection_name.clone();
+        let name_for_open = selection_name.clone();
         let file_icon = if is_directory {
             IconName::Folder
         } else {
@@ -617,22 +707,11 @@ impl FilemanWindow {
         let label_max_width_px =
             (icon_layout.cell_width - ICON_VIEW_PADDING_PX * 2.0).max(10.0);
         let label_max_width = px(label_max_width_px);
-        let icon_label_line_limit = if is_selected {
-            None
+        let icon_label_layout = if view_mode == ViewMode::Icon && secondary_label.is_none() {
+            self.cached_icon_label_layout(interaction.entry_index())
         } else {
-            Some(ICON_LABEL_MAX_LINES_UNSELECTED)
+            None
         };
-        let icon_label_layout = (view_mode == ViewMode::Icon && secondary_label.is_none()).then(
-            || {
-                icon_view_label_layout(
-                    &primary_label,
-                    label_max_width_px,
-                    icon_label_line_limit,
-                    window,
-                    cx,
-                )
-            },
-        );
         let label_element = if let Some(secondary) = secondary_label {
             v_flex()
                 .gap_0p5()
@@ -771,11 +850,13 @@ impl FilemanWindow {
         cx: &mut ViewContext<Self>,
     ) -> Vec<AnyElement> {
         self.list_visible_range = Some(range.clone());
-        self.refresh_uniform_list_row_height(self.visible_files().len());
-        let visible_files = self.visible_files();
+        self.refresh_uniform_list_row_height(self.visible_file_count());
+        if !self.uses_tile_grid() {
+            self.queue_icon_loads_for_range(range.clone(), cx);
+        }
         range
             .filter_map(|entry_index| {
-                visible_files.get(entry_index).map(|file_info| {
+                self.visible_file_at(entry_index).map(|file_info| {
                     self.render_file_entry(file_info, entry_index, view_mode, window, cx)
                 })
             })
@@ -817,11 +898,7 @@ impl FilemanWindow {
         let subfolder_search = self.using_subfolder_search();
         let view_mode = self.view_mode;
         let search_in_progress = self.search_in_progress;
-        let item_count = if subfolder_search {
-            self.search_matches.len()
-        } else {
-            self.visible_files().len()
-        };
+        let item_count = self.visible_file_count();
         let empty_state = v_flex()
             .flex_1()
             .items_center()
@@ -877,10 +954,23 @@ impl FilemanWindow {
             } else {
                 ICON_VIEW_TILE_GAP_PX
             };
+            let row_stride = self.tile_grid_row_stride_px();
+            let scroll_bits_before = self.last_tile_scroll_top_bits;
+            self.update_tile_visible_index_range(item_count);
+            if self.last_tile_scroll_top_bits != scroll_bits_before {
+                self.queue_icon_loads(cx);
+            }
+            let index_range = self.tile_visible_index_range(item_count);
 
-            let tiles: Vec<_> = if subfolder_search {
-                (0..item_count)
-                    .filter_map(|entry_index| {
+            if subfolder_search {
+                tile_grid_viewport_rows(
+                    item_count,
+                    columns,
+                    row_stride,
+                    px(tile_gap),
+                    index_range,
+                    |entry_index| {
+                        self.ensure_search_match_columns(entry_index);
                         self.search_matches.get(entry_index).map(|search_match| {
                             self.render_search_match(
                                 search_match,
@@ -890,13 +980,17 @@ impl FilemanWindow {
                                 cx,
                             )
                         })
-                    })
-                    .collect()
+                    },
+                )
             } else {
-                let visible_files: Vec<_> = self.visible_files();
-                (0..item_count)
-                    .filter_map(|entry_index| {
-                        visible_files.get(entry_index).map(|file_info| {
+                tile_grid_viewport_rows(
+                    item_count,
+                    columns,
+                    row_stride,
+                    px(tile_gap),
+                    index_range,
+                    |entry_index| {
+                        self.visible_file_at(entry_index).map(|file_info| {
                             self.render_file_entry(
                                 file_info,
                                 entry_index,
@@ -905,11 +999,9 @@ impl FilemanWindow {
                                 cx,
                             )
                         })
-                    })
-                    .collect()
-            };
-
-            tile_grid_rows(tiles, columns, px(tile_gap))
+                    },
+                )
+            }
         } else {
             Vec::new()
         };
@@ -924,8 +1016,8 @@ impl FilemanWindow {
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 this.drop_external_files(paths, cx);
             }))
-            .on_drop(cx.listener(|this, dragged: &DraggedFilePaths, _, cx| {
-                this.drop_internal_files(dragged, cx);
+            .on_drop(cx.listener(|this, dragged: &DraggedFilePaths, window, cx| {
+                this.drop_internal_files(dragged, window, cx);
             }))
             .on_mouse_down(
                 MouseButton::Right,
@@ -1060,8 +1152,12 @@ impl FilemanWindow {
     ) -> AnyElement {
         let path = search_match.path.clone();
         let selection_key = Self::selection_key_for_path(&path);
+        let inline_renaming = self
+            .inline_rename
+            .as_ref()
+            .is_some_and(|pending| pending.path == path);
         let is_in_selection = self.selected_files.contains(&selection_key);
-        let is_focused = self.list_focus_index == Some(entry_index);
+        let is_focused = self.list_focus_index == Some(entry_index) || inline_renaming;
         let is_directory = search_match.is_directory;
         let file_icon = if is_directory {
             IconName::Folder
@@ -1083,7 +1179,14 @@ impl FilemanWindow {
                 vec![path.clone()]
             },
         };
-        let name = search_match.name.clone();
+        let name = if inline_renaming {
+            self.inline_rename
+                .as_ref()
+                .map(|pending| pending.new_name.clone())
+                .unwrap_or_else(|| search_match.name.clone())
+        } else {
+            search_match.name.clone()
+        };
 
         let row_height = self.files_list_item_height();
         let drag_row_id = SharedString::from(format!("search-drag-{}", path.display()));
@@ -1226,6 +1329,7 @@ impl FilemanWindow {
         self.refresh_uniform_list_row_height(self.search_matches.len());
         range
             .filter_map(|entry_index| {
+                self.ensure_search_match_columns(entry_index);
                 self.search_matches.get(entry_index).map(|search_match| {
                     self.render_search_match(
                         search_match,

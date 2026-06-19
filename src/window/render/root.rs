@@ -1,6 +1,6 @@
 use crate::actions::*;
 use crate::window::FilemanWindow;
-use nptk::gpui::{anchored, deferred, Context, Render, Window};
+use nptk::gpui::{anchored, deferred, Context, MouseButton, MouseDownEvent, Render, Window};
 use nptk::theme::ActiveTheme;
 use nptk::ui::prelude::*;
 
@@ -20,6 +20,9 @@ impl Render for FilemanWindow {
 
         if self.marquee_drag.is_some() {
             self.register_marquee_window_listeners(window, cx);
+        }
+        if self.sidebar_resize_drag.is_some() {
+            self.register_sidebar_resize_listeners(window, cx);
         }
 
         let root = div()
@@ -97,14 +100,31 @@ impl Render for FilemanWindow {
             .w_full()
             .bg(colors.background)
             .text_color(colors.text)
-            .child(
+            .child({
+                let colors = colors.clone();
                 div()
                     .flex()
                     .flex_1()
                     .min_h_0()
                     .child(self.render_sidebar(window, cx))
-                    .child(self.render_main_panel(window, cx)),
-            )
+                    .child(
+                        div()
+                            .id("fileman-sidebar-splitter")
+                            .w(px(4.0))
+                            .h_full()
+                            .flex_shrink_0()
+                            .cursor_col_resize()
+                            .bg(colors.border)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.begin_sidebar_resize(event.position.x);
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(self.render_main_panel(window, cx))
+            })
             .child(self.render_status_bar(window, cx))
             .when_some(self.pending_delete.clone(), |root, pending| {
                 root.child(Self::render_delete_dialog(pending, cx))
@@ -120,6 +140,9 @@ impl Render for FilemanWindow {
             })
             .when_some(self.pending_paste_choice.clone(), |root, pending| {
                 root.child(Self::render_paste_conflict_dialog(pending, cx))
+            })
+            .when_some(self.pending_rename_collision.clone(), |root, pending| {
+                root.child(Self::render_rename_collision_dialog(pending, cx))
             })
             .when(self.show_about, |root| root.child(Self::render_about_dialog(cx)))
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {

@@ -1,11 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use nptk::file_icons::{icon_presentation_from_cached, FileIconPresentation, FileIconService};
 use npio::FileType;
 
+const PATH_ICON_CACHE_CAPACITY: usize = 512;
+
 pub struct FileIconCache {
     icons: HashMap<(PathBuf, u32), FileIconPresentation>,
+    icon_order: VecDeque<(PathBuf, u32)>,
     theme_icons: HashMap<(String, u32), FileIconPresentation>,
 }
 
@@ -13,6 +16,7 @@ impl FileIconCache {
     pub fn new() -> Self {
         Self {
             icons: HashMap::new(),
+            icon_order: VecDeque::new(),
             theme_icons: HashMap::new(),
         }
     }
@@ -28,7 +32,16 @@ impl FileIconCache {
     }
 
     pub fn store_icon(&mut self, path: PathBuf, size: u32, icon: FileIconPresentation) {
-        self.icons.insert((path, size), icon);
+        let key = (path.clone(), size);
+        if !self.icons.contains_key(&key) {
+            self.icon_order.push_back(key.clone());
+        }
+        self.icons.insert(key, icon);
+        while self.icon_order.len() > PATH_ICON_CACHE_CAPACITY {
+            if let Some(evicted) = self.icon_order.pop_front() {
+                self.icons.remove(&evicted);
+            }
+        }
     }
 
     pub fn store_theme_icon(&mut self, icon_name: String, size: u32, icon: FileIconPresentation) {
@@ -37,6 +50,7 @@ impl FileIconCache {
 
     pub fn clear(&mut self) {
         self.icons.clear();
+        self.icon_order.clear();
         self.theme_icons.clear();
     }
 

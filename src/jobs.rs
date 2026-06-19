@@ -66,11 +66,13 @@ pub fn run_paste_batch(
         };
 
         let mut destination = destination_directory.join(&file_name);
+        let mut replaced_existing = false;
         if destination.exists() {
             match settings.conflict {
                 ConflictResolution::Skip => continue,
                 ConflictResolution::Overwrite => {
-                    if let Err(error) = delete_before_overwrite(&destination) {
+                    replaced_existing = true;
+                    if let Err(error) = crate::operations::remove_path_at(&destination) {
                         result.errors.push(error);
                         continue;
                     }
@@ -87,6 +89,7 @@ pub fn run_paste_batch(
             }
         }
 
+        let undoable_move = is_cut && !replaced_existing;
         let source_for_undo = source.clone();
         let destination_for_undo = destination.clone();
         let operation_result = if is_cut {
@@ -97,29 +100,25 @@ pub fn run_paste_batch(
 
         match operation_result {
             Ok(()) => {
-                if is_cut {
+                if undoable_move {
                     result
                         .recorded_moves
                         .push((source_for_undo, destination_for_undo));
                 }
             }
-            Err(error) => result.errors.push(error),
+            Err(error) => {
+                if replaced_existing {
+                    result.errors.push(format!(
+                        "{error} (the previous item at the destination may have been removed)"
+                    ));
+                } else {
+                    result.errors.push(error);
+                }
+            }
         }
     }
 
     result
-}
-
-fn delete_before_overwrite(path: &nptk::std::path::Path) -> Result<(), String> {
-    let metadata = nptk::std::fs::metadata(path)
-        .map_err(|error| format!("Failed to read metadata: {error}"))?;
-    if metadata.is_dir() {
-        nptk::std::fs::remove_dir_all(path)
-            .map_err(|error| format!("Failed to remove directory: {error}"))
-    } else {
-        nptk::std::fs::remove_file(path)
-            .map_err(|error| format!("Failed to remove file: {error}"))
-    }
 }
 
 #[cfg(test)]

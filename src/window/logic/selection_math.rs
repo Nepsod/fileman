@@ -1,8 +1,37 @@
+use nptk::std::collections::HashSet;
+
 use crate::view_mode::{
     compact_view_layout, icon_view_layout, icon_view_tile_column_stride,
     icon_view_tile_row_stride, CompactViewLayout, ICON_VIEW_PADDING_PX, IconViewLayout,
     ViewMode,
 };
+
+pub fn prune_selection_keys(
+    selected: &mut HashSet<String>,
+    visible_keys: &HashSet<String>,
+    list_focus_index: &mut Option<usize>,
+    visible_count: usize,
+) {
+    selected.retain(|selection_key| visible_keys.contains(selection_key));
+    if list_focus_index.is_some_and(|focus_index| focus_index >= visible_count) {
+        *list_focus_index = None;
+    }
+}
+
+#[cfg(test)]
+mod selection_prune_tests {
+    use super::*;
+
+    #[test]
+    fn prune_selection_drops_missing_keys_and_out_of_range_focus() {
+        let mut selected = HashSet::from(["keep".to_string(), "gone".to_string()]);
+        let visible = HashSet::from(["keep".to_string()]);
+        let mut focus = Some(3);
+        prune_selection_keys(&mut selected, &visible, &mut focus, 2);
+        assert_eq!(selected, HashSet::from(["keep".to_string()]));
+        assert_eq!(focus, None);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TileGridMode {
@@ -136,6 +165,47 @@ pub fn tile_rectangle_selection_indices(
     indices
 }
 
+pub const TILE_VIEWPORT_OVERSCAN_ROWS: usize = 1;
+
+pub fn tile_row_count(item_count: usize, columns: usize) -> usize {
+    let columns = columns.max(1);
+    if item_count == 0 {
+        0
+    } else {
+        (item_count - 1) / columns + 1
+    }
+}
+
+pub fn tile_row_range_for_viewport(
+    scroll_top_px: f32,
+    viewport_height_px: f32,
+    row_stride_px: f32,
+    row_count: usize,
+    overscan_rows: usize,
+) -> std::ops::Range<usize> {
+    if row_count == 0 || row_stride_px <= 0.0 {
+        return 0..0;
+    }
+
+    let content_top = scroll_top_px.max(0.0);
+    let start_row = (content_top / row_stride_px).floor() as usize;
+    let start_row = start_row.saturating_sub(overscan_rows);
+    let visible_row_count = (viewport_height_px / row_stride_px).ceil() as usize + 1;
+    let end_row = (start_row + visible_row_count + overscan_rows * 2).min(row_count);
+    start_row..end_row
+}
+
+pub fn tile_index_range(
+    columns: usize,
+    row_range: std::ops::Range<usize>,
+    item_count: usize,
+) -> std::ops::Range<usize> {
+    let columns = columns.max(1);
+    let start = row_range.start.saturating_mul(columns);
+    let end = row_range.end.saturating_mul(columns).min(item_count);
+    start..end
+}
+
 pub fn list_row_index_at_list_y(list_y: f32, row_height: f32, item_count: usize) -> Option<usize> {
     if item_count == 0 || list_y < 0.0 || row_height <= 0.0 {
         return None;
@@ -213,5 +283,29 @@ mod tests {
     fn list_row_index_skips_area_below_last_row() {
         assert_eq!(list_row_index_at_list_y(48.0, 24.0, 2), None);
         assert_eq!(list_row_index_at_list_y(12.0, 24.0, 2), Some(0));
+    }
+
+    #[test]
+    fn tile_row_range_for_viewport_covers_visible_rows() {
+        let row_count = 20;
+        let stride = 100.0;
+        let range = tile_row_range_for_viewport(250.0, 200.0, stride, row_count, 1);
+        assert!(range.start <= 2);
+        assert!(range.end >= 5);
+        assert!(range.end <= row_count);
+    }
+
+    #[test]
+    fn tile_row_range_empty_when_no_rows() {
+        assert_eq!(
+            tile_row_range_for_viewport(0.0, 400.0, 80.0, 0, 1),
+            0..0
+        );
+    }
+
+    #[test]
+    fn tile_index_range_maps_rows_to_indices() {
+        let index_range = tile_index_range(4, 1..3, 10);
+        assert_eq!(index_range, 4..10);
     }
 }

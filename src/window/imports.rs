@@ -10,8 +10,8 @@ pub(crate) use crate::jobs::{
 pub(crate) use crate::location_bar::breadcrumb_segments;
 pub(crate) use crate::navigation::NavigationState;
 pub(crate) use crate::operations::{
-    create_directory, create_file, delete_path, duplicate_path, move_to_trash, PasteResult,
-    rename_path, unique_name_in_parent,
+    create_directory, create_file, cut_clipboard_should_clear_after_paste, delete_path,
+    duplicate_path, move_to_trash, remove_path_at, PasteResult, rename_path, unique_name_in_parent,
 };
 pub(crate) use crate::properties::PropertiesDialog;
 pub(crate) use crate::search::{SearchMatch, SearchScope};
@@ -36,11 +36,11 @@ pub(crate) use crate::view_mode::{
 };
 pub(crate) use crate::window::format::{
     delete_confirmation_message, format_file_type, format_modified, format_size, path_to_file_uri,
-    quick_access_places,
+    quick_access_places, table_columns_for_path,
 };
 pub(crate) use crate::window::{
-    ContextMenuTarget, FilemanWindow, PendingDelete, PendingPasteChoice,
-    PendingRename,
+    ContextMenuTarget, FilemanWindow, PendingDelete, PendingPasteChoice, PendingRename,
+    PendingRenameCollision,
 };
 pub(crate) use nptk::file_icons::FileIconPresentation;
 pub(crate) use nptk::gpui::{
@@ -48,6 +48,7 @@ pub(crate) use nptk::gpui::{
 };
 pub(crate) use nptk::gpui_tokio::Tokio;
 pub(crate) use nptk::std::collections::HashSet;
+pub(crate) use nptk::std::fs;
 pub(crate) use nptk::std::ops::Range;
 pub(crate) use nptk::std::path::{Path, PathBuf};
 pub(crate) use nptk::std::sync::atomic::{AtomicBool, Ordering};

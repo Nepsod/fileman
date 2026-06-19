@@ -149,8 +149,8 @@ impl FilemanWindow {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
                 this.drop_external_files(paths, cx);
             }))
-            .on_drop(cx.listener(|this, dragged: &DraggedFilePaths, _, cx| {
-                this.drop_internal_files(dragged, cx);
+            .on_drop(cx.listener(|this, dragged: &DraggedFilePaths, window, cx| {
+                this.drop_internal_files(dragged, window, cx);
             }))
             .child(Headline::new("Quick Access").size(HeadlineSize::XSmall))
             .child(
@@ -316,11 +316,7 @@ impl FilemanWindow {
     ) -> impl IntoElement {
         let colors = cx.theme().colors().clone();
         let selection_count = self.selected_files.len();
-        let item_count = if self.using_subfolder_search() {
-            self.search_matches.len()
-        } else {
-            self.visible_files().len()
-        };
+        let item_count = self.visible_file_count();
         let selection_summary = if selection_count == 0 {
             format!("{item_count} items")
         } else {

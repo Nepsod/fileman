@@ -23,6 +23,51 @@ impl FilemanWindow {
 
     pub(crate) fn cancel_pending_rename(&mut self, cx: &mut ViewContext<Self>) {
         self.pending_rename = None;
+        self.inline_rename = None;
+        self.pending_rename_collision = None;
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_pending_rename_collision(&mut self, cx: &mut ViewContext<Self>) {
+        if let Some(pending) = self.pending_rename_collision.take() {
+            self.inline_rename = Some(PendingRename {
+                path: pending.source_path,
+                new_name: pending.new_name,
+            });
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_pending_rename_collision(&mut self, cx: &mut ViewContext<Self>) {
+        let Some(pending) = self.pending_rename_collision.take() else {
+            return;
+        };
+        let source_path = pending.source_path;
+        let destination = pending.destination;
+        let removed_existing = destination.exists();
+        if removed_existing {
+            if let Err(error) = remove_path_at(&destination) {
+                self.set_status(error, cx);
+                cx.notify();
+                return;
+            }
+        }
+        match rename_path(source_path.clone(), destination.clone()) {
+            Ok(()) => {
+                self.undo_stack.push_move(source_path.clone(), destination.clone());
+                self.remap_selection_after_rename(&source_path, &destination);
+                self.set_status("Renamed item", cx);
+                self.reload_current_directory(cx);
+            }
+            Err(error) => {
+                let message = if removed_existing {
+                    format!("{error} (the previous item at the destination may have been removed)")
+                } else {
+                    error
+                };
+                self.set_status(message, cx);
+            }
+        }
         cx.notify();
     }
 
@@ -53,19 +98,23 @@ impl FilemanWindow {
         cx.notify();
     }
     pub(crate) fn confirm_pending_rename(&mut self, cx: &mut ViewContext<Self>) {
-        let Some(pending) = self.pending_rename.take() else {
+        let Some(pending) = self
+            .inline_rename
+            .take()
+            .or_else(|| self.pending_rename.take())
+        else {
             return;
         };
 
         let new_name = pending.new_name.trim();
         if new_name.is_empty() {
             self.set_status("Name cannot be empty", cx);
-            self.pending_rename = Some(pending);
+            self.inline_rename = Some(pending);
             return;
         }
         if new_name.contains('/') || new_name.contains('\\') {
             self.set_status("Name cannot contain path separators", cx);
-            self.pending_rename = Some(pending);
+            self.inline_rename = Some(pending);
             return;
         }
 
@@ -75,14 +124,72 @@ impl FilemanWindow {
         };
 
         let destination = parent.join(new_name);
-        match rename_path(pending.path, destination) {
+        let same_path = fs::canonicalize(&pending.path)
+            .ok()
+            .and_then(|source| {
+                fs::canonicalize(&destination)
+                    .ok()
+                    .map(|target| source == target)
+            })
+            .unwrap_or(pending.path == destination);
+
+        if destination.exists() && !same_path {
+            self.pending_rename_collision = Some(PendingRenameCollision {
+                source_path: pending.path,
+                destination,
+                new_name: new_name.to_string(),
+            });
+            cx.notify();
+            return;
+        }
+
+        let source_path = pending.path.clone();
+        match rename_path(pending.path, destination.clone()) {
             Ok(()) => {
+                self.undo_stack.push_move(source_path.clone(), destination.clone());
+                self.remap_selection_after_rename(&source_path, &destination);
                 self.set_status("Renamed item", cx);
                 self.reload_current_directory(cx);
             }
             Err(error) => self.set_status(error, cx),
         }
         cx.notify();
+    }
+
+    fn cancel_in_flight_paste(&mut self) {
+        if let Some(cancel) = &self.paste_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn start_paste_from_sources(
+        &mut self,
+        sources: Vec<PathBuf>,
+        destination_directory: PathBuf,
+        is_cut: bool,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let sources =
+            crate::drag::filter_paste_sources(sources, &destination_directory, is_cut);
+        if sources.is_empty() {
+            self.set_status("Cannot paste into this folder", cx);
+            cx.notify();
+            return;
+        }
+
+        let conflict_count = count_paste_conflicts(&sources, &destination_directory);
+        if conflict_count > 0 {
+            self.pending_paste_choice = Some(PendingPasteChoice {
+                sources,
+                destination_directory,
+                is_cut,
+                conflict_count,
+            });
+            cx.notify();
+            return;
+        }
+
+        self.execute_paste(sources, destination_directory, is_cut, PasteJobSettings::default(), cx);
     }
 
     pub(crate) fn confirm_settings(&mut self, cx: &mut ViewContext<Self>) {
@@ -282,7 +389,7 @@ impl FilemanWindow {
         if sources.is_empty() {
             return;
         }
-        self.paste_dropped_files(sources, self.current_path.clone(), false, cx);
+        self.start_paste_from_sources(sources, self.current_path.clone(), false, cx);
     }
 
     pub(crate) fn drop_external_into_directory(
@@ -305,12 +412,18 @@ impl FilemanWindow {
             sources,
             destination_directory.to_path_buf(),
             window.mouse_position(),
+            false,
             window,
             cx,
         );
     }
 
-    pub(crate) fn drop_internal_files(&mut self, dragged: &DraggedFilePaths, cx: &mut ViewContext<Self>) {
+    pub(crate) fn drop_internal_files(
+        &mut self,
+        dragged: &DraggedFilePaths,
+        window: &mut Window,
+        cx: &mut ViewContext<Self>,
+    ) {
         let sources = crate::drag::filter_sources_for_destination(
             &dragged.paths,
             &self.current_path,
@@ -320,7 +433,14 @@ impl FilemanWindow {
             self.set_status("Items are already in this folder", cx);
             return;
         }
-        self.paste_dropped_files(sources, self.current_path.clone(), true, cx);
+        self.offer_drop_into_directory(
+            sources,
+            self.current_path.clone(),
+            window.mouse_position(),
+            true,
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn drop_into_directory(
@@ -340,6 +460,7 @@ impl FilemanWindow {
             sources,
             destination_directory.to_path_buf(),
             window.mouse_position(),
+            true,
             window,
             cx,
         );
@@ -350,13 +471,21 @@ impl FilemanWindow {
         sources: Vec<PathBuf>,
         destination_directory: PathBuf,
         position: Point<Pixels>,
+        allow_move: bool,
         window: &mut Window,
         cx: &mut ViewContext<Self>,
     ) {
         if sources.is_empty() {
             return;
         }
-        self.deploy_drop_choice_menu(position, sources, destination_directory, window, cx);
+        self.deploy_drop_choice_menu(
+            position,
+            sources,
+            destination_directory,
+            allow_move,
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn deploy_drop_choice_menu(
@@ -364,6 +493,7 @@ impl FilemanWindow {
         position: Point<Pixels>,
         sources: Vec<PathBuf>,
         destination_directory: PathBuf,
+        allow_move: bool,
         window: &mut Window,
         cx: &mut ViewContext<Self>,
     ) {
@@ -379,8 +509,9 @@ impl FilemanWindow {
             let sources_for_copy = sources.clone();
             let destination_for_move = destination_directory.clone();
             let destination_for_copy = destination_directory.clone();
-            menu.context(focus_handle.clone())
-                .entry("Move here", None, move |_, cx| {
+            let mut menu = menu.context(focus_handle.clone());
+            if allow_move {
+                menu = menu.entry("Move here", None, move |_, cx| {
                     log_entity_update(
                         "drop_paste_move",
                         weak_for_move.update(cx, |this, cx| {
@@ -392,8 +523,9 @@ impl FilemanWindow {
                             );
                         }),
                     );
-                })
-                .entry("Copy here", None, move |_, cx| {
+                });
+            }
+            menu = menu.entry("Copy here", None, move |_, cx| {
                     log_entity_update(
                         "drop_paste_copy",
                         weak_for_copy.update(cx, |this, cx| {
@@ -405,9 +537,11 @@ impl FilemanWindow {
                             );
                         }),
                     );
-                })
-                .separator()
-                .entry("Cancel", None, move |_, cx| {
+                });
+            if allow_move {
+                menu = menu.separator();
+            }
+            menu.entry("Cancel", None, move |_, cx| {
                     log_entity_update(
                         "drop_paste_cancel",
                         weak_for_cancel.update(cx, |this, cx| {
@@ -482,6 +616,9 @@ impl FilemanWindow {
         cx: &mut ViewContext<Self>,
     ) {
         let action_label = if is_cut { "Moving" } else { "Copying" };
+        self.cancel_in_flight_paste();
+        self.paste_generation = self.paste_generation.wrapping_add(1);
+        let generation = self.paste_generation;
         let cancel = Arc::new(AtomicBool::new(false));
         self.paste_cancel = Some(cancel.clone());
         self.set_status(format!("{action_label} {} items…", sources.len()), cx);
@@ -533,9 +670,14 @@ impl FilemanWindow {
                 }
             }
 
+            let moved_count = combined.recorded_moves.len();
             let status = if combined.cancelled {
                 if combined.errors.is_empty() {
-                    "Paste cancelled".to_string()
+                    if moved_count > 0 {
+                        format!("Paste cancelled after {moved_count} of {total} items")
+                    } else {
+                        "Paste cancelled".to_string()
+                    }
                 } else {
                     format!("Paste cancelled; {}", combined.errors.join("; "))
                 }
@@ -548,9 +690,18 @@ impl FilemanWindow {
             log_entity_update(
                 "paste_complete",
                 this.update(cx, |this, cx| {
+                    if generation != this.paste_generation {
+                        return;
+                    }
                     this.paste_cancel = None;
+                    let cut_should_clear =
+                        is_cut && cut_clipboard_should_clear_after_paste(&combined);
                     for (source, destination) in combined.recorded_moves {
                         this.undo_stack.push_move(source, destination);
+                    }
+                    if cut_should_clear {
+                        this.clipboard.clear();
+                        cx.write_to_clipboard(ClipboardItem::new_file_paths(Vec::new(), false));
                     }
                     this.set_status(status, cx);
                     this.reload_current_directory(cx);
@@ -602,11 +753,16 @@ impl FilemanWindow {
     }
 
     pub(crate) fn handle_rename_dialog_key(&mut self, event: &KeyDownEvent, cx: &mut ViewContext<Self>) {
-        let Some(pending) = self.pending_rename.as_mut() else {
+        let Some(pending) = self
+            .inline_rename
+            .as_mut()
+            .or_else(|| self.pending_rename.as_mut())
+        else {
             return;
         };
 
         if event.keystroke.key == "escape" {
+            self.inline_rename = None;
             self.pending_rename = None;
             cx.notify();
             return;
@@ -670,7 +826,14 @@ impl FilemanWindow {
     }
 
     pub(crate) fn handle_toolbar_input_key(&mut self, event: &KeyDownEvent, cx: &mut ViewContext<Self>) {
-        if self.pending_rename.is_some() {
+        if self.pending_rename_collision.is_some() {
+            if event.keystroke.key == "escape" {
+                self.cancel_pending_rename_collision(cx);
+            }
+            return;
+        }
+
+        if self.inline_rename.is_some() || self.pending_rename.is_some() {
             self.handle_rename_dialog_key(event, cx);
             return;
         }
@@ -821,20 +984,7 @@ impl FilemanWindow {
             return;
         };
 
-        let destination_directory = self.current_path.clone();
-        let conflict_count = count_paste_conflicts(&sources, &destination_directory);
-        if conflict_count > 0 {
-            self.pending_paste_choice = Some(PendingPasteChoice {
-                sources,
-                destination_directory,
-                is_cut,
-                conflict_count,
-            });
-            cx.notify();
-            return;
-        }
-
-        self.execute_paste(sources, destination_directory, is_cut, PasteJobSettings::default(), cx);
+        self.start_paste_from_sources(sources, self.current_path.clone(), is_cut, cx);
     }
 
     pub(crate) fn paste_dropped_files(
@@ -848,25 +998,7 @@ impl FilemanWindow {
             return;
         }
 
-        let conflict_count = count_paste_conflicts(&sources, &destination_directory);
-        if conflict_count > 0 {
-            self.pending_paste_choice = Some(PendingPasteChoice {
-                sources,
-                destination_directory,
-                is_cut,
-                conflict_count,
-            });
-            cx.notify();
-            return;
-        }
-
-        self.execute_paste(
-            sources,
-            destination_directory,
-            is_cut,
-            PasteJobSettings::default(),
-            cx,
-        );
+        self.start_paste_from_sources(sources, destination_directory, is_cut, cx);
     }
 
     pub(crate) fn perform_delete(&mut self, paths: Vec<PathBuf>, permanent: bool, cx: &mut ViewContext<Self>) {
@@ -1069,7 +1201,7 @@ impl FilemanWindow {
     }
 
     pub(crate) fn start_rename_selected(&mut self, cx: &mut ViewContext<Self>) {
-        let Some(name) = self.selected_files.iter().next().cloned() else {
+        let Some(selection_key) = self.selected_files.iter().next().cloned() else {
             self.set_status("Select a single item to rename", cx);
             return;
         };
@@ -1079,11 +1211,33 @@ impl FilemanWindow {
             return;
         }
 
-        let path = self.current_path.join(&name);
-        self.pending_rename = Some(PendingRename {
-            path,
-            new_name: name,
-        });
+        let path = if self.using_subfolder_search() {
+            PathBuf::from(&selection_key)
+        } else {
+            self.current_path.join(&selection_key)
+        };
+        let new_name = path
+            .file_name()
+            .and_then(|segment| segment.to_str())
+            .unwrap_or(&selection_key)
+            .to_string();
+
+        self.list_focus_index = if self.using_subfolder_search() {
+            self.search_matches
+                .iter()
+                .position(|search_match| {
+                    Self::selection_key_for_path(&search_match.path) == selection_key
+                })
+        } else {
+            self.visible_file_indices.iter().position(|&file_index| {
+                self.files
+                    .get(file_index)
+                    .and_then(|file_info| file_info.get_name())
+                    .is_some_and(|entry_name| entry_name == selection_key)
+            })
+        };
+        self.inline_rename = Some(PendingRename { path, new_name });
+        self.pending_rename = None;
         cx.notify();
     }
 

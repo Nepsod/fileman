@@ -1,15 +1,106 @@
 use crate::icon_label_layout::{
     icon_view_label_layout, IconViewLabelLayout, ICON_LABEL_MAX_LINES_UNSELECTED,
 };
+use crate::view_mode::{compact_view_layout, icon_view_layout, icon_view_tile_row_stride};
 use crate::window::logic::selection_math::{
-    file_entry_is_visible, list_row_index_at_list_y, tile_rectangle_selection_indices,
-    tile_slot_at_list_point, TileGridMode,
+    file_entry_is_visible, list_row_index_at_list_y, prune_selection_keys, tile_index_range,
+    tile_rectangle_selection_indices, tile_row_count, tile_row_range_for_viewport,
+    tile_slot_at_list_point, TileGridMode, TILE_VIEWPORT_OVERSCAN_ROWS,
 };
 use crate::window::imports::*;
 
 impl FilemanWindow {
     pub(crate) fn invalidate_icon_label_layout_cache(&mut self) {
         self.icon_label_layout_cache_key = None;
+        self.tile_visible_index_range = None;
+        self.last_tile_scroll_top_bits = None;
+    }
+
+    pub(crate) fn rebuild_visible_file_indices(&mut self) {
+        self.visible_file_indices = self
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, file_info)| {
+                let name = file_info.get_name().unwrap_or("");
+                file_entry_is_visible(name, &self.search_query, self.show_hidden)
+                    .then_some(index)
+            })
+            .collect();
+    }
+
+    pub(crate) fn visible_file_count(&self) -> usize {
+        if self.using_subfolder_search() {
+            self.search_matches.len()
+        } else {
+            self.visible_file_indices.len()
+        }
+    }
+
+    pub(crate) fn visible_file_at(&self, visible_index: usize) -> Option<&FileInfo> {
+        let file_index = *self.visible_file_indices.get(visible_index)?;
+        self.files.get(file_index)
+    }
+
+    pub(crate) fn tile_grid_columns(&self) -> usize {
+        match self.view_mode {
+            ViewMode::Icon => icon_view_layout(self.icon_size, self.files_panel_width()).columns,
+            ViewMode::Compact => compact_view_layout(self.files_panel_width()).columns,
+            _ => 1,
+        }
+        .max(1)
+    }
+
+    pub(crate) fn tile_grid_row_stride_px(&self) -> f32 {
+        match self.view_mode {
+            ViewMode::Icon => {
+                let layout = icon_view_layout(self.icon_size, self.files_panel_width());
+                icon_view_tile_row_stride(layout.cell_height)
+            }
+            ViewMode::Compact => compact_view_layout(self.files_panel_width()).row_stride,
+            _ => 1.0,
+        }
+    }
+
+    pub(crate) fn update_tile_visible_index_range(&mut self, item_count: usize) {
+        if item_count == 0 || !self.uses_tile_grid() {
+            self.tile_visible_index_range = None;
+            return;
+        }
+
+        let scroll_top = (-self.marquee_scroll_offset().y).as_f32();
+        let scroll_bits = scroll_top.to_bits();
+        let viewport_height = self
+            .marquee_viewport_bounds()
+            .size
+            .height
+            .as_f32()
+            .max(1.0);
+        let columns = self.tile_grid_columns();
+        let row_count = tile_row_count(item_count, columns);
+        let row_stride = self.tile_grid_row_stride_px();
+        let row_range = tile_row_range_for_viewport(
+            scroll_top,
+            viewport_height,
+            row_stride,
+            row_count,
+            TILE_VIEWPORT_OVERSCAN_ROWS,
+        );
+
+        if self.last_tile_scroll_top_bits == Some(scroll_bits)
+            && self.tile_visible_index_range.is_some()
+        {
+            return;
+        }
+
+        self.last_tile_scroll_top_bits = Some(scroll_bits);
+        self.tile_visible_index_range = Some(tile_index_range(columns, row_range, item_count));
+    }
+
+    pub(crate) fn tile_visible_index_range(&self, item_count: usize) -> std::ops::Range<usize> {
+        self.tile_visible_index_range
+            .clone()
+            .unwrap_or(0..item_count)
     }
 
     fn icon_label_layout_cache_fingerprint(&self, entry_count: usize) -> (usize, u32, u32, u64, u64) {
@@ -54,7 +145,13 @@ impl FilemanWindow {
             (layout.cell_width - ICON_VIEW_PADDING_PX * 2.0).max(10.0);
         self.icon_label_layout_cache
             .resize(names.len(), IconViewLabelLayout::fallback(label_max_width_px));
-        for (index, name) in names.iter().enumerate() {
+        let item_count = names.len();
+        self.update_tile_visible_index_range(item_count);
+        let visible_range = self.tile_visible_index_range(item_count);
+        for index in visible_range {
+            let Some(name) = names.get(index) else {
+                continue;
+            };
             let max_lines = if self.selected_files.contains(name) {
                 None
             } else {
@@ -68,6 +165,10 @@ impl FilemanWindow {
                 cx,
             );
         }
+    }
+
+    pub(crate) fn cached_icon_label_layout(&self, entry_index: usize) -> Option<IconViewLabelLayout> {
+        self.icon_label_layout_cache.get(entry_index).copied()
     }
     pub(crate) fn apply_directory_drop_target(
         &self,
@@ -544,6 +645,12 @@ impl FilemanWindow {
         if self.pending_rename.is_some() {
             self.pending_rename = None;
         }
+        if self.inline_rename.is_some() {
+            self.inline_rename = None;
+        }
+        if self.pending_rename_collision.is_some() {
+            self.pending_rename_collision = None;
+        }
         if self.pending_properties.is_some() {
             self.pending_properties = None;
         }
@@ -556,6 +663,9 @@ impl FilemanWindow {
         }
         if self.show_about {
             self.show_about = false;
+        }
+        if self.paste_cancel.is_some() {
+            self.cancel_active_paste(cx);
         }
         self.dismiss_context_menu();
         self.selected_files.clear();
@@ -577,14 +687,6 @@ impl FilemanWindow {
 
     pub(crate) fn uses_tile_grid(&self) -> bool {
         matches!(self.view_mode, ViewMode::Icon | ViewMode::Compact)
-    }
-
-    pub(crate) fn tile_grid_columns(&self) -> usize {
-        match self.view_mode {
-            ViewMode::Icon => icon_view_layout(self.icon_size, self.files_panel_width()).columns,
-            ViewMode::Compact => compact_view_layout(self.files_panel_width()).columns,
-            _ => 1,
-        }
     }
 
     pub(crate) fn files_list_item_height(&self) -> Pixels {
@@ -848,9 +950,7 @@ impl FilemanWindow {
         }
 
         let last_index = names.len().saturating_sub(1);
-        let current_index = self
-            .list_focus_index
-            .unwrap_or_else(|| names.len().saturating_sub(1));
+        let current_index = self.list_focus_index.unwrap_or(0);
         let next_index = ((current_index as isize) + index_delta).clamp(0, last_index as isize)
             as usize;
 
@@ -967,6 +1067,37 @@ impl FilemanWindow {
         }
     }
 
+    pub(crate) fn register_sidebar_resize_listeners(
+        &self,
+        window: &mut Window,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let view = cx.entity();
+        let view_for_mouse_up = view.clone();
+        window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+            if phase == DispatchPhase::Capture {
+                view_for_mouse_up.update(cx, |this, cx| {
+                    if this.sidebar_resize_drag.is_some() {
+                        this.finish_sidebar_resize(cx);
+                    }
+                });
+            }
+        });
+        let view_for_mouse_move = view.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+            if phase != DispatchPhase::Capture {
+                return;
+            }
+            if event.pressed_button == Some(MouseButton::Left) {
+                view_for_mouse_move.update(cx, |this, cx| {
+                    if this.sidebar_resize_drag.is_some() {
+                        this.update_sidebar_resize(event.position.x, cx);
+                    }
+                });
+            }
+        });
+    }
+
     pub(crate) fn register_marquee_window_listeners(&self, window: &mut Window, cx: &mut ViewContext<Self>) {
         let view = cx.entity();
         let view_for_mouse_up = view.clone();
@@ -1051,6 +1182,48 @@ impl FilemanWindow {
 
     pub(crate) fn selection_key_for_path(path: &Path) -> String {
         path.to_string_lossy().into_owned()
+    }
+
+    pub(crate) fn remap_selection_after_rename(&mut self, source: &Path, destination: &Path) {
+        let old_key = if self.using_subfolder_search() {
+            Self::selection_key_for_path(source)
+        } else {
+            source
+                .file_name()
+                .and_then(|segment| segment.to_str())
+                .map(str::to_string)
+                .unwrap_or_default()
+        };
+        if !self.selected_files.remove(&old_key) {
+            return;
+        }
+        let new_key = if self.using_subfolder_search() {
+            Self::selection_key_for_path(destination)
+        } else {
+            destination
+                .file_name()
+                .and_then(|segment| segment.to_str())
+                .map(str::to_string)
+                .unwrap_or_default()
+        };
+        if !new_key.is_empty() {
+            self.selected_files.insert(new_key);
+        }
+    }
+
+    pub(crate) fn prune_selection_to_visible(&mut self) {
+        let visible_keys: HashSet<String> = self.visible_entry_names().into_iter().collect();
+        let visible_count = if self.using_subfolder_search() {
+            self.search_matches.len()
+        } else {
+            self.visible_file_indices.len()
+        };
+        prune_selection_keys(
+            &mut self.selected_files,
+            &visible_keys,
+            &mut self.list_focus_index,
+            visible_count,
+        );
     }
 
     pub(crate) fn start_marquee_autoscroll_task(&mut self, cx: &mut ViewContext<Self>) {
@@ -1214,12 +1387,9 @@ impl FilemanWindow {
     }
 
     pub(crate) fn visible_files(&self) -> Vec<&FileInfo> {
-        self.files
+        self.visible_file_indices
             .iter()
-            .filter(|file_info| {
-                let name = file_info.get_name().unwrap_or("");
-                file_entry_is_visible(name, &self.search_query, self.show_hidden)
-            })
+            .filter_map(|&index| self.files.get(index))
             .collect()
     }
 

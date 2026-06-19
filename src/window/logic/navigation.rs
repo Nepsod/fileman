@@ -30,6 +30,7 @@ impl FilemanWindow {
         };
         self.config.save();
         crate::sort::sort_files(&mut self.files, self.sort_column, self.sort_order);
+        self.rebuild_visible_file_indices();
         self.invalidate_icon_label_layout_cache();
         self.set_status(format!("Sorted by {:?} ({:?})", self.sort_column, self.sort_order), cx);
         cx.notify();
@@ -185,6 +186,7 @@ impl FilemanWindow {
             status_message: SharedString::from("Ready"),
             pending_delete: None,
             pending_rename: None,
+            pending_rename_collision: None,
             loading_directory: false,
             view_mode,
             clipboard: FileClipboard::default(),
@@ -211,6 +213,7 @@ impl FilemanWindow {
             settings_terminal_focus: false,
             pending_paste_choice: None,
             paste_cancel: None,
+            paste_generation: 0,
             files_scroll_handle: UniformListScrollHandle::new(),
             uniform_list_row_height: None,
             marquee_drag: None,
@@ -219,6 +222,11 @@ impl FilemanWindow {
             icon_label_layout_cache: Vec::new(),
             icon_label_layout_cache_key: None,
             list_visible_range: None,
+            visible_file_indices: Vec::new(),
+            tile_visible_index_range: None,
+            last_tile_scroll_top_bits: None,
+            inline_rename: None,
+            sidebar_resize_drag: None,
             show_about: false,
             path_line_input,
             search_line_input,
@@ -271,68 +279,6 @@ impl FilemanWindow {
             ViewMode::Compact => COMPACT_TILE_ICON_PX,
             _ => self.icon_size,
         }
-    }
-
-    pub(crate) fn queue_icon_loads(&mut self, cx: &mut ViewContext<Self>) {
-        let icon_size = self.file_icon_cache_size();
-        let mut pending: Vec<(PathBuf, FileType)> = Vec::new();
-
-        for file_info in &self.files {
-            let Some(name) = file_info.get_name() else {
-                continue;
-            };
-            if name.is_empty() {
-                continue;
-            }
-            let path = self.current_path.join(name);
-            if self.icon_cache.cached_icon(&path, icon_size).is_some() {
-                continue;
-            }
-            pending.push((path, file_info.get_file_type()));
-        }
-
-        if pending.is_empty() {
-            return;
-        }
-
-        let use_thumbnails = matches!(self.view_mode, ViewMode::Icon | ViewMode::Compact);
-
-        let Some(icon_service) = nptk::file_icons::FileIconService::global(cx).cloned() else {
-            return;
-        };
-
-        cx.spawn(async move |this, cx| {
-            for (path, file_type) in pending {
-                let path_for_load = path.clone();
-                let icon_service = icon_service.clone();
-                let image = Tokio::spawn(cx, async move {
-                    crate::icons::FileIconCache::load_icon(
-                        &icon_service,
-                        path_for_load,
-                        icon_size,
-                        file_type,
-                        use_thumbnails,
-                    )
-                    .await
-                })
-                .await
-                .ok()
-                .flatten();
-
-                let Some(icon) = image else {
-                    continue;
-                };
-
-                log_entity_update(
-                    "store_file_icon",
-                    this.update(cx, |this, cx| {
-                        this.icon_cache.store_icon(path, icon_size, icon);
-                        cx.notify();
-                    }),
-                );
-            }
-        })
-        .detach();
     }
 
     pub(crate) fn queue_ui_icon_loads(&mut self, cx: &mut ViewContext<Self>) {
@@ -523,7 +469,9 @@ impl FilemanWindow {
                         Ok(Ok(mut files)) => {
                             crate::sort::sort_files(&mut files, this.sort_column, this.sort_order);
                             this.files = files;
+                            this.rebuild_visible_file_indices();
                             this.invalidate_icon_label_layout_cache();
+                            this.prune_selection_to_visible();
                             if show_loading && !this.using_subfolder_search() {
                                 this.set_status("Ready", cx);
                             }
@@ -532,6 +480,7 @@ impl FilemanWindow {
                         _ => {
                             if show_loading {
                                 this.files.clear();
+                                this.rebuild_visible_file_indices();
                                 this.set_status("Failed to load directory", cx);
                             }
                         }
@@ -712,11 +661,145 @@ impl FilemanWindow {
         self.show_hidden = !self.show_hidden;
         self.config.folder_view.show_hidden = self.show_hidden;
         self.config.save();
+        self.rebuild_visible_file_indices();
         self.invalidate_icon_label_layout_cache();
         if self.using_subfolder_search() {
             self.schedule_subfolder_search(cx);
         }
         cx.notify();
+    }
+
+    pub(crate) fn queue_icon_loads_for_range(
+        &mut self,
+        index_range: std::ops::Range<usize>,
+        cx: &mut ViewContext<Self>,
+    ) {
+        let icon_size = self.file_icon_cache_size();
+        let mut pending: Vec<(PathBuf, FileType)> = Vec::new();
+
+        if self.using_subfolder_search() {
+            for entry_index in index_range {
+                let Some(search_match) = self.search_matches.get(entry_index) else {
+                    continue;
+                };
+                let path = search_match.path.clone();
+                if self.icon_cache.cached_icon(&path, icon_size).is_some() {
+                    continue;
+                }
+                let file_type = if search_match.is_directory {
+                    FileType::Directory
+                } else {
+                    FileType::Regular
+                };
+                pending.push((path, file_type));
+            }
+        } else {
+            for entry_index in index_range {
+                let Some(file_info) = self.visible_file_at(entry_index) else {
+                    continue;
+                };
+                let Some(name) = file_info.get_name() else {
+                    continue;
+                };
+                if name.is_empty() {
+                    continue;
+                }
+                let path = self.current_path.join(name);
+                if self.icon_cache.cached_icon(&path, icon_size).is_some() {
+                    continue;
+                }
+                pending.push((path, file_info.get_file_type()));
+            }
+        }
+
+        if pending.is_empty() {
+            return;
+        }
+
+        let use_thumbnails = matches!(self.view_mode, ViewMode::Icon | ViewMode::Compact);
+
+        let Some(icon_service) = nptk::file_icons::FileIconService::global(cx).cloned() else {
+            return;
+        };
+
+        cx.spawn(async move |this, cx| {
+            for (path, file_type) in pending {
+                let path_for_load = path.clone();
+                let icon_service = icon_service.clone();
+                let image = Tokio::spawn(cx, async move {
+                    crate::icons::FileIconCache::load_icon(
+                        &icon_service,
+                        path_for_load,
+                        icon_size,
+                        file_type,
+                        use_thumbnails,
+                    )
+                    .await
+                })
+                .await
+                .ok()
+                .flatten();
+
+                let Some(icon) = image else {
+                    continue;
+                };
+
+                log_entity_update(
+                    "store_file_icon",
+                    this.update(cx, |this, cx| {
+                        this.icon_cache.store_icon(path, icon_size, icon);
+                        cx.notify();
+                    }),
+                );
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn queue_icon_loads(&mut self, cx: &mut ViewContext<Self>) {
+        let item_count = self.visible_file_count();
+        if item_count == 0 {
+            return;
+        }
+
+        let index_range = if self.uses_tile_grid() {
+            self.update_tile_visible_index_range(item_count);
+            self.tile_visible_index_range(item_count)
+        } else if let Some(range) = self.list_visible_range.clone() {
+            range
+        } else {
+            0..item_count
+        };
+        self.queue_icon_loads_for_range(index_range, cx);
+    }
+
+    pub(crate) fn begin_sidebar_resize(&mut self, pointer_x: Pixels) {
+        self.sidebar_resize_drag = Some((pointer_x.as_f32(), self.config.window.splitter_pos));
+    }
+
+    pub(crate) fn update_sidebar_resize(&mut self, pointer_x: Pixels, cx: &mut ViewContext<Self>) {
+        let Some((start_x, start_width)) = self.sidebar_resize_drag else {
+            return;
+        };
+        let delta = pointer_x.as_f32() - start_x;
+        let new_width = ((start_width as f32) + delta)
+            .round()
+            .clamp(
+                crate::config::SIDEBAR_MIN_WIDTH as f32,
+                crate::config::SIDEBAR_MAX_WIDTH as f32,
+            ) as u32;
+        if new_width != self.config.window.splitter_pos {
+            self.config.window.splitter_pos = new_width;
+            self.invalidate_icon_label_layout_cache();
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn finish_sidebar_resize(&mut self, cx: &mut ViewContext<Self>) {
+        if self.sidebar_resize_drag.take().is_some() {
+            self.config.save();
+            self.persist_window_geometry(cx);
+        }
     }
 
     pub(crate) fn toggle_sort_order(&mut self, cx: &mut ViewContext<Self>) {

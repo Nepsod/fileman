@@ -188,6 +188,55 @@ impl FilemanWindow {
             )
     }
 
+    pub(in crate::window::render) fn render_rename_collision_dialog(
+        pending: PendingRenameCollision,
+        cx: &mut ViewContext<Self>,
+    ) -> impl IntoElement {
+        let colors = cx.theme().colors().clone();
+        let message = format!(
+            "An item named \"{}\" already exists. Replace it?",
+            pending.new_name
+        );
+
+        div()
+            .absolute()
+            .inset_0()
+            .bg(gpui::black().opacity(0.45))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                v_flex()
+                    .w(px(420.0))
+                    .gap_3()
+                    .p_4()
+                    .bg(colors.elevated_surface_background)
+                    .border_1()
+                    .border_color(colors.border)
+                    .rounded_lg()
+                    .child(Headline::new("Name already exists").size(HeadlineSize::Small))
+                    .child(Label::new(message))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .justify_end()
+                            .child(
+                                Button::new("rename-collision-cancel", "Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.cancel_pending_rename_collision(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("rename-collision-replace", "Replace")
+                                    .style(ButtonStyle::Filled)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.confirm_pending_rename_collision(cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     pub(in crate::window::render) fn render_properties_dialog(
         dialog: PropertiesDialog,
         cx: &mut ViewContext<Self>,

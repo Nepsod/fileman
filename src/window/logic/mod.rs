@@ -4,4 +4,4 @@ pub(crate) mod foreground;
 mod navigation;
 mod search;
 mod selection;
-mod selection_math;
+pub(crate) mod selection_math;

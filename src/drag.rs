@@ -72,15 +72,40 @@ pub fn drop_target_style(mut style: StyleRefinement, cx: &App) -> StyleRefinemen
     style
 }
 
+fn canonical_path_for_validation(path: &Path) -> PathBuf {
+    nptk::std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn path_is_directory_for_validation(path: &Path) -> bool {
+    nptk::std::fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
+}
+
 pub fn is_valid_drop_destination(sources: &[PathBuf], destination: &Path) -> bool {
     if !destination.is_dir() {
         return false;
     }
 
+    let destination_canonical = canonical_path_for_validation(destination);
     sources.iter().all(|source| {
-        source.as_path() != destination
-            && !(source.is_dir() && destination.starts_with(source))
+        let source_canonical = canonical_path_for_validation(source);
+        let source_parent_canonical = source
+            .parent()
+            .map(canonical_path_for_validation);
+        source_canonical != destination_canonical
+            && source_parent_canonical.as_ref() != Some(&destination_canonical)
+            && !(path_is_directory_for_validation(source)
+                && destination_canonical.starts_with(&source_canonical))
     })
+}
+
+pub fn filter_paste_sources(
+    sources: Vec<PathBuf>,
+    destination: &Path,
+    is_cut: bool,
+) -> Vec<PathBuf> {
+    filter_sources_for_destination(&sources, destination, is_cut)
 }
 
 pub fn filter_sources_for_destination(
@@ -126,4 +151,63 @@ fn drag_label_and_icon(paths: &[PathBuf]) -> (SharedString, IconName) {
     };
 
     (SharedString::from(name.to_string()), icon)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nptk::std::fs;
+
+    fn test_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "fileman_drag_test_{label}_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create drag test directory");
+        directory
+    }
+
+    #[test]
+    fn paste_into_descendant_directory_is_blocked() {
+        let parent = test_directory("parent");
+        let child = parent.join("child");
+        fs::create_dir_all(&child).unwrap();
+
+        let sources = vec![parent.clone()];
+        assert!(!is_valid_drop_destination(&sources, &child));
+        assert!(filter_paste_sources(sources, &child, false).is_empty());
+
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn paste_into_same_directory_is_blocked() {
+        let directory = test_directory("same");
+        let sources = vec![directory.join("item.txt")];
+        fs::write(&sources[0], b"x").unwrap();
+
+        assert!(!is_valid_drop_destination(&sources, &directory));
+        assert!(filter_paste_sources(sources, &directory, false).is_empty());
+
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn paste_into_sibling_directory_is_allowed() {
+        let root = test_directory("siblings");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+
+        let sources = vec![source.clone()];
+        assert!(is_valid_drop_destination(&sources, &destination));
+        assert_eq!(
+            filter_paste_sources(sources.clone(), &destination, false),
+            sources
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

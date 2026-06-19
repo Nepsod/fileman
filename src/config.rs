@@ -210,3 +210,6 @@ impl FilemanConfig {
             .unwrap_or_else(|| mode.default_icon_size())
     }
 }
+
+pub const SIDEBAR_MIN_WIDTH: u32 = 120;
+pub const SIDEBAR_MAX_WIDTH: u32 = 400;

@@ -20,8 +20,8 @@ pub struct SearchMatch {
     pub modified_display: String,
 }
 
-const MAX_SEARCH_DEPTH: usize = 12;
-const MAX_SEARCH_RESULTS: usize = 500;
+pub(crate) const MAX_SEARCH_DEPTH: usize = 12;
+pub(crate) const MAX_SEARCH_RESULTS: usize = 500;
 
 pub fn find_in_subfolders(
     root: &Path,
@@ -90,16 +90,14 @@ fn walk_directory(
                 })
                 .unwrap_or_else(|| ".".to_string());
             let is_directory = path.is_dir();
-            let (size_display, type_display, modified_display) =
-                table_columns_for_path(&path, is_directory);
             results.push(SearchMatch {
                 path: path.clone(),
                 name: name.to_string(),
                 parent_label,
                 is_directory,
-                size_display,
-                type_display,
-                modified_display,
+                size_display: String::new(),
+                type_display: String::new(),
+                modified_display: String::new(),
             });
         }
 

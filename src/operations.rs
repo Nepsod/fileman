@@ -14,14 +14,21 @@ pub fn move_to_trash(path: PathBuf) -> Result<(), String> {
     trash::delete(&path).map_err(|error| format!("Failed to move to trash: {error}"))
 }
 
-pub fn delete_path(path: PathBuf) -> Result<(), String> {
-    let metadata = fs::metadata(&path).map_err(|error| format!("Failed to read metadata: {error}"))?;
+pub fn remove_path_at(path: &Path) -> Result<(), String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("Failed to read metadata: {error}"))?;
 
-    if metadata.is_dir() {
-        fs::remove_dir_all(&path).map_err(|error| format!("Failed to remove directory: {error}"))
+    if metadata.file_type().is_symlink() {
+        fs::remove_file(path).map_err(|error| format!("Failed to remove symlink: {error}"))
+    } else if metadata.is_dir() {
+        fs::remove_dir_all(path).map_err(|error| format!("Failed to remove directory: {error}"))
     } else {
-        fs::remove_file(&path).map_err(|error| format!("Failed to remove file: {error}"))
+        fs::remove_file(path).map_err(|error| format!("Failed to remove file: {error}"))
     }
+}
+
+pub fn delete_path(path: PathBuf) -> Result<(), String> {
+    remove_path_at(&path)
 }
 
 pub fn rename_path(from: PathBuf, to: PathBuf) -> Result<(), String> {
@@ -87,6 +94,10 @@ pub struct PasteResult {
     pub cancelled: bool,
 }
 
+pub fn cut_clipboard_should_clear_after_paste(result: &PasteResult) -> bool {
+    result.errors.is_empty() || !result.recorded_moves.is_empty() || result.cancelled
+}
+
 pub fn paste_single(
     source: PathBuf,
     destination_directory: &Path,
@@ -136,7 +147,13 @@ pub fn move_path(from: PathBuf, to: PathBuf) -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(rename_error) if rename_error.raw_os_error() == Some(18) => {
             copy_path(from.clone(), to.clone())?;
-            delete_path(from)
+            if let Err(error) = delete_path(from) {
+                let _ = remove_path_at(&to);
+                return Err(format!(
+                    "Move copied the item but failed to remove the original: {error}"
+                ));
+            }
+            Ok(())
         }
         Err(rename_error) => Err(format!("Failed to move: {rename_error}")),
     }
@@ -159,4 +176,82 @@ fn copy_directory(from: &Path, to: &Path) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+
+    fn test_directory(label: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "fileman_operations_test_{label}_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("create operations test directory");
+        directory
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remove_path_at_deletes_symlink_to_directory_not_target() {
+        let root = test_directory("symlink_dir");
+        let target = root.join("target_dir");
+        let link = root.join("link_dir");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep.txt"), b"stay").unwrap();
+
+        if symlink(&target, &link).is_err() {
+            return;
+        }
+
+        remove_path_at(&link).expect("remove symlink");
+        assert!(!link.exists());
+        assert!(target.exists());
+        assert!(target.join("keep.txt").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cut_clipboard_clears_after_full_success() {
+        let result = PasteResult {
+            errors: Vec::new(),
+            recorded_moves: vec![(PathBuf::from("/a"), PathBuf::from("/b"))],
+            cancelled: false,
+        };
+        assert!(cut_clipboard_should_clear_after_paste(&result));
+    }
+
+    #[test]
+    fn cut_clipboard_clears_after_partial_success_with_errors() {
+        let result = PasteResult {
+            errors: vec!["failed".to_string()],
+            recorded_moves: vec![(PathBuf::from("/a"), PathBuf::from("/b"))],
+            cancelled: false,
+        };
+        assert!(cut_clipboard_should_clear_after_paste(&result));
+    }
+
+    #[test]
+    fn cut_clipboard_clears_after_cancel_with_moves() {
+        let result = PasteResult {
+            errors: Vec::new(),
+            recorded_moves: vec![(PathBuf::from("/a"), PathBuf::from("/b"))],
+            cancelled: true,
+        };
+        assert!(cut_clipboard_should_clear_after_paste(&result));
+    }
+
+    #[test]
+    fn cut_clipboard_kept_when_all_items_failed() {
+        let result = PasteResult {
+            errors: vec!["failed".to_string()],
+            recorded_moves: Vec::new(),
+            cancelled: false,
+        };
+        assert!(!cut_clipboard_should_clear_after_paste(&result));
+    }
 }
