@@ -68,6 +68,7 @@ impl FilemanWindow {
         self.icon_label_layout_cache_key = None;
         self.tile_visible_index_range = None;
         self.last_tile_scroll_top_bits = None;
+        self.last_tile_range_fingerprint = None;
     }
 
     pub(crate) fn rebuild_visible_file_indices(&mut self) {
@@ -121,6 +122,7 @@ impl FilemanWindow {
     pub(crate) fn update_tile_visible_index_range(&mut self, item_count: usize) {
         if item_count == 0 || !self.uses_tile_grid() {
             self.tile_visible_index_range = None;
+            self.last_tile_range_fingerprint = None;
             return;
         }
 
@@ -142,13 +144,21 @@ impl FilemanWindow {
             row_count,
             TILE_VIEWPORT_OVERSCAN_ROWS,
         );
+        let range_fingerprint = (
+            scroll_bits,
+            viewport_height.to_bits(),
+            row_stride.to_bits(),
+            columns,
+            item_count,
+        );
 
-        if self.last_tile_scroll_top_bits == Some(scroll_bits)
+        if self.last_tile_range_fingerprint == Some(range_fingerprint)
             && self.tile_visible_index_range.is_some()
         {
             return;
         }
 
+        self.last_tile_range_fingerprint = Some(range_fingerprint);
         self.last_tile_scroll_top_bits = Some(scroll_bits);
         self.tile_visible_index_range = Some(tile_index_range(columns, row_range, item_count));
     }
@@ -210,6 +220,42 @@ impl FilemanWindow {
         self.update_tile_visible_index_range(entry_count);
         let visible_range = self.tile_visible_index_range(entry_count);
         for index in visible_range {
+            let Some(name) = self.visible_name_at(index) else {
+                continue;
+            };
+            let max_lines = if self.selected_indices.contains(&index) {
+                None
+            } else {
+                Some(ICON_LABEL_MAX_LINES_UNSELECTED)
+            };
+            self.icon_label_layout_cache[index] = icon_view_label_layout(
+                name,
+                label_max_width_px,
+                max_lines,
+                window,
+                cx,
+            );
+        }
+    }
+
+    pub(crate) fn sync_icon_label_layout_cache_for_marquee(&mut self, window: &Window, cx: &App) {
+        if self.view_mode != ViewMode::Icon {
+            return;
+        }
+
+        let entry_count = self.visible_file_count();
+        if entry_count == 0 {
+            return;
+        }
+
+        let layout = icon_view_layout(self.icon_size, self.files_panel_width());
+        let label_max_width_px =
+            (layout.cell_width - ICON_VIEW_PADDING_PX * 2.0).max(10.0);
+        if self.icon_label_layout_cache.len() < entry_count {
+            self.icon_label_layout_cache
+                .resize(entry_count, IconViewLabelLayout::fallback(label_max_width_px));
+        }
+        for index in 0..entry_count {
             let Some(name) = self.visible_name_at(index) else {
                 continue;
             };
@@ -682,6 +728,9 @@ impl FilemanWindow {
             autoscroll_vertical,
             autoscroll_horizontal,
         });
+        if self.view_mode == ViewMode::Icon {
+            self.sync_icon_label_layout_cache_for_marquee(window, cx);
+        }
         self.start_marquee_autoscroll_task(cx);
         self.marquee_cancel_subscription = Some(cx.observe_window_activation(
             window,

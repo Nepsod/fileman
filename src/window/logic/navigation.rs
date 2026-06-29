@@ -234,8 +234,10 @@ impl FilemanWindow {
             visible_file_indices: Vec::new(),
             tile_visible_index_range: None,
             last_tile_scroll_top_bits: None,
+            last_tile_range_fingerprint: None,
             inline_rename: None,
             sidebar_resize_drag: None,
+            sidebar_resize_cancel_subscription: None,
             show_about: false,
             path_line_input,
             search_line_input,
@@ -501,11 +503,16 @@ impl FilemanWindow {
         .detach();
     }
 
-    pub(crate) fn reload_volume_mounts(&mut self) {
-        self.volume_mounts = crate::devices::list_removable_mounts();
+    pub(crate) fn reload_sidebar_state(&mut self, cx: &mut ViewContext<Self>) {
+        self.bookmark_paths = crate::bookmarks::load_bookmarks();
+        self.queue_ui_icon_loads(cx);
     }
 
     pub(crate) fn remove_bookmark_for_current(&mut self, cx: &mut ViewContext<Self>) {
+        if !crate::bookmarks::is_bookmarked(&self.current_path, &self.bookmark_paths) {
+            self.set_status("Current folder is not bookmarked", cx);
+            return;
+        }
         match crate::bookmarks::remove_bookmark(&self.current_path) {
             Ok(()) => {
                 self.bookmark_paths = crate::bookmarks::load_bookmarks();
@@ -579,10 +586,15 @@ impl FilemanWindow {
     pub(crate) fn set_view_mode(&mut self, mode: ViewMode, cx: &mut ViewContext<Self>) {
         self.view_mode = mode;
         self.uniform_list_row_height = None;
-        self.icon_label_layout_cache_key = None;
+        self.invalidate_icon_label_layout_cache();
         self.icon_size = self.config.icon_size_for_mode(mode);
         self.config.folder_view.mode = mode.config_value().to_string();
         self.config.save();
+        self.files_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(px(0.), px(0.)));
         self.set_status(format!("View: {}", mode.menu_label()), cx);
         self.queue_icon_loads(cx);
         cx.notify();
@@ -803,8 +815,21 @@ impl FilemanWindow {
         self.queue_icon_loads_for_range(index_range, cx);
     }
 
-    pub(crate) fn begin_sidebar_resize(&mut self, pointer_x: Pixels) {
+    pub(crate) fn begin_sidebar_resize(
+        &mut self,
+        pointer_x: Pixels,
+        window: &mut Window,
+        cx: &mut ViewContext<Self>,
+    ) {
         self.sidebar_resize_drag = Some((pointer_x.as_f32(), self.config.window.splitter_pos));
+        self.sidebar_resize_cancel_subscription = Some(cx.observe_window_activation(
+            window,
+            |this, _, cx| {
+                if this.sidebar_resize_drag.is_some() {
+                    this.finish_sidebar_resize(cx);
+                }
+            },
+        ));
     }
 
     pub(crate) fn update_sidebar_resize(&mut self, pointer_x: Pixels, cx: &mut ViewContext<Self>) {
@@ -826,6 +851,7 @@ impl FilemanWindow {
     }
 
     pub(crate) fn finish_sidebar_resize(&mut self, cx: &mut ViewContext<Self>) {
+        self.sidebar_resize_cancel_subscription = None;
         if self.sidebar_resize_drag.take().is_some() {
             self.config.save();
             self.persist_window_geometry(cx);
@@ -841,18 +867,28 @@ impl FilemanWindow {
     }
 
     pub(crate) fn zoom_icons_in(&mut self, cx: &mut ViewContext<Self>) {
+        if self.view_mode != ViewMode::Icon {
+            return;
+        }
         let next = self.icon_size.saturating_add(ICON_ZOOM_STEP);
         self.set_icon_size(next, cx);
         self.set_status(format!("Icon size: {} px", self.icon_size), cx);
     }
 
     pub(crate) fn zoom_icons_out(&mut self, cx: &mut ViewContext<Self>) {
+        if self.view_mode != ViewMode::Icon {
+            return;
+        }
         let next = self.icon_size.saturating_sub(ICON_ZOOM_STEP);
         self.set_icon_size(next, cx);
         self.set_status(format!("Icon size: {} px", self.icon_size), cx);
     }
 
     pub(crate) fn zoom_icons_reset(&mut self, cx: &mut ViewContext<Self>) {
+        if self.view_mode != ViewMode::Icon {
+            return;
+        }
+        self.invalidate_icon_label_layout_cache();
         self.config.folder_view.icon_size = None;
         self.icon_size = self.view_mode.default_icon_size();
         self.config.save();

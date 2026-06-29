@@ -133,6 +133,10 @@ impl FilemanWindow {
         let places = quick_access_places();
         let bookmark_paths = self.bookmark_paths.clone();
         let volume_mounts = self.volume_mounts.clone();
+        let active_path = self
+            .current_path
+            .canonicalize()
+            .unwrap_or_else(|_| self.current_path.clone());
 
         let sidebar = v_flex()
             .id("fileman-sidebar")
@@ -157,7 +161,10 @@ impl FilemanWindow {
                 v_flex()
                     .gap_0p5()
                     .children(places.into_iter().map(|(label, path)| {
-                        let is_active = self.current_path == path;
+                        let is_active = path
+                            .canonicalize()
+                            .unwrap_or_else(|_| path.clone())
+                            == active_path;
                         let path_clone = path.clone();
                         let label_string = label.to_string();
 
@@ -206,7 +213,11 @@ impl FilemanWindow {
                     .child(
                         v_flex().gap_0p5().children(volume_mounts.into_iter().map(
                             |mount| {
-                                let is_active = mount.mount_point == self.current_path;
+                                let is_active = mount
+                                    .mount_point
+                                    .canonicalize()
+                                    .unwrap_or_else(|_| mount.mount_point.clone())
+                                    == active_path;
                                 let path = mount.mount_point.clone();
                                 let navigate_path = path.clone();
                                 let label = mount.label.clone();
@@ -254,17 +265,22 @@ impl FilemanWindow {
                 sidebar
                     .child(Headline::new("Bookmarks").size(HeadlineSize::XSmall))
                     .child(
-                        v_flex().gap_0p5().children(bookmark_paths.into_iter().map(
-                            |path| {
+                        v_flex().gap_0p5().children(bookmark_paths.into_iter().enumerate().map(
+                            |(bookmark_index, path)| {
                                 let display_name = path
                                     .file_name()
                                     .and_then(|name| name.to_str())
                                     .map(str::to_string)
                                     .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                                let is_active = path == self.current_path;
+                                let is_active = path
+                                    .canonicalize()
+                                    .unwrap_or_else(|_| path.clone())
+                                    == active_path;
                                 let path_clone = path.clone();
-                                let item_id =
-                                    SharedString::from(format!("bookmark-{}", path.display()));
+                                let item_id = SharedString::from(format!(
+                                    "bookmark-{bookmark_index}-{}",
+                                    path.display()
+                                ));
 
                                 self.apply_directory_drop_target(
                                     div()

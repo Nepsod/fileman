@@ -31,7 +31,7 @@ impl FilemanWindow {
         } else if action.partial_eq(&DeletePermanent) {
             self.request_delete(true, cx);
         } else if action.partial_eq(&Refresh) {
-            self.reload_volume_mounts();
+            self.reload_sidebar_state(cx);
             self.reload_current_directory(cx);
         } else if action.partial_eq(&SelectAll) {
             self.select_all_visible(cx);

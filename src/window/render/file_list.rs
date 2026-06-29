@@ -26,78 +26,6 @@ fn file_list_item(entry_index: usize, is_selected: bool, is_focused: bool) -> Li
 
 use crate::icon_label_layout::IconViewLabelLayout;
 
-fn tile_grid_spacer(height_px: f32) -> AnyElement {
-    div().h(px(height_px.max(0.0))).into_any_element()
-}
-
-fn tile_grid_viewport_rows<F>(
-    item_count: usize,
-    columns: usize,
-    row_stride_px: f32,
-    tile_gap: Pixels,
-    index_range: std::ops::Range<usize>,
-    mut render_tile: F,
-) -> Vec<AnyElement>
-where
-    F: FnMut(usize) -> Option<AnyElement>,
-{
-    use crate::window::logic::selection_math::tile_row_count;
-
-    if item_count == 0 {
-        return Vec::new();
-    }
-
-    let columns = columns.max(1);
-    let row_count = tile_row_count(item_count, columns);
-    let start_row = index_range.start / columns;
-    let end_row = index_range.end.div_ceil(columns).min(row_count);
-    let mut rows = Vec::new();
-
-    if start_row > 0 {
-        rows.push(tile_grid_spacer(start_row as f32 * row_stride_px));
-    }
-
-    for row in start_row..end_row {
-        let row_start = row * columns;
-        let row_end = (row_start + columns).min(item_count);
-        let row_tiles: Vec<_> = (row_start..row_end)
-            .filter_map(|entry_index| render_tile(entry_index))
-            .collect();
-        if !row_tiles.is_empty() {
-            rows.push(
-                h_flex()
-                    .gap(tile_gap)
-                    .items_start()
-                    .children(row_tiles)
-                    .into_any_element(),
-            );
-        }
-    }
-
-    if end_row < row_count {
-        rows.push(tile_grid_spacer((row_count - end_row) as f32 * row_stride_px));
-    }
-
-    rows
-}
-
-fn tile_grid_rows(mut tiles: Vec<AnyElement>, columns: usize, gap: Pixels) -> Vec<AnyElement> {
-    let columns = columns.max(1);
-    let mut rows = Vec::new();
-    while !tiles.is_empty() {
-        let chunk_len = columns.min(tiles.len());
-        let row_tiles: Vec<_> = tiles.drain(..chunk_len).collect();
-        rows.push(
-            h_flex()
-                .gap(gap)
-                .items_start()
-                .children(row_tiles)
-                .into_any_element(),
-        );
-    }
-    rows
-}
-
 fn tile_icon_content(icon_element: AnyElement, icon_pixel_size: f32) -> impl IntoElement {
     div()
         .w(px(icon_pixel_size))
@@ -740,6 +668,7 @@ impl FilemanWindow {
             ViewMode::Compact => {
                 let interactive = h_flex()
                     .id(format!("{tile_id}-interactive"))
+                    .w_full()
                     .items_center()
                     .gap(px(COMPACT_TILE_ICON_LABEL_GAP_PX))
                     .px(px(COMPACT_TILE_HORIZONTAL_PADDING_PX))
@@ -776,6 +705,69 @@ impl FilemanWindow {
                 self.visible_file_at(entry_index).map(|file_info| {
                     self.render_file_entry(file_info, entry_index, view_mode, window, cx)
                 })
+            })
+            .collect()
+    }
+
+    pub(in crate::window::render) fn render_tile_row_range(
+        &mut self,
+        row_range: Range<usize>,
+        view_mode: ViewMode,
+        columns: usize,
+        row_stride: f32,
+        tile_gap: f32,
+        subfolder_search: bool,
+        window: &mut Window,
+        cx: &mut ViewContext<Self>,
+    ) -> Vec<AnyElement> {
+        let columns = columns.max(1);
+        let item_count = if subfolder_search {
+            self.search_matches.len()
+        } else {
+            self.visible_file_count()
+        };
+        let start = (row_range.start * columns).min(item_count);
+        let end = (row_range.end * columns).min(item_count);
+        self.list_visible_range = Some(start..end);
+        if !subfolder_search {
+            self.queue_icon_loads_for_range(start..end, cx);
+        }
+        row_range
+            .map(|row| {
+                let row_start = (row * columns).min(item_count);
+                let row_end = (row_start + columns).min(item_count);
+                let tiles: Vec<AnyElement> = (row_start..row_end)
+                    .filter_map(|entry_index| {
+                        if subfolder_search {
+                            self.ensure_search_match_columns(entry_index);
+                            self.search_matches.get(entry_index).map(|search_match| {
+                                self.render_search_match(
+                                    search_match,
+                                    entry_index,
+                                    view_mode,
+                                    window,
+                                    cx,
+                                )
+                            })
+                        } else {
+                            self.visible_file_at(entry_index).map(|file_info| {
+                                self.render_file_entry(
+                                    file_info,
+                                    entry_index,
+                                    view_mode,
+                                    window,
+                                    cx,
+                                )
+                            })
+                        }
+                    })
+                    .collect();
+                h_flex()
+                    .h(px(row_stride))
+                    .gap(px(tile_gap))
+                    .items_start()
+                    .children(tiles)
+                    .into_any_element()
             })
             .collect()
     }
@@ -853,75 +845,6 @@ impl FilemanWindow {
             );
 
         let uses_tile_grid = matches!(view_mode, ViewMode::Icon | ViewMode::Compact);
-        let tile_scroll_content: Vec<AnyElement> = if uses_tile_grid
-            && !self.loading_directory
-            && !search_in_progress
-            && item_count > 0
-        {
-            let columns = match view_mode {
-                ViewMode::Icon => {
-                    icon_view_layout(self.icon_size, self.files_panel_width()).columns
-                }
-                ViewMode::Compact => compact_view_layout(self.files_panel_width()).columns,
-                _ => 1,
-            }
-            .max(1);
-            let tile_gap = if view_mode == ViewMode::Compact {
-                COMPACT_TILE_SPACING_PX
-            } else {
-                ICON_VIEW_TILE_GAP_PX
-            };
-            let row_stride = self.tile_grid_row_stride_px();
-            let scroll_bits_before = self.last_tile_scroll_top_bits;
-            self.update_tile_visible_index_range(item_count);
-            if self.last_tile_scroll_top_bits != scroll_bits_before {
-                self.queue_icon_loads(cx);
-            }
-            let index_range = self.tile_visible_index_range(item_count);
-
-            if subfolder_search {
-                tile_grid_viewport_rows(
-                    item_count,
-                    columns,
-                    row_stride,
-                    px(tile_gap),
-                    index_range,
-                    |entry_index| {
-                        self.ensure_search_match_columns(entry_index);
-                        self.search_matches.get(entry_index).map(|search_match| {
-                            self.render_search_match(
-                                search_match,
-                                entry_index,
-                                view_mode,
-                                window,
-                                cx,
-                            )
-                        })
-                    },
-                )
-            } else {
-                tile_grid_viewport_rows(
-                    item_count,
-                    columns,
-                    row_stride,
-                    px(tile_gap),
-                    index_range,
-                    |entry_index| {
-                        self.visible_file_at(entry_index).map(|file_info| {
-                            self.render_file_entry(
-                                file_info,
-                                entry_index,
-                                view_mode,
-                                window,
-                                cx,
-                            )
-                        })
-                    },
-                )
-            }
-        } else {
-            Vec::new()
-        };
 
         let mut scroll = div()
             .id("files-scroll-area")
@@ -961,70 +884,98 @@ impl FilemanWindow {
         }
 
         if uses_tile_grid {
-            let tile_scroll_handle = self.files_scroll_handle.0.borrow().base_handle.clone();
+            use crate::window::logic::selection_math::tile_row_count;
+
+            let columns = self.tile_grid_columns();
+            let row_count = tile_row_count(item_count, columns);
+            let row_stride = self.tile_grid_row_stride_px();
             let tile_gap = if view_mode == ViewMode::Compact {
-                px(COMPACT_TILE_SPACING_PX)
+                COMPACT_TILE_SPACING_PX
             } else {
-                px(ICON_VIEW_TILE_GAP_PX)
+                ICON_VIEW_TILE_GAP_PX
             };
             scroll.child(
                 div()
                     .id("fileman-marquee-layer")
                     .flex_1()
                     .min_h_0()
-                    .relative()
+                    .flex()
+                    .flex_col()
                     .child(
                         self.attach_marquee_handlers(
                             div()
-                                .id("fileman-tile-scroll")
-                                .overflow_y_scroll()
-                                .size_full()
-                                .track_scroll(&tile_scroll_handle)
+                                .flex_1()
+                                .min_h_0()
                                 .relative()
-                                .p(px(ICON_VIEW_PADDING_PX))
-                                .flex()
-                                .flex_col()
-                                .gap(tile_gap)
-                                .children(tile_scroll_content)
-                                .child(self.render_marquee_overlay(cx, true)),
+                                .child(
+                                    uniform_list(
+                                        "fileman-tile-grid",
+                                        row_count,
+                                        cx.processor(
+                                            move |this,
+                                                  row_range: Range<usize>,
+                                                  window,
+                                                  cx| {
+                                                this.render_tile_row_range(
+                                                    row_range,
+                                                    view_mode,
+                                                    columns,
+                                                    row_stride,
+                                                    tile_gap,
+                                                    subfolder_search,
+                                                    window,
+                                                    cx,
+                                                )
+                                            },
+                                        ),
+                                    )
+                                    .p(px(ICON_VIEW_PADDING_PX))
+                                    .size_full()
+                                    .track_scroll(&self.files_scroll_handle),
+                                )
+                                .vertical_scrollbar_for(&self.files_scroll_handle, window, cx)
+                                .child(self.render_marquee_overlay(cx, false)),
                             cx,
                         ),
                     ),
             )
         } else {
-            let mut marquee_layer = div()
+            let marquee_layer = div()
                 .id("fileman-marquee-layer")
                 .flex_1()
                 .min_h_0()
                 .flex()
                 .flex_col();
-            if view_mode == ViewMode::Table && !self.loading_directory && item_count > 0 {
-                marquee_layer = marquee_layer.child(self.render_table_sortable_header(cx));
-            }
             scroll.child(
-                self.attach_marquee_handlers(marquee_layer, cx).child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .relative()
-                        .child(
-                            uniform_list(
-                                "fileman-file-list",
-                                item_count,
-                                cx.processor(move |this, range: Range<usize>, window, cx| {
-                                    if subfolder_search {
-                                        this.render_search_match_range(range, view_mode, window, cx)
-                                    } else {
-                                        this.render_file_entry_range(range, view_mode, window, cx)
-                                    }
-                                }),
+                marquee_layer
+                    .when(
+                        view_mode == ViewMode::Table && !self.loading_directory && item_count > 0,
+                        |layer| layer.child(self.render_table_sortable_header(cx)),
+                    )
+                    .child(self.attach_marquee_handlers(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .relative()
+                            .child(
+                                uniform_list(
+                                    "fileman-file-list",
+                                    item_count,
+                                    cx.processor(move |this, range: Range<usize>, window, cx| {
+                                        if subfolder_search {
+                                            this.render_search_match_range(range, view_mode, window, cx)
+                                        } else {
+                                            this.render_file_entry_range(range, view_mode, window, cx)
+                                        }
+                                    }),
+                                )
+                                .size_full()
+                                .track_scroll(&self.files_scroll_handle),
                             )
-                            .size_full()
-                            .track_scroll(&self.files_scroll_handle),
-                        )
-                        .vertical_scrollbar_for(&self.files_scroll_handle, window, cx)
-                        .child(self.render_marquee_overlay(cx, false)),
-                ),
+                            .vertical_scrollbar_for(&self.files_scroll_handle, window, cx)
+                            .child(self.render_marquee_overlay(cx, false)),
+                        cx,
+                    )),
             )
         }
     }

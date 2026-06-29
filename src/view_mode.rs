@@ -37,7 +37,7 @@ impl ViewMode {
     pub fn icon_size(self) -> u32 {
         match self {
             Self::Icon => 48,
-            Self::Compact => 16,
+            Self::Compact => COMPACT_TILE_ICON_PX,
             Self::List | Self::Table => 20,
         }
     }
@@ -91,7 +91,9 @@ pub fn icon_view_layout(icon_size: u32, panel_width: f32) -> IconViewLayout {
     let cell_width = (icon_size_pixels + ICON_VIEW_HORIZONTAL_SPACING_PX * 2.0).max(1.0);
     let available_width = (panel_width - ICON_VIEW_PADDING_PX * 2.0).max(1.0);
     let column_stride = icon_view_tile_column_stride(cell_width);
-    let columns = (available_width / column_stride).floor().max(1.0) as usize;
+    let columns = ((available_width + ICON_VIEW_TILE_GAP_PX) / column_stride)
+        .floor()
+        .max(1.0) as usize;
     let cell_height = icon_size_pixels
         + ICON_ICON_LABEL_GAP_PX
         + ICON_LABEL_AREA_HEIGHT_PX

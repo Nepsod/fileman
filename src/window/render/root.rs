@@ -117,8 +117,8 @@ impl Render for FilemanWindow {
                             .bg(colors.border)
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                    this.begin_sidebar_resize(event.position.x);
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    this.begin_sidebar_resize(event.position.x, window, cx);
                                     cx.notify();
                                 }),
                             ),

@@ -29,12 +29,18 @@ pub(crate) fn quick_access_places() -> Vec<(&'static str, PathBuf)> {
     let mut places = vec![("Root", PathBuf::from("/"))];
     if let Some(home) = dirs::home_dir() {
         places.push(("Home", home.clone()));
-        places.push(("Desktop", home.join("Desktop")));
-        places.push(("Documents", home.join("Documents")));
-        places.push(("Downloads", home.join("Downloads")));
-        places.push(("Music", home.join("Music")));
-        places.push(("Pictures", home.join("Pictures")));
-        places.push(("Videos", home.join("Videos")));
+        for (label, path) in [
+            ("Desktop", home.join("Desktop")),
+            ("Documents", home.join("Documents")),
+            ("Downloads", home.join("Downloads")),
+            ("Music", home.join("Music")),
+            ("Pictures", home.join("Pictures")),
+            ("Videos", home.join("Videos")),
+        ] {
+            if path.is_dir() {
+                places.push((label, path));
+            }
+        }
     }
     places
 }

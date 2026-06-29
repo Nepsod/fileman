@@ -1,5 +1,7 @@
+use nptk::std::ffi::OsString;
 use nptk::std::collections::HashSet;
 use nptk::std::fs;
+use nptk::std::os::unix::ffi::OsStringExt;
 use nptk::std::path::{Path, PathBuf};
 
 use npio::mount::Mount;
@@ -111,10 +113,40 @@ fn mount_path_from_mount(mount: &dyn Mount) -> Option<PathBuf> {
 
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let path_string = uri.strip_prefix("file://").unwrap_or(uri);
+    let path_string = path_string
+        .strip_prefix("localhost")
+        .unwrap_or(path_string);
     if path_string.is_empty() {
         return None;
     }
-    Some(PathBuf::from(path_string))
+    Some(PathBuf::from(percent_decode_os(path_string)))
+}
+
+fn percent_decode_os(encoded: &str) -> OsString {
+    let bytes = encoded.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""), 16)
+            {
+                decoded.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    OsString::from_vec(decoded)
+}
+
+fn unescape_proc_mount_path(mount_point: &str) -> String {
+    mount_point
+        .replace("\\\\", "\\")
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
 }
 
 fn is_removable_mount_path(mount_point: &Path) -> bool {
@@ -177,7 +209,10 @@ fn parse_mount_line(line: &str) -> Option<(PathBuf, &str)> {
     let _device = fields.next()?;
     let mount_point = fields.next()?;
     let filesystem = fields.next()?;
-    Some((PathBuf::from(mount_point), filesystem))
+    Some((
+        PathBuf::from(unescape_proc_mount_path(mount_point)),
+        filesystem,
+    ))
 }
 
 fn mount_label(mount_point: &Path, filesystem: &str) -> String {
